@@ -407,7 +407,7 @@ class ASoulPlugin(Star):
         width = 1080
         outer_padding = 28
         panel_width = width - outer_padding * 2
-        header_height = 224
+        header_height = 216
         footer_height = 48
         list_gap = 18
         row_gap = 16
@@ -428,8 +428,8 @@ class ASoulPlugin(Star):
         measure_image = Image.new("RGBA", (width, 10), (0, 0, 0, 0))
         measure_draw = ImageDraw.Draw(measure_image)
         wrapped_items: List[Tuple[ScheduleItem, List[str], int]] = []
-        avatar_slot_width = 188
-        content_width = panel_width - 250 - avatar_slot_width - 54
+        avatar_slot_width = 214
+        content_width = panel_width - 250 - avatar_slot_width - 36
         total_rows_height = 0
 
         for item in items:
@@ -490,7 +490,7 @@ class ASoulPlugin(Star):
         )
 
         panel_left = outer_padding + 40
-        title_top = outer_padding + 54
+        title_top = outer_padding + 40
         draw.rounded_rectangle(
             (panel_left, title_top, panel_left + 146, title_top + 38),
             radius=18,
@@ -504,17 +504,17 @@ class ASoulPlugin(Star):
             fill="#201a17",
         )
         draw.text(
-            (panel_left, title_top + 130),
+            (panel_left, title_top + 122),
             "今日排班",
             font=font_subtitle,
             fill="#74685f",
         )
-        draw.text(
-            (panel_left, title_top + 166),
-            f"{len(items)} 条安排",
-            font=font_count,
-            fill="#c56d49",
-        )
+        count_text = f"{len(items)} 条安排"
+        count_box = draw.textbbox((0, 0), count_text, font=font_count)
+        count_width = count_box[2] - count_box[0]
+        count_x = width - outer_padding - 44 - count_width
+        count_y = outer_padding + header_height - 48
+        draw.text((count_x, count_y), count_text, font=font_count, fill="#c56d49")
 
         list_top = outer_padding + header_height + list_gap
         list_left = outer_padding + 28
@@ -544,7 +544,7 @@ class ASoulPlugin(Star):
                 draw.text((time_x, time_y), item.start_text, font=font_time, fill="#201a17")
 
                 text_left = list_left + 204
-                avatar_left = width - outer_padding - 28 - avatar_slot_width + 22
+                avatar_left = width - outer_padding - 28 - avatar_slot_width
                 label_width = self._text_width(draw, item.label, font_label) + 26
                 draw.rounded_rectangle(
                     (text_left, row_y + 22, text_left + label_width, row_y + 52),
@@ -564,10 +564,10 @@ class ASoulPlugin(Star):
                 self._paste_item_avatars(
                     image=image,
                     hosts=item.hosts,
-                    left=avatar_left,
-                    top=row_y + 24,
-                    slot_width=avatar_slot_width - 40,
-                    slot_height=row_height - 48,
+                    left=avatar_left + 12,
+                    top=row_y + 18,
+                    slot_width=avatar_slot_width - 24,
+                    slot_height=row_height - 36,
                 )
                 row_y = row_bottom + row_gap
         else:
@@ -735,14 +735,14 @@ class ASoulPlugin(Star):
         resampling = getattr(Image, "Resampling", Image)
         count = len(avatar_paths)
         if count == 1:
-            avatar_size = min(112, slot_height)
             gap = 0
+            avatar_size = min(112, slot_height, slot_width)
         elif count == 2:
-            avatar_size = min(82, slot_height)
             gap = 8
+            avatar_size = min(84, slot_height, (slot_width - gap) // 2)
         else:
-            avatar_size = min(64, slot_height)
             gap = 6
+            avatar_size = min(62, slot_height, max(36, (slot_width - gap * (count - 1)) // count))
 
         total_width = count * avatar_size + (count - 1) * gap
         start_x = left + max(0, (slot_width - total_width) // 2)
