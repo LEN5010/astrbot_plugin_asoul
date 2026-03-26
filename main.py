@@ -1,7 +1,12 @@
 import asyncio
+import base64
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib import request
 from zoneinfo import ZoneInfo
@@ -147,6 +152,21 @@ SCHEDULE_IMAGE_TEMPLATE = """
       font-weight: 700;
     }
 
+    .avatars {
+      display: flex;
+      gap: 14px;
+      align-items: flex-end;
+      margin-top: 22px;
+      min-height: 118px;
+    }
+
+    .avatar {
+      width: 100px;
+      height: 100px;
+      object-fit: contain;
+      filter: drop-shadow(0 12px 18px rgba(76, 43, 20, 0.12));
+    }
+
     .list {
       position: relative;
       padding: 18px 20px 22px;
@@ -244,6 +264,13 @@ SCHEDULE_IMAGE_TEMPLATE = """
           <span>{{ subtitle }}</span>
           <span class="count">{{ count_text }}</span>
         </div>
+        {% if avatars %}
+        <div class="avatars">
+          {% for avatar in avatars %}
+          <img class="avatar" src="{{ avatar.src }}" alt="{{ avatar.name }}" />
+          {% endfor %}
+        </div>
+        {% endif %}
       </div>
 
       {% if items %}
@@ -611,11 +638,17 @@ class ASoulPlugin(Star):
         return items
 
     async def _render_schedule_image(self, items: List[ScheduleItem]) -> str:
+        try:
+            return await asyncio.to_thread(self._render_schedule_image_local, items)
+        except Exception:
+            logger.exception("本地 Pillow 渲染失败，回退到 html_render")
+
         today = datetime.now(DISPLAY_TZ).date()
         render_data = {
             "date_text": today.strftime("%Y-%m-%d"),
             "subtitle": "按 calendar.ics 清洗后的今日直播安排",
             "count_text": f"{len(items)} 条安排",
+            "avatars": self._load_avatar_data_list(),
             "items": [
                 {
                     "start_text": item.start_text,
@@ -633,6 +666,198 @@ class ASoulPlugin(Star):
         }
         return await self.html_render(SCHEDULE_IMAGE_TEMPLATE, render_data, options=options)
 
+    def _render_schedule_image_local(self, items: List[ScheduleItem]) -> str:
+        from PIL import Image, ImageDraw, ImageFont
+
+        today = datetime.now(DISPLAY_TZ).date()
+        width = 1080
+        outer_padding = 28
+        panel_width = width - outer_padding * 2
+        header_height = 290
+        footer_height = 48
+        list_gap = 18
+        row_gap = 16
+
+        work_dir = Path(tempfile.mkdtemp(prefix="asoul_schedule_", dir="/tmp"))
+        output_path = work_dir / "today_schedule.png"
+
+        font_title = self._load_pillow_font(54)
+        font_subtitle = self._load_pillow_font(22)
+        font_count = self._load_pillow_font(28)
+        font_time = self._load_pillow_font(34)
+        font_label = self._load_pillow_font(18)
+        font_hosts = self._load_pillow_font(24)
+        font_content = self._load_pillow_font(32)
+        font_empty = self._load_pillow_font(30)
+        font_footer = self._load_pillow_font(14)
+
+        measure_image = Image.new("RGBA", (width, 10), (0, 0, 0, 0))
+        measure_draw = ImageDraw.Draw(measure_image)
+        wrapped_items: List[Tuple[ScheduleItem, List[str], int]] = []
+        content_width = panel_width - 250 - 56 - 42
+        total_rows_height = 0
+
+        for item in items:
+            content_lines = self._wrap_text_lines(
+                measure_draw,
+                item.content,
+                font_content,
+                content_width,
+                max_lines=2,
+            )
+            content_height = self._measure_lines_height(measure_draw, content_lines, font_content, 10)
+            row_height = max(136, 82 + content_height)
+            wrapped_items.append((item, content_lines, row_height))
+            total_rows_height += row_height
+
+        if wrapped_items:
+            list_height = total_rows_height + row_gap * (len(wrapped_items) - 1) + list_gap * 2
+        else:
+            list_height = 160
+
+        height = outer_padding * 2 + header_height + list_height + footer_height
+        image = Image.new("RGBA", (width, height), "#f3ebdf")
+        draw = ImageDraw.Draw(image)
+
+        draw.ellipse((-120, -80, 420, 300), fill="#efd4c2")
+        draw.ellipse((760, -40, 1160, 280), fill="#dce8df")
+        draw.rounded_rectangle(
+            (
+                outer_padding,
+                outer_padding,
+                width - outer_padding,
+                height - outer_padding,
+            ),
+            radius=32,
+            fill=(255, 250, 244, 242),
+            outline=(255, 255, 255, 180),
+            width=2,
+        )
+        draw.rounded_rectangle(
+            (
+                outer_padding,
+                outer_padding,
+                width - outer_padding,
+                outer_padding + header_height,
+            ),
+            radius=32,
+            fill="#eee0cf",
+        )
+        draw.line(
+            (
+                outer_padding + 28,
+                outer_padding + header_height,
+                width - outer_padding - 28,
+                outer_padding + header_height,
+            ),
+            fill="#d8cabb",
+            width=2,
+        )
+
+        panel_left = outer_padding + 40
+        title_top = outer_padding + 54
+        draw.rounded_rectangle(
+            (panel_left, title_top, panel_left + 146, title_top + 38),
+            radius=18,
+            fill="#f4d8c8",
+        )
+        draw.text((panel_left + 18, title_top + 8), "A-SOUL LIVE", font=font_label, fill="#c56d49")
+        draw.text(
+            (panel_left, title_top + 56),
+            f"{today.strftime('%Y-%m-%d')} 今日直播",
+            font=font_title,
+            fill="#201a17",
+        )
+        draw.text(
+            (panel_left, title_top + 126),
+            "今日排班 · 数据来自 asoul.love/calendar.ics",
+            font=font_subtitle,
+            fill="#74685f",
+        )
+        draw.text(
+            (panel_left, title_top + 166),
+            f"{len(items)} 条安排",
+            font=font_count,
+            fill="#c56d49",
+        )
+
+        self._paste_header_avatars(
+            image=image,
+            top=outer_padding + 34,
+            right=width - outer_padding - 36,
+            avatar_size=108,
+            gap=10,
+        )
+
+        list_top = outer_padding + header_height + list_gap
+        list_left = outer_padding + 28
+        row_y = list_top
+
+        if wrapped_items:
+            for item, content_lines, row_height in wrapped_items:
+                row_bottom = row_y + row_height
+                draw.rounded_rectangle(
+                    (list_left, row_y, width - outer_padding - 28, row_bottom),
+                    radius=26,
+                    fill="#fffaf4",
+                    outline="#eadbc9",
+                    width=2,
+                )
+                draw.rounded_rectangle(
+                    (list_left + 24, row_y + 22, list_left + 168, row_y + row_height - 22),
+                    radius=24,
+                    fill="#f1e4d3",
+                )
+
+                time_box = draw.textbbox((0, 0), item.start_text, font=font_time)
+                time_width = time_box[2] - time_box[0]
+                time_height = time_box[3] - time_box[1]
+                time_x = list_left + 96 - time_width / 2
+                time_y = row_y + row_height / 2 - time_height / 2 - 4
+                draw.text((time_x, time_y), item.start_text, font=font_time, fill="#201a17")
+
+                text_left = list_left + 204
+                label_width = self._text_width(draw, item.label, font_label) + 26
+                draw.rounded_rectangle(
+                    (text_left, row_y + 22, text_left + label_width, row_y + 52),
+                    radius=15,
+                    fill="#201a17",
+                )
+                draw.text((text_left + 13, row_y + 28), item.label, font=font_label, fill="#fff7ef")
+                draw.text((text_left, row_y + 64), item.hosts_text, font=font_hosts, fill="#74685f")
+                self._draw_multiline_text(
+                    draw,
+                    (text_left, row_y + 96),
+                    content_lines,
+                    font_content,
+                    "#201a17",
+                    line_spacing=10,
+                )
+                row_y = row_bottom + row_gap
+        else:
+            empty_text = "今天还没有查到直播安排"
+            empty_box = draw.textbbox((0, 0), empty_text, font=font_empty)
+            empty_width = empty_box[2] - empty_box[0]
+            draw.text(
+                ((width - empty_width) / 2, list_top + 40),
+                empty_text,
+                font=font_empty,
+                fill="#74685f",
+            )
+
+        footer_text = "AstrBot Plugin · A-SOUL Calendar"
+        footer_box = draw.textbbox((0, 0), footer_text, font=font_footer)
+        footer_width = footer_box[2] - footer_box[0]
+        draw.text(
+            (width - outer_padding - 28 - footer_width, height - outer_padding - 26),
+            footer_text,
+            font=font_footer,
+            fill="#8c8178",
+        )
+
+        image.save(output_path, format="PNG")
+        return str(output_path)
+
     def _format_schedule_fallback(self, items: List[ScheduleItem]) -> str:
         today = datetime.now(DISPLAY_TZ).date().strftime("%Y-%m-%d")
         if not items:
@@ -645,6 +870,144 @@ class ASoulPlugin(Star):
 
     def _format_start_time(self, start: datetime) -> str:
         return start.strftime("%H:%M")
+
+    def _find_font_file(self) -> Optional[str]:
+        candidates = [
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        ]
+        for candidate in candidates:
+            if Path(candidate).exists():
+                return candidate
+
+        fc_match = shutil.which("fc-match")
+        if fc_match:
+            try:
+                result = subprocess.run(
+                    [fc_match, "-f", "%{file}\n", "sans:lang=zh-cn"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                font_path = result.stdout.strip().splitlines()[0]
+                if font_path and Path(font_path).exists():
+                    return font_path
+            except Exception:
+                pass
+
+        return None
+
+    def _load_pillow_font(self, size: int):
+        from PIL import ImageFont
+
+        font_file = self._find_font_file()
+        if font_file:
+            try:
+                return ImageFont.truetype(font_file, size=size)
+            except Exception:
+                logger.warning("字体加载失败: %s", font_file)
+        return ImageFont.load_default()
+
+    def _wrap_text_lines(self, draw, text: str, font, max_width: int, max_lines: int = 2) -> List[str]:
+        compact = " ".join(text.split())
+        if not compact:
+            return [""]
+
+        lines: List[str] = []
+        current = ""
+        for char in compact:
+            trial = current + char
+            if self._text_width(draw, trial, font) <= max_width:
+                current = trial
+                continue
+
+            if current:
+                lines.append(current)
+            current = char
+            if len(lines) >= max_lines - 1:
+                break
+
+        remainder = compact[len("".join(lines)):]
+        if remainder:
+            tail = ""
+            for char in remainder:
+                trial = tail + char
+                suffix = "…" if len(remainder) < len(compact) or len(lines) >= max_lines - 1 else ""
+                if self._text_width(draw, trial + suffix, font) <= max_width:
+                    tail = trial
+                else:
+                    break
+            if len(lines) >= max_lines - 1 and len(remainder) > len(tail):
+                tail = tail.rstrip() + "…"
+            lines.append(tail or remainder[:1])
+        elif current:
+            lines.append(current)
+
+        return lines[:max_lines]
+
+    def _measure_lines_height(self, draw, lines: List[str], font, line_spacing: int) -> int:
+        if not lines:
+            return 0
+        bbox = draw.textbbox((0, 0), "测", font=font)
+        line_height = bbox[3] - bbox[1]
+        return line_height * len(lines) + line_spacing * (len(lines) - 1)
+
+    def _text_width(self, draw, text: str, font) -> int:
+        if not text:
+            return 0
+        bbox = draw.textbbox((0, 0), text, font=font)
+        return bbox[2] - bbox[0]
+
+    def _draw_multiline_text(self, draw, pos, lines: List[str], font, fill: str, line_spacing: int) -> None:
+        x, y = pos
+        bbox = draw.textbbox((0, 0), "测", font=font)
+        line_height = bbox[3] - bbox[1]
+        for index, line in enumerate(lines):
+            draw.text((x, y + index * (line_height + line_spacing)), line, font=font, fill=fill)
+
+    def _paste_header_avatars(self, image, top: int, right: int, avatar_size: int, gap: int) -> None:
+        from PIL import Image
+
+        avatar_paths = self._get_avatar_paths()
+        if not avatar_paths:
+            return
+
+        resampling = getattr(Image, "Resampling", Image)
+        total_width = len(avatar_paths) * avatar_size + (len(avatar_paths) - 1) * gap
+        start_x = right - total_width
+        for index, avatar_path in enumerate(avatar_paths):
+            avatar = Image.open(avatar_path).convert("RGBA")
+            avatar.thumbnail((avatar_size, avatar_size), resampling.LANCZOS)
+            x = start_x + index * (avatar_size + gap)
+            y = top + max(0, avatar_size - avatar.height)
+            image.alpha_composite(avatar, (x, y))
+
+    def _get_avatar_paths(self) -> List[Path]:
+        return [
+            Path(__file__).resolve().with_name(f"{name}.png")
+            for name in ("贝拉", "嘉然", "乃琳", "心宜", "思诺")
+            if Path(__file__).resolve().with_name(f"{name}.png").exists()
+        ]
+
+    def _load_avatar_data_list(self) -> List[Dict[str, str]]:
+        avatar_names = ("贝拉", "嘉然", "乃琳", "心宜", "思诺")
+        avatars: List[Dict[str, str]] = []
+        for name in avatar_names:
+            path = Path(__file__).resolve().with_name(f"{name}.png")
+            if not path.exists():
+                continue
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            avatars.append(
+                {
+                    "name": name,
+                    "src": f"data:image/png;base64,{encoded}",
+                }
+            )
+        return avatars
 
     def _extract_hosts(self, event: CalendarEvent) -> List[str]:
         description_line = next(
