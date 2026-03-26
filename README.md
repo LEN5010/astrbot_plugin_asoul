@@ -98,3 +98,7 @@ AstrBot 相关文档：
 
 - [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
 - [AstrBot 插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
+
+鸣谢:
+
+- [枝江站](https://asoul.love/)
