@@ -52,6 +52,228 @@ MEMBER_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("思诺", ("思诺", "gladys")),
     ("A-SOUL", ("a-soul", "asoul", "一个魂")),
 )
+SCHEDULE_IMAGE_TEMPLATE = """
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root {
+      --bg: #f5efe6;
+      --paper: rgba(255, 251, 245, 0.92);
+      --paper-strong: #fffdf8;
+      --ink: #201a17;
+      --muted: #72675f;
+      --line: rgba(32, 26, 23, 0.08);
+      --accent: #d86f45;
+      --accent-soft: rgba(216, 111, 69, 0.12);
+      --shadow: 0 24px 80px rgba(70, 43, 22, 0.10);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(216, 111, 69, 0.18), transparent 34%),
+        radial-gradient(circle at 85% 20%, rgba(68, 135, 120, 0.14), transparent 30%),
+        linear-gradient(180deg, #f7f1e7 0%, #efe5d9 100%);
+      color: var(--ink);
+    }
+
+    .page {
+      width: 920px;
+      padding: 40px 36px 32px;
+    }
+
+    .panel {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.45);
+      border-radius: 28px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(135deg, rgba(255,255,255,0.45), transparent 36%),
+        linear-gradient(180deg, transparent, rgba(255,255,255,0.22));
+      pointer-events: none;
+    }
+
+    .header {
+      position: relative;
+      padding: 30px 30px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      display: inline-block;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 14px 0 8px;
+      font-size: 40px;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+    }
+
+    .subline {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .count {
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .list {
+      position: relative;
+      padding: 18px 20px 22px;
+    }
+
+    .item {
+      display: grid;
+      grid-template-columns: 128px 1fr;
+      gap: 18px;
+      align-items: stretch;
+      padding: 12px 10px;
+    }
+
+    .item + .item {
+      border-top: 1px solid var(--line);
+    }
+
+    .time {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 96px;
+      border-radius: 22px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.9), rgba(255,248,241,0.95));
+      border: 1px solid rgba(216, 111, 69, 0.10);
+      color: var(--ink);
+      font-size: 32px;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .card {
+      min-height: 96px;
+      border-radius: 22px;
+      padding: 18px 20px 16px;
+      background: var(--paper-strong);
+      border: 1px solid rgba(32, 26, 23, 0.06);
+    }
+
+    .meta {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+
+    .tag {
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: #1f1b18;
+      color: #f7f1e7;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    .hosts {
+      color: var(--muted);
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .content {
+      font-size: 28px;
+      line-height: 1.28;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      word-break: break-word;
+    }
+
+    .empty {
+      padding: 34px 28px 38px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 22px;
+      line-height: 1.6;
+    }
+
+    .footer {
+      padding: 0 30px 26px;
+      color: rgba(114, 103, 95, 0.92);
+      font-size: 13px;
+      letter-spacing: 0.04em;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="panel">
+      <div class="header">
+        <div class="eyebrow">A-SOUL LIVE</div>
+        <h1>{{ date_text }} 今日直播</h1>
+        <div class="subline">
+          <span>{{ subtitle }}</span>
+          <span class="count">{{ count_text }}</span>
+        </div>
+      </div>
+
+      {% if items %}
+      <div class="list">
+        {% for item in items %}
+        <div class="item">
+          <div class="time">{{ item.start_text }}</div>
+          <div class="card">
+            <div class="meta">
+              <span class="tag">{{ item.label }}</span>
+              <span class="hosts">{{ item.hosts_text }}</span>
+            </div>
+            <div class="content">{{ item.content }}</div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty">
+        今天还没有查到直播安排。<br />
+        晚点再发一次“直播数据”试试。
+      </div>
+      {% endif %}
+
+      <div class="footer">Data source: asoul.love/calendar.ics</div>
+    </div>
+  </div>
+</body>
+</html>
+"""
 
 
 @dataclass
@@ -65,6 +287,16 @@ class CalendarEvent:
     start: datetime
     end: datetime
     all_day: bool = False
+
+
+@dataclass
+class ScheduleItem:
+    start: datetime
+    start_text: str
+    hosts: List[str]
+    hosts_text: str
+    content: str
+    label: str
 
 
 @register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "1.1.0")
@@ -90,7 +322,15 @@ class ASoulPlugin(Star):
             yield event.plain_result("⚠️ 直播日历暂时不可用，请稍后再试。")
             return
 
-        yield event.plain_result(self._format_schedule(events))
+        items = self._build_schedule_items(events)
+        try:
+            image_url = await self._render_schedule_image(items)
+        except Exception:
+            logger.exception("渲染直播图片失败")
+            yield event.plain_result(self._format_schedule_fallback(items))
+            return
+
+        yield event.image_result(image_url)
 
     async def _get_today_live_events(self) -> List[CalendarEvent]:
         today = datetime.now(DISPLAY_TZ).date()
@@ -341,20 +581,66 @@ class ASoulPlugin(Star):
             return False
         return True
 
-    def _format_schedule(self, events: List[CalendarEvent]) -> str:
-        today = datetime.now(DISPLAY_TZ).date().strftime("%Y-%m-%d")
-        if not events:
-            return f"📅 {today} 今日暂无直播安排\n💤 可以晚点再查一次。"
+    def _build_schedule_items(self, events: List[CalendarEvent]) -> List[ScheduleItem]:
+        grouped: Dict[Tuple[datetime, str, str], ScheduleItem] = {}
 
-        lines = [f"📅 {today} 今日直播安排", f"📡 共 {len(events)} 场"]
         for event in events:
             hosts = self._extract_hosts(event)
             content = self._extract_content(event, hosts)
-            lines.append("")
-            lines.append(f"{self._pick_content_emoji(event, content)} {self._format_start_time(event.start)} 开播")
-            lines.append(f"👤 {' / '.join(hosts) if hosts else '待确认'}")
-            lines.append(f"📝 {content}")
+            label = self._classify_event_label(event, content)
+            key = (event.start, content, label)
 
+            if key not in grouped:
+                grouped[key] = ScheduleItem(
+                    start=event.start,
+                    start_text=self._format_start_time(event.start),
+                    hosts=[],
+                    hosts_text="待确认",
+                    content=content,
+                    label=label,
+                )
+
+            item = grouped[key]
+            for host in hosts:
+                if host not in item.hosts:
+                    item.hosts.append(host)
+            item.hosts_text = " / ".join(item.hosts) if item.hosts else "待确认"
+
+        items = list(grouped.values())
+        items.sort(key=lambda item: item.start)
+        return items
+
+    async def _render_schedule_image(self, items: List[ScheduleItem]) -> str:
+        today = datetime.now(DISPLAY_TZ).date()
+        render_data = {
+            "date_text": today.strftime("%Y-%m-%d"),
+            "subtitle": "按 calendar.ics 清洗后的今日直播安排",
+            "count_text": f"{len(items)} 条安排",
+            "items": [
+                {
+                    "start_text": item.start_text,
+                    "hosts_text": item.hosts_text,
+                    "content": item.content,
+                    "label": item.label,
+                }
+                for item in items
+            ],
+        }
+        options = {
+            "type": "png",
+            "full_page": True,
+            "animations": "disabled",
+        }
+        return await self.html_render(SCHEDULE_IMAGE_TEMPLATE, render_data, options=options)
+
+    def _format_schedule_fallback(self, items: List[ScheduleItem]) -> str:
+        today = datetime.now(DISPLAY_TZ).date().strftime("%Y-%m-%d")
+        if not items:
+            return f"{today} 今日暂无直播安排。"
+
+        lines = [f"{today} 今日直播安排"]
+        for item in items:
+            lines.append(f"{item.start_text} {item.hosts_text} {item.content}")
         return "\n".join(lines)
 
     def _format_start_time(self, start: datetime) -> str:
@@ -419,23 +705,25 @@ class ASoulPlugin(Star):
             return description_line
         return "直播内容待定"
 
-    def _pick_content_emoji(self, event: CalendarEvent, content: str) -> str:
+    def _classify_event_label(self, event: CalendarEvent, content: str) -> str:
         lowered = f"{event.summary} {content}".lower()
         if "突击" in event.summary:
-            return "⚡"
+            return "突击"
         if any(keyword in lowered for keyword in ("线下", "演唱会", "歌会", "music", "演唱")):
-            return "🎤"
+            return "演出"
         if any(keyword in lowered for keyword in ("节目", "综艺", "movie", "电影")):
-            return "🎬"
+            return "节目"
         if any(keyword in lowered for keyword in ("歌", "唱", "music", "演唱", "歌会")):
-            return "🎤"
+            return "歌会"
         if any(keyword in lowered for keyword in ("游戏", "联机", "fps", "mc", "minecraft")):
-            return "🎮"
+            return "游戏"
         if any(keyword in lowered for keyword in ("联动", "合作", "嘉宾", "同台")):
-            return "🤝"
+            return "联动"
         if any(keyword in lowered for keyword in ("杂谈", "聊天", "电台", "talk")):
-            return "💬"
-        return "📺"
+            return "杂谈"
+        if "2d" in lowered:
+            return "2D"
+        return "直播"
 
     async def terminate(self):
         """插件卸载时调用。"""
