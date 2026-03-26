@@ -60,6 +60,7 @@ MEMBER_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("思诺", ("思诺", "gladys")),
     ("A-SOUL", ("a-soul", "asoul", "一个魂")),
 )
+ASOUL_CORE_MEMBERS = ["嘉然", "乃琳", "贝拉"]
 
 
 @dataclass
@@ -810,20 +811,32 @@ class ASoulPlugin(Star):
         )
         if "|" in description_line:
             _, raw_hosts = description_line.split("|", 1)
-            hosts = [item for item in re.split(r"[ /、,，]+", raw_hosts.strip()) if item]
+            raw_hosts = raw_hosts.strip()
+            if self._contains_asoul_group(raw_hosts):
+                return list(ASOUL_CORE_MEMBERS)
+            hosts = [item for item in re.split(r"[ /、,，&＆+和]+", raw_hosts) if item]
             if hosts:
                 return hosts
 
         haystack = " ".join(
             part.lower() for part in (event.summary, event.description, event.location) if part
         )
+        if self._contains_asoul_group(haystack):
+            return list(ASOUL_CORE_MEMBERS)
+
         matched_hosts: List[str] = []
 
         for canonical, aliases in MEMBER_ALIASES:
+            if canonical == "A-SOUL":
+                continue
             if any(alias.lower() in haystack for alias in aliases):
                 matched_hosts.append(canonical)
 
         return matched_hosts
+
+    def _contains_asoul_group(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(alias in lowered for alias in ("a-soul", "asoul", "一个魂"))
 
     def _extract_content(self, event: CalendarEvent, hosts: List[str]) -> str:
         summary = " ".join(event.summary.split())
