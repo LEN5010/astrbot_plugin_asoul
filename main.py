@@ -19,6 +19,7 @@ CALENDAR_TTL = timedelta(minutes=10)
 DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 PLUGIN_DIR = Path(__file__).resolve().parent
 TRIGGER_TEXTS = {"直播数据", "今日直播"}
+HELP_TRIGGER_TEXTS = {"/bot帮助", "bot帮助"}
 LIVE_KEYWORDS = {
     "直播",
     "开播",
@@ -89,6 +90,19 @@ class ASoulPlugin(Star):
         self._calendar_cache: List[CalendarEvent] = []
         self._calendar_cache_expires_at = datetime.min.replace(tzinfo=timezone.utc)
         self._calendar_lock = asyncio.Lock()
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def handle_bot_help(self, event: AstrMessageEvent):
+        """用户发送 /bot帮助 时返回使用说明。"""
+        if event.message_str.strip() not in HELP_TRIGGER_TEXTS:
+            return
+
+        event.stop_event()
+        yield event.plain_result(
+            "鸣潮bot请使用【ww帮助】获取图文\n"
+            "自动签到请使用【ww登陆】，然后输入【ww开启自动签到】\n"
+            "asoul推送请使用【直播数据】"
+        )
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_live_request(self, event: AstrMessageEvent):
