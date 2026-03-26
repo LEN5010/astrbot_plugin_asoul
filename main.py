@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import re
 import shutil
 import subprocess
@@ -18,6 +17,7 @@ from astrbot.api.star import Context, Star, register
 CALENDAR_URL = "https://asoul.love/calendar.ics"
 CALENDAR_TTL = timedelta(minutes=10)
 DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
+PLUGIN_DIR = Path(__file__).resolve().parent
 TRIGGER_TEXTS = {"直播数据", "今日直播"}
 LIVE_KEYWORDS = {
     "直播",
@@ -57,250 +57,6 @@ MEMBER_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("思诺", ("思诺", "gladys")),
     ("A-SOUL", ("a-soul", "asoul", "一个魂")),
 )
-SCHEDULE_IMAGE_TEMPLATE = """
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    :root {
-      --bg: #f5efe6;
-      --paper: rgba(255, 251, 245, 0.92);
-      --paper-strong: #fffdf8;
-      --ink: #201a17;
-      --muted: #72675f;
-      --line: rgba(32, 26, 23, 0.08);
-      --accent: #d86f45;
-      --accent-soft: rgba(216, 111, 69, 0.12);
-      --shadow: 0 24px 80px rgba(70, 43, 22, 0.10);
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      font-family: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
-      background:
-        radial-gradient(circle at top left, rgba(216, 111, 69, 0.18), transparent 34%),
-        radial-gradient(circle at 85% 20%, rgba(68, 135, 120, 0.14), transparent 30%),
-        linear-gradient(180deg, #f7f1e7 0%, #efe5d9 100%);
-      color: var(--ink);
-    }
-
-    .page {
-      width: 920px;
-      padding: 40px 36px 32px;
-    }
-
-    .panel {
-      position: relative;
-      overflow: hidden;
-      border: 1px solid rgba(255, 255, 255, 0.45);
-      border-radius: 28px;
-      background: var(--paper);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-    }
-
-    .panel::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background:
-        linear-gradient(135deg, rgba(255,255,255,0.45), transparent 36%),
-        linear-gradient(180deg, transparent, rgba(255,255,255,0.22));
-      pointer-events: none;
-    }
-
-    .header {
-      position: relative;
-      padding: 30px 30px 20px;
-      border-bottom: 1px solid var(--line);
-    }
-
-    .eyebrow {
-      display: inline-block;
-      padding: 6px 12px;
-      border-radius: 999px;
-      background: var(--accent-soft);
-      color: var(--accent);
-      font-size: 14px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-    }
-
-    h1 {
-      margin: 14px 0 8px;
-      font-size: 40px;
-      line-height: 1.1;
-      letter-spacing: -0.03em;
-    }
-
-    .subline {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: center;
-      color: var(--muted);
-      font-size: 16px;
-    }
-
-    .count {
-      color: var(--ink);
-      font-weight: 700;
-    }
-
-    .avatars {
-      display: flex;
-      gap: 14px;
-      align-items: flex-end;
-      margin-top: 22px;
-      min-height: 118px;
-    }
-
-    .avatar {
-      width: 100px;
-      height: 100px;
-      object-fit: contain;
-      filter: drop-shadow(0 12px 18px rgba(76, 43, 20, 0.12));
-    }
-
-    .list {
-      position: relative;
-      padding: 18px 20px 22px;
-    }
-
-    .item {
-      display: grid;
-      grid-template-columns: 128px 1fr;
-      gap: 18px;
-      align-items: stretch;
-      padding: 12px 10px;
-    }
-
-    .item + .item {
-      border-top: 1px solid var(--line);
-    }
-
-    .time {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 96px;
-      border-radius: 22px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.9), rgba(255,248,241,0.95));
-      border: 1px solid rgba(216, 111, 69, 0.10);
-      color: var(--ink);
-      font-size: 32px;
-      font-weight: 800;
-      letter-spacing: -0.04em;
-    }
-
-    .card {
-      min-height: 96px;
-      border-radius: 22px;
-      padding: 18px 20px 16px;
-      background: var(--paper-strong);
-      border: 1px solid rgba(32, 26, 23, 0.06);
-    }
-
-    .meta {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-bottom: 10px;
-    }
-
-    .tag {
-      padding: 5px 10px;
-      border-radius: 999px;
-      background: #1f1b18;
-      color: #f7f1e7;
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-    }
-
-    .hosts {
-      color: var(--muted);
-      font-size: 16px;
-      font-weight: 600;
-    }
-
-    .content {
-      font-size: 28px;
-      line-height: 1.28;
-      font-weight: 700;
-      letter-spacing: -0.03em;
-      word-break: break-word;
-    }
-
-    .empty {
-      padding: 34px 28px 38px;
-      text-align: center;
-      color: var(--muted);
-      font-size: 22px;
-      line-height: 1.6;
-    }
-
-    .footer {
-      padding: 0 30px 26px;
-      color: rgba(114, 103, 95, 0.92);
-      font-size: 13px;
-      letter-spacing: 0.04em;
-    }
-  </style>
-</head>
-<body>
-  <div class="page">
-    <div class="panel">
-      <div class="header">
-        <div class="eyebrow">A-SOUL LIVE</div>
-        <h1>{{ date_text }} 今日直播</h1>
-        <div class="subline">
-          <span>{{ subtitle }}</span>
-          <span class="count">{{ count_text }}</span>
-        </div>
-        {% if avatars %}
-        <div class="avatars">
-          {% for avatar in avatars %}
-          <img class="avatar" src="{{ avatar.src }}" alt="{{ avatar.name }}" />
-          {% endfor %}
-        </div>
-        {% endif %}
-      </div>
-
-      {% if items %}
-      <div class="list">
-        {% for item in items %}
-        <div class="item">
-          <div class="time">{{ item.start_text }}</div>
-          <div class="card">
-            <div class="meta">
-              <span class="tag">{{ item.label }}</span>
-              <span class="hosts">{{ item.hosts_text }}</span>
-            </div>
-            <div class="content">{{ item.content }}</div>
-          </div>
-        </div>
-        {% endfor %}
-      </div>
-      {% else %}
-      <div class="empty">
-        今天还没有查到直播安排。<br />
-        晚点再发一次“直播数据”试试。
-      </div>
-      {% endif %}
-
-      <div class="footer">Data source: asoul.love/calendar.ics</div>
-    </div>
-  </div>
-</body>
-</html>
-"""
 
 
 @dataclass
@@ -641,30 +397,8 @@ class ASoulPlugin(Star):
         try:
             return await asyncio.to_thread(self._render_schedule_image_local, items)
         except Exception:
-            logger.exception("本地 Pillow 渲染失败，回退到 html_render")
-
-        today = datetime.now(DISPLAY_TZ).date()
-        render_data = {
-            "date_text": today.strftime("%Y-%m-%d"),
-            "subtitle": "按 calendar.ics 清洗后的今日直播安排",
-            "count_text": f"{len(items)} 条安排",
-            "avatars": self._load_avatar_data_list(),
-            "items": [
-                {
-                    "start_text": item.start_text,
-                    "hosts_text": item.hosts_text,
-                    "content": item.content,
-                    "label": item.label,
-                }
-                for item in items
-            ],
-        }
-        options = {
-            "type": "png",
-            "full_page": True,
-            "animations": "disabled",
-        }
-        return await self.html_render(SCHEDULE_IMAGE_TEMPLATE, render_data, options=options)
+            logger.exception("本地 Pillow 渲染失败")
+            raise
 
     def _render_schedule_image_local(self, items: List[ScheduleItem]) -> str:
         from PIL import Image, ImageDraw, ImageFont
@@ -673,7 +407,7 @@ class ASoulPlugin(Star):
         width = 1080
         outer_padding = 28
         panel_width = width - outer_padding * 2
-        header_height = 290
+        header_height = 224
         footer_height = 48
         list_gap = 18
         row_gap = 16
@@ -694,7 +428,8 @@ class ASoulPlugin(Star):
         measure_image = Image.new("RGBA", (width, 10), (0, 0, 0, 0))
         measure_draw = ImageDraw.Draw(measure_image)
         wrapped_items: List[Tuple[ScheduleItem, List[str], int]] = []
-        content_width = panel_width - 250 - 56 - 42
+        avatar_slot_width = 188
+        content_width = panel_width - 250 - avatar_slot_width - 54
         total_rows_height = 0
 
         for item in items:
@@ -769,8 +504,8 @@ class ASoulPlugin(Star):
             fill="#201a17",
         )
         draw.text(
-            (panel_left, title_top + 126),
-            "今日排班 · 数据来自 asoul.love/calendar.ics",
+            (panel_left, title_top + 130),
+            "今日排班",
             font=font_subtitle,
             fill="#74685f",
         )
@@ -779,14 +514,6 @@ class ASoulPlugin(Star):
             f"{len(items)} 条安排",
             font=font_count,
             fill="#c56d49",
-        )
-
-        self._paste_header_avatars(
-            image=image,
-            top=outer_padding + 34,
-            right=width - outer_padding - 36,
-            avatar_size=108,
-            gap=10,
         )
 
         list_top = outer_padding + header_height + list_gap
@@ -817,6 +544,7 @@ class ASoulPlugin(Star):
                 draw.text((time_x, time_y), item.start_text, font=font_time, fill="#201a17")
 
                 text_left = list_left + 204
+                avatar_left = width - outer_padding - 28 - avatar_slot_width + 22
                 label_width = self._text_width(draw, item.label, font_label) + 26
                 draw.rounded_rectangle(
                     (text_left, row_y + 22, text_left + label_width, row_y + 52),
@@ -832,6 +560,14 @@ class ASoulPlugin(Star):
                     font_content,
                     "#201a17",
                     line_spacing=10,
+                )
+                self._paste_item_avatars(
+                    image=image,
+                    hosts=item.hosts,
+                    left=avatar_left,
+                    top=row_y + 24,
+                    slot_width=avatar_slot_width - 40,
+                    slot_height=row_height - 48,
                 )
                 row_y = row_bottom + row_gap
         else:
@@ -873,6 +609,7 @@ class ASoulPlugin(Star):
 
     def _find_font_file(self) -> Optional[str]:
         candidates = [
+            str(PLUGIN_DIR / "GenJyuuGothic-Normal-2.ttf"),
             "/System/Library/Fonts/Hiragino Sans GB.ttc",
             "/System/Library/Fonts/PingFang.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -969,45 +706,52 @@ class ASoulPlugin(Star):
         for index, line in enumerate(lines):
             draw.text((x, y + index * (line_height + line_spacing)), line, font=font, fill=fill)
 
-    def _paste_header_avatars(self, image, top: int, right: int, avatar_size: int, gap: int) -> None:
+    def _paste_item_avatars(
+        self,
+        image,
+        hosts: List[str],
+        left: int,
+        top: int,
+        slot_width: int,
+        slot_height: int,
+    ) -> None:
         from PIL import Image
 
-        avatar_paths = self._get_avatar_paths()
+        avatar_map = self._get_avatar_path_map()
+        avatar_paths = [avatar_map[host] for host in hosts if host in avatar_map]
         if not avatar_paths:
             return
 
         resampling = getattr(Image, "Resampling", Image)
-        total_width = len(avatar_paths) * avatar_size + (len(avatar_paths) - 1) * gap
-        start_x = right - total_width
+        count = len(avatar_paths)
+        if count == 1:
+            avatar_size = min(112, slot_height)
+            gap = 0
+        elif count == 2:
+            avatar_size = min(82, slot_height)
+            gap = 8
+        else:
+            avatar_size = min(64, slot_height)
+            gap = 6
+
+        total_width = count * avatar_size + (count - 1) * gap
+        start_x = left + max(0, (slot_width - total_width) // 2)
+        base_y = top + max(0, (slot_height - avatar_size) // 2)
         for index, avatar_path in enumerate(avatar_paths):
             avatar = Image.open(avatar_path).convert("RGBA")
             avatar.thumbnail((avatar_size, avatar_size), resampling.LANCZOS)
             x = start_x + index * (avatar_size + gap)
-            y = top + max(0, avatar_size - avatar.height)
+            y = base_y + max(0, avatar_size - avatar.height) // 2
             image.alpha_composite(avatar, (x, y))
 
-    def _get_avatar_paths(self) -> List[Path]:
-        return [
-            Path(__file__).resolve().with_name(f"{name}.png")
-            for name in ("贝拉", "嘉然", "乃琳", "心宜", "思诺")
-            if Path(__file__).resolve().with_name(f"{name}.png").exists()
-        ]
-
-    def _load_avatar_data_list(self) -> List[Dict[str, str]]:
+    def _get_avatar_path_map(self) -> Dict[str, Path]:
         avatar_names = ("贝拉", "嘉然", "乃琳", "心宜", "思诺")
-        avatars: List[Dict[str, str]] = []
+        avatar_map: Dict[str, Path] = {}
         for name in avatar_names:
-            path = Path(__file__).resolve().with_name(f"{name}.png")
-            if not path.exists():
-                continue
-            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-            avatars.append(
-                {
-                    "name": name,
-                    "src": f"data:image/png;base64,{encoded}",
-                }
-            )
-        return avatars
+            path = PLUGIN_DIR / f"{name}.png"
+            if path.exists():
+                avatar_map[name] = path
+        return avatar_map
 
     def _extract_hosts(self, event: CalendarEvent) -> List[str]:
         description_line = next(
