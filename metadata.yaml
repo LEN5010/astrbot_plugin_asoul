@@ -1,6 +1,6 @@
 name: astrbot_plugin_asoul # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
 display_name: Asoul信息推送 # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
 desc: 给Bot推送Asoul信息。 # 插件简短描述
-version: v1.1.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+version: v1.2.0 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: LEN5010 # 作者
 repo: https://github.com/LEN5010/astrbot_plugin_asoul # 插件的仓库地址

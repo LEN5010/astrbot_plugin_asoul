@@ -18,8 +18,10 @@ CALENDAR_URL = "https://asoul.love/calendar.ics"
 CALENDAR_TTL = timedelta(minutes=10)
 DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 PLUGIN_DIR = Path(__file__).resolve().parent
-TRIGGER_TEXTS = {"直播数据", "今日直播"}
+TODAY_TRIGGER_TEXTS = {"今日直播"}
+TOMORROW_TRIGGER_TEXTS = {"明日直播"}
 HELP_TRIGGER_TEXTS = {"/bot帮助", "bot帮助"}
+NO_NEXT_WEEK_SCHEDULE_TEXT = "还没有下周的直播排表哦"
 LIVE_KEYWORDS = {
     "直播",
     "开播",
@@ -101,19 +103,30 @@ class ASoulPlugin(Star):
         yield event.plain_result(
             "鸣潮bot请使用【ww帮助】获取图文\n"
             "自动签到请使用【ww登陆】，然后输入【ww开启自动签到】\n"
-            "asoul推送请使用【直播数据】"
+            "asoul推送请使用【今日直播】或【明日直播】"
         )
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_live_request(self, event: AstrMessageEvent):
-        """用户发送“直播数据”时返回今日直播安排。"""
-        if event.message_str.strip() not in TRIGGER_TEXTS:
+        """用户发送“今日直播”或“明日直播”时返回直播安排。"""
+        message_text = event.message_str.strip()
+        if message_text not in TODAY_TRIGGER_TEXTS and message_text not in TOMORROW_TRIGGER_TEXTS:
             return
 
         event.stop_event()
+        today = datetime.now(DISPLAY_TZ).date()
+        if message_text in TODAY_TRIGGER_TEXTS:
+            target_day = today
+            title_text = "今日直播"
+        else:
+            if today.weekday() == 6:
+                yield event.plain_result(NO_NEXT_WEEK_SCHEDULE_TEXT)
+                return
+            target_day = today + timedelta(days=1)
+            title_text = "明日直播"
 
         try:
-            events = await self._get_today_live_events()
+            events = await self._get_live_events_for_day(target_day)
         except Exception:
             logger.exception("获取 A-SOUL 直播日历失败")
             yield event.plain_result("⚠️ 直播日历暂时不可用，请稍后再试。")
@@ -121,24 +134,23 @@ class ASoulPlugin(Star):
 
         items = self._build_schedule_items(events)
         try:
-            image_url = await self._render_schedule_image(items)
+            image_url = await self._render_schedule_image(items, target_day, title_text)
         except Exception:
             logger.exception("渲染直播图片失败")
-            yield event.plain_result(self._format_schedule_fallback(items))
+            yield event.plain_result(self._format_schedule_fallback(items, target_day, title_text))
             return
 
         yield event.image_result(image_url)
 
-    async def _get_today_live_events(self) -> List[CalendarEvent]:
-        today = datetime.now(DISPLAY_TZ).date()
+    async def _get_live_events_for_day(self, target_day: date) -> List[CalendarEvent]:
         calendar_events = await self._load_calendar_events()
-        today_events = [
+        filtered_events = [
             event
             for event in calendar_events
-            if self._is_same_day(event, today) and self._is_livestream_event(event)
+            if self._is_same_day(event, target_day) and self._is_livestream_event(event)
         ]
-        today_events.sort(key=lambda item: item.start)
-        return today_events
+        filtered_events.sort(key=lambda item: item.start)
+        return filtered_events
 
     async def _load_calendar_events(self) -> List[CalendarEvent]:
         now = datetime.now(timezone.utc)
@@ -407,17 +419,26 @@ class ASoulPlugin(Star):
         items.sort(key=lambda item: item.start)
         return items
 
-    async def _render_schedule_image(self, items: List[ScheduleItem]) -> str:
+    async def _render_schedule_image(
+        self,
+        items: List[ScheduleItem],
+        target_day: date,
+        title_text: str,
+    ) -> str:
         try:
-            return await asyncio.to_thread(self._render_schedule_image_local, items)
+            return await asyncio.to_thread(self._render_schedule_image_local, items, target_day, title_text)
         except Exception:
             logger.exception("本地 Pillow 渲染失败")
             raise
 
-    def _render_schedule_image_local(self, items: List[ScheduleItem]) -> str:
+    def _render_schedule_image_local(
+        self,
+        items: List[ScheduleItem],
+        target_day: date,
+        title_text: str,
+    ) -> str:
         from PIL import Image, ImageDraw, ImageFont
 
-        today = datetime.now(DISPLAY_TZ).date()
         width = 1080
         outer_padding = 28
         panel_width = width - outer_padding * 2
@@ -513,7 +534,7 @@ class ASoulPlugin(Star):
         draw.text((panel_left + 18, title_top + 8), "A-SOUL LIVE", font=font_label, fill="#c56d49")
         draw.text(
             (panel_left, title_top + 56),
-            f"{today.strftime('%Y-%m-%d')} 今日直播",
+            f"{target_day.strftime('%Y-%m-%d')} {title_text}",
             font=font_title,
             fill="#201a17",
         )
@@ -608,12 +629,17 @@ class ASoulPlugin(Star):
         image.save(output_path, format="PNG")
         return str(output_path)
 
-    def _format_schedule_fallback(self, items: List[ScheduleItem]) -> str:
-        today = datetime.now(DISPLAY_TZ).date().strftime("%Y-%m-%d")
+    def _format_schedule_fallback(
+        self,
+        items: List[ScheduleItem],
+        target_day: date,
+        title_text: str,
+    ) -> str:
+        day_text = target_day.strftime("%Y-%m-%d")
         if not items:
-            return f"{today} 今日暂无直播安排。"
+            return f"{day_text} 暂无{title_text}安排。"
 
-        lines = [f"{today} 今日直播安排"]
+        lines = [f"{day_text} {title_text}安排"]
         for item in items:
             lines.append(f"{item.start_text} {item.hosts_text} {item.content}")
         return "\n".join(lines)
