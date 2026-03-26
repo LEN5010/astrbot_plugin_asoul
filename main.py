@@ -609,13 +609,23 @@ class ASoulPlugin(Star):
 
     def _find_font_file(self) -> Optional[str]:
         candidates = [
-            str(PLUGIN_DIR / "GenJyuuGothic-Normal-2.ttf"),
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/PingFang.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJKsc-Regular.otf",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/source-han-sans/SourceHanSansCN-Regular.otf",
+            "/usr/share/fonts/opentype/sourcehansans/SourceHanSansCN-Regular.otf",
             "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
+            "/usr/share/fonts/truetype/arphic/ukai.ttc",
+            str(PLUGIN_DIR / "font.ttf"),
+            str(PLUGIN_DIR / "font.otf"),
+            str(PLUGIN_DIR / "GenJyuuGothic-Normal-2.ttf"),
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
         ]
         for candidate in candidates:
             if Path(candidate).exists():
