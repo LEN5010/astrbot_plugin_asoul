@@ -351,11 +351,13 @@ class ASoulPlugin(Star):
 
     async def _build_comment_test_notifications(self, uid: str) -> list[BilibiliNotification]:
         owner_name = await self._bilibili_gateway.get_user_name(uid)
+        recent_dynamics = await self._bilibili_gateway.get_recent_dynamics(uid, stop_at_id=None)
+        recent_videos = await self._bilibili_gateway.get_recent_videos(uid, stop_at_id=None)
         resources = self._build_comment_test_resources(
             uid,
             owner_name,
-            await self._bilibili_gateway.get_latest_dynamics(uid, 2),
-            await self._bilibili_gateway.get_latest_videos(uid, 2),
+            recent_dynamics[:2],
+            recent_videos[:2],
         )
         notifications: list[BilibiliNotification] = []
         watched_uids = {target_uid for target_uid in self._bilibili_config.target_uids}
