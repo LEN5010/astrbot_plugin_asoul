@@ -1,7 +1,6 @@
-import asyncio
 import logging
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 DEFAULT_BILIBILI_TARGET_UIDS = [
@@ -15,9 +14,18 @@ DEFAULT_BILIBILI_TARGET_UIDS = [
 ]
 DEFAULT_POLL_INTERVAL_SECONDS = 120
 MIN_POLL_INTERVAL_SECONDS = 30
+BILIBILI_CREDENTIAL_FIELDS = (
+    "sessdata",
+    "bili_jct",
+    "buvid3",
+    "buvid4",
+    "dedeuserid",
+    "ac_time_value",
+)
 
 KV_BILIBILI_MONITOR_STATE = "bilibili_monitor_state"
 KV_BILIBILI_GROUP_ORIGINS = "bilibili_group_origins"
+KV_BILIBILI_CREDENTIAL = "bilibili_credential"
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,14 @@ class BilibiliPushConfig:
     push_video: bool
     push_live: bool
     request_client: str
+    credential_data: Dict[str, str]
+
+
+@dataclass(frozen=True)
+class BilibiliRichTextNode:
+    kind: str
+    text: str = ""
+    image_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -39,6 +55,8 @@ class BilibiliDynamicPost:
     id: str
     text: str
     url: str
+    rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
+    image_urls: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -46,6 +64,7 @@ class BilibiliVideoPost:
     id: str
     title: str
     url: str
+    cover_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -54,6 +73,7 @@ class BilibiliLiveStatus:
     title: str
     room_id: str
     url: str
+    cover_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -63,15 +83,10 @@ class BilibiliNotification:
     author_name: str
     title: str
     url: str
-
-    def render_text(self) -> str:
-        prefix_map = {
-            "dynamic": "【B站动态】",
-            "video": "【B站新视频】",
-            "live": "【B站开播】",
-        }
-        prefix = prefix_map.get(self.kind, "【B站通知】")
-        return f"{prefix}{self.author_name}\n{self.title}\n{self.url}"
+    text: str = ""
+    rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
+    image_urls: List[str] = field(default_factory=list)
+    cover_url: str = ""
 
 
 def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> BilibiliPushConfig:
@@ -90,6 +105,7 @@ def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> Bilibili
         push_video=bool(source.get("push_video", True)),
         push_live=bool(source.get("push_live", True)),
         request_client=request_client,
+        credential_data=_normalize_credential_data(source),
     )
 
 
@@ -108,22 +124,77 @@ def _normalize_string_list(raw_value: Any) -> List[str]:
     return normalized
 
 
+def _normalize_credential_data(raw_value: Any) -> Dict[str, str]:
+    if isinstance(raw_value, dict) and any(key in raw_value for key in BILIBILI_CREDENTIAL_FIELDS):
+        source = raw_value
+    elif isinstance(raw_value, dict):
+        source = {}
+    else:
+        source = {}
+
+    normalized: Dict[str, str] = {}
+    for field_name in BILIBILI_CREDENTIAL_FIELDS:
+        value = source.get(field_name, "")
+        text = str(value or "").strip()
+        if text:
+            normalized[field_name] = text
+    return normalized
+
+
+def normalize_bilibili_credential_data(raw_value: Any) -> Dict[str, str]:
+    return _normalize_credential_data(raw_value)
+
+
 class BilibiliGateway:
-    def __init__(self, request_client: str = "aiohttp") -> None:
+    def __init__(
+        self,
+        request_client: str = "aiohttp",
+        credential_data: Optional[Dict[str, str]] = None,
+    ) -> None:
         self._request_client = request_client
         self._client_selected = False
+        self._credential_data = _normalize_credential_data(credential_data or {})
+        self._credential = None
+        if self._credential_data:
+            self._credential = self._build_credential(self._credential_data)
 
-    def _load_user_module(self):
-        from bilibili_api import select_client, user
+    def _load_modules(self):
+        from bilibili_api import Credential, select_client, user
 
         if not self._client_selected:
             select_client(self._request_client)
             self._client_selected = True
-        return user
+        return user, Credential
+
+    def _build_credential(self, credential_data: Dict[str, str]):
+        if not credential_data.get("sessdata"):
+            return None
+        _, credential_cls = self._load_modules()
+        return credential_cls(**credential_data)
+
+    def set_credential_data(self, credential_data: Optional[Dict[str, str]]) -> None:
+        self._credential_data = _normalize_credential_data(credential_data or {})
+        self._credential = self._build_credential(self._credential_data) if self._credential_data else None
+
+    def clear_credential(self) -> None:
+        self._credential_data = {}
+        self._credential = None
+
+    def get_credential_data(self) -> Dict[str, str]:
+        return dict(self._credential_data)
+
+    def has_credential(self) -> bool:
+        return bool(self._credential and self._credential.has_sessdata())
+
+    def _new_user(self, uid: str):
+        user_module, _ = self._load_modules()
+        kwargs: Dict[str, Any] = {"uid": int(uid)}
+        if self._credential is not None:
+            kwargs["credential"] = self._credential
+        return user_module.User(**kwargs)
 
     async def get_user_name(self, uid: str) -> str:
-        user_module = self._load_user_module()
-        user_obj = user_module.User(uid=int(uid))
+        user_obj = self._new_user(uid)
         info = await user_obj.get_user_info()
 
         for key in ("name", "uname", "nickname"):
@@ -138,8 +209,7 @@ class BilibiliGateway:
         uid: str,
         stop_at_id: Optional[str],
     ) -> List[BilibiliDynamicPost]:
-        user_module = self._load_user_module()
-        user_obj = user_module.User(uid=int(uid))
+        user_obj = self._new_user(uid)
 
         offset = ""
         collected: List[BilibiliDynamicPost] = []
@@ -153,6 +223,8 @@ class BilibiliGateway:
 
             reached_stop = False
             for item in items:
+                if self._is_pinned_dynamic(item):
+                    continue
                 parsed = self._parse_dynamic_post(item)
                 if parsed is None or parsed.id in seen_ids:
                     continue
@@ -179,8 +251,7 @@ class BilibiliGateway:
         uid: str,
         stop_at_id: Optional[str],
     ) -> List[BilibiliVideoPost]:
-        user_module = self._load_user_module()
-        user_obj = user_module.User(uid=int(uid))
+        user_obj = self._new_user(uid)
 
         page_index = 1
         collected: List[BilibiliVideoPost] = []
@@ -211,8 +282,7 @@ class BilibiliGateway:
         return collected
 
     async def get_live_status(self, uid: str) -> Optional[BilibiliLiveStatus]:
-        user_module = self._load_user_module()
-        user_obj = user_module.User(uid=int(uid))
+        user_obj = self._new_user(uid)
         info = await user_obj.get_live_info()
 
         live_status_value = self._find_first_value(info, ("live_status", "liveStatus", "roomStatus"))
@@ -222,11 +292,10 @@ class BilibiliGateway:
         room_id_value = self._find_first_value(info, ("roomid", "room_id", "roomId"))
         title_value = self._find_first_value(info, ("title", "roomtitle"))
         url_value = self._find_first_value(info, ("url", "link"))
+        cover_value = self._find_first_value(info, ("cover_from_user", "user_cover", "cover", "keyframe"))
 
         room_id = str(room_id_value).strip() if room_id_value is not None else ""
-        url = str(url_value).strip() if url_value is not None else ""
-        if url.startswith("//"):
-            url = f"https:{url}"
+        url = _normalize_url(str(url_value).strip() if url_value is not None else "")
         if not url and room_id:
             url = f"https://live.bilibili.com/{room_id}"
 
@@ -242,6 +311,7 @@ class BilibiliGateway:
             title=title or "直播已开始",
             room_id=room_id,
             url=url or "https://live.bilibili.com",
+            cover_url=_normalize_url(str(cover_value).strip() if cover_value is not None else ""),
         )
 
     def _extract_dynamic_items(self, page: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -266,6 +336,15 @@ class BilibiliGateway:
                 return [item for item in value if isinstance(item, dict)]
         return []
 
+    def _is_pinned_dynamic(self, item: Dict[str, Any]) -> bool:
+        modules = item.get("modules", {})
+        if not isinstance(modules, dict):
+            return False
+        module_tag = modules.get("module_tag", {})
+        if not isinstance(module_tag, dict):
+            return False
+        return str(module_tag.get("text", "") or "").strip() == "置顶"
+
     def _parse_dynamic_post(self, item: Dict[str, Any]) -> Optional[BilibiliDynamicPost]:
         dynamic_id = item.get("id_str") or item.get("id")
         if dynamic_id is None:
@@ -273,32 +352,93 @@ class BilibiliGateway:
         if dynamic_id is None:
             return None
 
+        rich_nodes, plain_text = self._extract_dynamic_rich_nodes(item)
+        image_urls = self._extract_dynamic_image_urls(item)
+
+        url_value = (
+            self._find_first_value(item.get("basic", {}), ("jump_url",))
+            or item.get("jump_url")
+            or item.get("url")
+            or self._find_first_value(item, ("jump_url", "url"))
+        )
+        url = _normalize_url(str(url_value).strip() if url_value is not None else "")
+        if not url:
+            url = f"https://t.bilibili.com/{dynamic_id}"
+
+        text = plain_text or "发布了新动态"
+        return BilibiliDynamicPost(
+            id=str(dynamic_id),
+            text=text,
+            url=url,
+            rich_nodes=rich_nodes,
+            image_urls=image_urls,
+        )
+
+    def _extract_dynamic_rich_nodes(self, item: Dict[str, Any]) -> tuple[List[BilibiliRichTextNode], str]:
         modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
         module_dynamic = modules.get("module_dynamic", {}) if isinstance(modules.get("module_dynamic"), dict) else {}
         desc = module_dynamic.get("desc", {}) if isinstance(module_dynamic.get("desc"), dict) else {}
         major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
+        opus = major.get("opus", {}) if isinstance(major.get("opus"), dict) else {}
+        summary = opus.get("summary", {}) if isinstance(opus.get("summary"), dict) else {}
 
-        text_candidates = [
-            desc.get("text"),
-            self._extract_nested_text(major.get("archive")),
-            self._extract_nested_text(major.get("article")),
-            self._extract_nested_text(major.get("opus")),
-            self._extract_nested_text(item),
-        ]
-        text = next((candidate for candidate in text_candidates if candidate), "发布了新动态")
+        raw_nodes = summary.get("rich_text_nodes")
+        if not isinstance(raw_nodes, list) or not raw_nodes:
+            raw_nodes = desc.get("rich_text_nodes")
+        if not isinstance(raw_nodes, list):
+            raw_nodes = []
 
-        url_value = item.get("jump_url") or item.get("url") or self._find_first_value(item, ("jump_url", "url"))
-        url = str(url_value).strip() if url_value is not None else ""
-        if url.startswith("//"):
-            url = f"https:{url}"
-        if not url:
-            url = f"https://t.bilibili.com/{dynamic_id}"
+        nodes: List[BilibiliRichTextNode] = []
+        plain_parts: List[str] = []
+        for raw_node in raw_nodes:
+            if not isinstance(raw_node, dict):
+                continue
+            emoji = raw_node.get("emoji", {}) if isinstance(raw_node.get("emoji"), dict) else {}
+            emoji_url = _normalize_url(str(emoji.get("icon_url", "") or ""))
+            node_text = str(raw_node.get("text", "") or emoji.get("text", "") or "")
+            if emoji_url:
+                nodes.append(BilibiliRichTextNode(kind="emoji", text=node_text, image_url=emoji_url))
+                if node_text:
+                    plain_parts.append(node_text)
+                continue
+            if node_text:
+                nodes.append(BilibiliRichTextNode(kind="text", text=node_text))
+                plain_parts.append(node_text)
 
-        return BilibiliDynamicPost(
-            id=str(dynamic_id),
-            text=_trim_text(text, 120),
-            url=url,
-        )
+        summary_text = str(summary.get("text", "") or desc.get("text", "") or "").strip()
+        plain_text = "".join(plain_parts).strip() or summary_text or self._extract_nested_text(major) or self._extract_nested_text(item)
+        if not nodes and plain_text:
+            nodes = [BilibiliRichTextNode(kind="text", text=plain_text)]
+
+        return nodes, plain_text.strip()
+
+    def _extract_dynamic_image_urls(self, item: Dict[str, Any]) -> List[str]:
+        modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
+        module_dynamic = modules.get("module_dynamic", {}) if isinstance(modules.get("module_dynamic"), dict) else {}
+        major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
+        image_urls: List[str] = []
+        seen = set()
+
+        def append_candidate(raw_value: Any) -> None:
+            url = _normalize_url(str(raw_value or "").strip())
+            if not url or url in seen:
+                return
+            seen.add(url)
+            image_urls.append(url)
+
+        opus = major.get("opus", {}) if isinstance(major.get("opus"), dict) else {}
+        for pic in opus.get("pics", []) if isinstance(opus.get("pics"), list) else []:
+            if not isinstance(pic, dict):
+                continue
+            append_candidate(pic.get("url") or pic.get("orig_url") or pic.get("img_src"))
+
+        draw = major.get("draw", {}) if isinstance(major.get("draw"), dict) else {}
+        for pic in draw.get("items", []) if isinstance(draw.get("items"), list) else []:
+            if not isinstance(pic, dict):
+                continue
+            append_candidate(pic.get("src") or pic.get("url") or pic.get("img_src"))
+
+        return image_urls
 
     def _parse_video_post(self, item: Dict[str, Any]) -> Optional[BilibiliVideoPost]:
         bvid = item.get("bvid") or self._find_first_value(item, ("bvid",))
@@ -311,18 +451,20 @@ class BilibiliGateway:
         title = str(title_value).strip() if title_value is not None else "发布了新视频"
 
         url_value = item.get("url") or item.get("link")
-        url = str(url_value).strip() if url_value is not None else ""
-        if url.startswith("//"):
-            url = f"https:{url}"
+        url = _normalize_url(str(url_value).strip() if url_value is not None else "")
         if not url and bvid:
             url = f"https://www.bilibili.com/video/{bvid}"
         if not url and aid:
             url = f"https://www.bilibili.com/video/av{aid}"
 
+        cover_value = item.get("pic") or self._find_first_value(item, ("pic", "cover"))
+        cover_url = _normalize_url(str(cover_value).strip() if cover_value is not None else "")
+
         return BilibiliVideoPost(
             id=str(video_id),
-            title=_trim_text(title, 120),
+            title=title or "发布了新视频",
             url=url or "https://www.bilibili.com",
+            cover_url=cover_url,
         )
 
     def _extract_nested_text(self, value: Any) -> str:
@@ -413,8 +555,11 @@ class BilibiliMonitorService:
                                 kind="dynamic",
                                 uid=uid,
                                 author_name=author_name,
-                                title=post.text,
+                                title="",
                                 url=post.url,
+                                text=post.text,
+                                rich_nodes=post.rich_nodes,
+                                image_urls=post.image_urls,
                             )
                         )
                 uid_state["last_dynamic_id"] = dynamics[0].id
@@ -432,6 +577,7 @@ class BilibiliMonitorService:
                                 author_name=author_name,
                                 title=post.title,
                                 url=post.url,
+                                cover_url=post.cover_url,
                             )
                         )
                 uid_state["last_video_id"] = videos[0].id
@@ -450,8 +596,9 @@ class BilibiliMonitorService:
                                 kind="live",
                                 uid=uid,
                                 author_name=author_name,
-                                title=_trim_text(live_status.title or "直播已开始", 120),
+                                title=live_status.title or "直播已开始",
                                 url=live_status.url,
+                                cover_url=live_status.cover_url,
                             )
                         )
                     uid_state["last_live_active"] = live_status.is_live
@@ -460,8 +607,10 @@ class BilibiliMonitorService:
         return uid_state, notifications
 
 
-def _trim_text(text: str, limit: int) -> str:
-    compact = " ".join(str(text or "").split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: max(0, limit - 1)].rstrip() + "…"
+def _normalize_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    if text.startswith("//"):
+        return f"https:{text}"
+    return text

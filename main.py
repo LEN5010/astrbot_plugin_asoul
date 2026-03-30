@@ -1,17 +1,23 @@
 import asyncio
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from bilibili_api import login_v2
 
 from asoul_bilibili import (
+    KV_BILIBILI_CREDENTIAL,
     KV_BILIBILI_GROUP_ORIGINS,
     KV_BILIBILI_MONITOR_STATE,
     BilibiliGateway,
     BilibiliMonitorService,
+    BilibiliRichTextNode,
     build_bilibili_push_config,
+    normalize_bilibili_credential_data,
 )
 from asoul_calendar import CalendarRepository
 from asoul_core import (
@@ -25,6 +31,10 @@ from asoul_core import (
 from asoul_render import ScheduleImageRenderer
 from asoul_schedule import ScheduleService
 
+GROUP_MESSAGE_TYPE = "GroupMessage"
+MIN_AT_ALL_REMAINING = 1
+QR_CODE_PATH = Path(__file__).resolve().parent / "temp" / "bilibili_login_qrcode.png"
+
 
 @register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "1.1.0")
 class ASoulPlugin(Star):
@@ -35,12 +45,18 @@ class ASoulPlugin(Star):
         self._schedule_service = ScheduleService()
         self._image_renderer = ScheduleImageRenderer()
         self._bilibili_config = build_bilibili_push_config(self.config)
+        self._bilibili_gateway = BilibiliGateway(
+            request_client=self._bilibili_config.request_client,
+            credential_data=self._bilibili_config.credential_data,
+        )
         self._bilibili_monitor = BilibiliMonitorService(
-            BilibiliGateway(request_client=self._bilibili_config.request_client)
+            self._bilibili_gateway
         )
         self._bilibili_task: asyncio.Task | None = None
         self._bilibili_group_origins: dict[str, str] = {}
         self._bilibili_monitor_state: dict = {}
+        self._bilibili_credential_data: dict[str, str] = {}
+        self._bilibili_missing_login_logged = False
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
@@ -132,13 +148,24 @@ class ASoulPlugin(Star):
     async def _load_bilibili_runtime_state(self) -> None:
         group_origins = await self.get_kv_data(KV_BILIBILI_GROUP_ORIGINS, {})
         monitor_state = await self.get_kv_data(KV_BILIBILI_MONITOR_STATE, {})
+        credential_data = await self.get_kv_data(KV_BILIBILI_CREDENTIAL, {})
         self._bilibili_group_origins = group_origins if isinstance(group_origins, dict) else {}
         self._bilibili_monitor_state = monitor_state if isinstance(monitor_state, dict) else {}
+        self._bilibili_credential_data = self._resolve_bilibili_credential_data(credential_data)
+        self._bilibili_gateway.set_credential_data(self._bilibili_credential_data)
 
     async def _run_bilibili_monitor_loop(self) -> None:
         logger.info("启动 B 站自动播报任务，轮询间隔 %s 秒", self._bilibili_config.poll_interval_seconds)
         try:
             while True:
+                if not self._bilibili_gateway.has_credential():
+                    if not self._bilibili_missing_login_logged:
+                        logger.warning("B 站自动播报未登录，轮询已暂停。请配置凭据或使用 /bili_login 登录。")
+                        self._bilibili_missing_login_logged = True
+                    await asyncio.sleep(self._bilibili_config.poll_interval_seconds)
+                    continue
+
+                self._bilibili_missing_login_logged = False
                 await self._poll_bilibili_updates_once()
                 await asyncio.sleep(self._bilibili_config.poll_interval_seconds)
         except asyncio.CancelledError:
@@ -164,7 +191,7 @@ class ASoulPlugin(Star):
         for notification in notifications:
             for unified_msg_origin in target_origins:
                 try:
-                    chain = self._build_notification_chain(notification)
+                    chain = await self._build_notification_chain(notification, unified_msg_origin)
                     await self.context.send_message(unified_msg_origin, chain)
                 except Exception:
                     logger.exception("发送 B 站播报失败: uid=%s kind=%s", notification.uid, notification.kind)
@@ -180,12 +207,181 @@ class ASoulPlugin(Star):
             origins.append(unified_msg_origin)
         return origins
 
-    def _build_notification_chain(self, notification) -> MessageChain:
-        if notification.kind == "live":
-            return MessageChain(
-                [
-                    Comp.At(qq="all"),
-                    Comp.Plain("\n" + notification.render_text()),
-                ]
+    async def _build_notification_chain(self, notification, unified_msg_origin: str) -> MessageChain:
+        chain_parts = self._build_notification_parts(notification)
+        if notification.kind == "live" and await self._should_send_live_atall(unified_msg_origin):
+            chain_parts = [Comp.AtAll(), Comp.Plain(" ")] + chain_parts
+        return MessageChain(chain_parts)
+
+    def _build_notification_parts(self, notification) -> list[Any]:
+        prefix_map = {
+            "dynamic": "【B站动态】",
+            "video": "【B站新视频】",
+            "live": "【B站开播】",
+        }
+        prefix = prefix_map.get(notification.kind, "【B站通知】")
+        chain_parts: list[Any] = [Comp.Plain(f"{prefix}{notification.author_name}\n")]
+
+        if notification.kind == "dynamic":
+            self._append_rich_text_parts(chain_parts, notification.rich_nodes, notification.text)
+            for image_url in notification.image_urls:
+                chain_parts.append(Comp.Plain("\n"))
+                chain_parts.append(Comp.Image.fromURL(image_url))
+        else:
+            title = str(notification.title or "").strip()
+            if title:
+                chain_parts.append(Comp.Plain(title))
+            cover_url = str(notification.cover_url or "").strip()
+            if cover_url:
+                chain_parts.append(Comp.Plain("\n"))
+                chain_parts.append(Comp.Image.fromURL(cover_url))
+
+        chain_parts.append(Comp.Plain(f"\n{notification.url}"))
+        return chain_parts
+
+    def _append_rich_text_parts(
+        self,
+        chain_parts: list[Any],
+        rich_nodes: list[BilibiliRichTextNode],
+        fallback_text: str,
+    ) -> None:
+        nodes = rich_nodes or []
+        if not nodes:
+            chain_parts.append(Comp.Plain(fallback_text or "发布了新动态"))
+            return
+
+        for node in nodes:
+            if node.kind == "emoji" and node.image_url:
+                chain_parts.append(Comp.Image.fromURL(node.image_url))
+                continue
+            if node.text:
+                chain_parts.append(Comp.Plain(node.text))
+
+    def _resolve_bilibili_credential_data(self, runtime_credential_data: Any) -> dict[str, str]:
+        runtime_data = normalize_bilibili_credential_data(runtime_credential_data)
+        if runtime_data:
+            return runtime_data
+        return normalize_bilibili_credential_data(self._bilibili_config.credential_data)
+
+    async def _save_bilibili_credential(self, credential_data: dict[str, str]) -> None:
+        normalized = normalize_bilibili_credential_data(credential_data)
+        self._bilibili_credential_data = normalized
+        self._bilibili_gateway.set_credential_data(normalized)
+        await self.put_kv_data(KV_BILIBILI_CREDENTIAL, normalized)
+
+    async def _clear_bilibili_credential(self) -> None:
+        self._bilibili_credential_data = {}
+        self._bilibili_gateway.clear_credential()
+        await self.delete_kv_data(KV_BILIBILI_CREDENTIAL)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_login")
+    async def bili_login(self, event: AstrMessageEvent):
+        if event.message_obj.group_id:
+            yield event.plain_result("请在私聊中使用 /bili_login。")
+            return
+
+        QR_CODE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        qr_login = login_v2.QrCodeLogin(platform=login_v2.QrCodeLoginChannel.WEB)
+        await qr_login.generate_qrcode()
+        qr_login.get_qrcode_picture().to_file(str(QR_CODE_PATH))
+
+        yield event.chain_result(
+            [
+                Comp.Plain("请使用哔哩哔哩 App 扫描二维码登录。"),
+                Comp.Image.fromFileSystem(str(QR_CODE_PATH)),
+            ]
+        )
+
+        try:
+            while True:
+                state = await qr_login.check_state()
+                if state == login_v2.QrCodeLoginEvents.DONE:
+                    credential = qr_login.get_credential()
+                    await self._save_bilibili_credential(credential.get_cookies())
+                    yield event.plain_result("B 站登录成功，自动播报已恢复。")
+                    return
+                if state == login_v2.QrCodeLoginEvents.TIMEOUT:
+                    yield event.plain_result("二维码已过期，请重新执行 /bili_login。")
+                    return
+                await asyncio.sleep(2)
+        except Exception:
+            logger.exception("B 站二维码登录失败")
+            yield event.plain_result("B 站登录失败，请查看日志。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_logout")
+    async def bili_logout(self, event: AstrMessageEvent):
+        await self._clear_bilibili_credential()
+        yield event.plain_result("已清除当前保存的 B 站登录态。")
+
+    async def _should_send_live_atall(self, unified_msg_origin: str) -> bool:
+        group_ctx = self._extract_group_session(unified_msg_origin)
+        if not group_ctx:
+            logger.info("直播 @全体仅支持群聊会话: %s", unified_msg_origin)
+            return False
+
+        platform_id, group_id = group_ctx
+        platform_inst = self.context.get_platform_inst(platform_id)
+        if not platform_inst:
+            logger.warning("直播 @全体失败：找不到平台实例 %s", platform_id)
+            return False
+
+        client = platform_inst.get_client()
+        if not client or not hasattr(client, "call_action"):
+            logger.warning("直播 @全体失败：平台 %s 不支持 call_action", platform_id)
+            return False
+
+        try:
+            group_id_param: int | str = int(group_id) if group_id.isdigit() else group_id
+            remain_raw = await client.call_action(
+                "get_group_at_all_remain",
+                group_id=group_id_param,
             )
-        return MessageChain([Comp.Plain(notification.render_text())])
+        except Exception:
+            logger.exception("查询群 %s @全体剩余次数失败", group_id)
+            return False
+
+        remain_data = self._extract_action_data(remain_raw)
+        can_at_all = bool(remain_data.get("can_at_all"))
+        group_remain = int(remain_data.get("remain_at_all_count_for_group", 0) or 0)
+        self_remain_value = remain_data.get(
+            "remain_at_all_count_for_self",
+            remain_data.get("remain_at_all_count_for_uin", 0),
+        )
+        self_remain = int(self_remain_value or 0)
+
+        if not can_at_all:
+            logger.info("群 %s 当前不允许 @全体成员", group_id)
+            return False
+        if group_remain < MIN_AT_ALL_REMAINING or self_remain < MIN_AT_ALL_REMAINING:
+            logger.info(
+                "群 %s @全体次数不足: group=%s, self=%s",
+                group_id,
+                group_remain,
+                self_remain,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _extract_group_session(unified_msg_origin: str) -> Optional[Tuple[str, str]]:
+        try:
+            platform_id, message_type, session_id = unified_msg_origin.split(":", 2)
+        except ValueError:
+            return None
+        if message_type != GROUP_MESSAGE_TYPE:
+            return None
+        group_id = session_id.split("_")[-1].strip()
+        if not group_id:
+            return None
+        return platform_id, group_id
+
+    @staticmethod
+    def _extract_action_data(action_result: Any) -> dict[str, Any]:
+        if not isinstance(action_result, dict):
+            return {}
+        payload = action_result.get("data")
+        if isinstance(payload, dict):
+            return payload
+        return action_result
