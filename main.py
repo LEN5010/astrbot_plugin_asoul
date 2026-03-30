@@ -219,6 +219,10 @@ class ASoulPlugin(Star):
             chain_parts = [Comp.AtAll(), Comp.Plain(" ")] + chain_parts
         return MessageChain(chain_parts)
 
+    @staticmethod
+    def _safe_plain_newline() -> str:
+        return "\u200b\n\u200b"
+
     def _build_notification_parts(self, notification) -> list[Any]:
         prefix_map = {
             "dynamic": "【B站动态】",
@@ -226,23 +230,26 @@ class ASoulPlugin(Star):
             "live": "【B站开播】",
         }
         prefix = prefix_map.get(notification.kind, "【B站通知】")
-        chain_parts: list[Any] = [Comp.Plain(f"{prefix}{notification.author_name}\n")]
+        chain_parts: list[Any] = [Comp.Plain(f"{prefix}{notification.author_name}")]
 
         if notification.kind == "dynamic":
+            chain_parts.append(Comp.Plain(self._safe_plain_newline()))
             self._append_rich_text_parts(chain_parts, notification.rich_nodes, notification.text)
             for image_url in notification.image_urls:
-                chain_parts.append(Comp.Plain("\n"))
+                chain_parts.append(Comp.Plain(self._safe_plain_newline()))
                 chain_parts.append(Comp.Image.fromURL(image_url))
         else:
             title = str(notification.title or "").strip()
             if title:
-                chain_parts.append(Comp.Plain(title))
+                chain_parts[0] = Comp.Plain(
+                    f"{prefix}{notification.author_name}{self._safe_plain_newline()}{title}"
+                )
             cover_url = str(notification.cover_url or "").strip()
             if cover_url:
-                chain_parts.append(Comp.Plain("\n"))
+                chain_parts.append(Comp.Plain(self._safe_plain_newline()))
                 chain_parts.append(Comp.Image.fromURL(cover_url))
 
-        chain_parts.append(Comp.Plain(f"\n{notification.url}"))
+        chain_parts.append(Comp.Plain(f"{self._safe_plain_newline()}{notification.url}"))
         return chain_parts
 
     def _append_rich_text_parts(
