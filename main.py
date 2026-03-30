@@ -15,6 +15,7 @@ if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
 from asoul_bilibili import (
+    BilibiliCommentResource,
     KV_BILIBILI_CREDENTIAL,
     KV_BILIBILI_GROUP_ORIGINS,
     KV_BILIBILI_MONITOR_STATE,
@@ -338,7 +339,7 @@ class ASoulPlugin(Star):
 
     async def _build_comment_test_notifications(self, uid: str) -> list[BilibiliNotification]:
         owner_name = await self._bilibili_gateway.get_user_name(uid)
-        resources = self._bilibili_monitor._build_comment_resources(
+        resources = self._build_comment_test_resources(
             uid,
             owner_name,
             await self._bilibili_gateway.get_latest_dynamics(uid, 2),
@@ -353,11 +354,83 @@ class ASoulPlugin(Star):
                 for comment_post in comments
                 if comment_post.author_uid in watched_uids
             ]
-            for comment_post in sorted(filtered_comments, key=lambda item: (item.created_at, int(item.id))):
+            for comment_post in sorted(filtered_comments, key=lambda item: (item.created_at, self._safe_int(item.id))):
                 notifications.append(
-                    self._bilibili_monitor._build_comment_notification(resource, comment_post)
+                    self._build_comment_test_notification(resource, comment_post)
                 )
         return notifications
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _build_comment_test_resources(
+        self,
+        owner_uid: str,
+        owner_name: str,
+        dynamics,
+        videos,
+    ) -> list[BilibiliCommentResource]:
+        resources: list[BilibiliCommentResource] = []
+
+        for post in dynamics:
+            if getattr(post, "comment_oid", 0) <= 0 or getattr(post, "comment_type", 0) <= 0:
+                continue
+            resources.append(
+                BilibiliCommentResource(
+                    key=f"dynamic:{post.comment_type}:{post.comment_oid}",
+                    owner_uid=owner_uid,
+                    owner_name=owner_name,
+                    resource_kind="dynamic",
+                    oid=post.comment_oid,
+                    type_value=post.comment_type,
+                    title=self._trim_plain_text(post.text, 80),
+                    url=post.url,
+                )
+            )
+
+        for post in videos:
+            if getattr(post, "comment_oid", 0) <= 0:
+                continue
+            resources.append(
+                BilibiliCommentResource(
+                    key=f"video:{post.comment_oid}",
+                    owner_uid=owner_uid,
+                    owner_name=owner_name,
+                    resource_kind="video",
+                    oid=post.comment_oid,
+                    type_value=1,
+                    title=self._trim_plain_text(post.title, 80),
+                    url=post.url,
+                )
+            )
+
+        return resources
+
+    def _build_comment_test_notification(self, resource: BilibiliCommentResource, comment_post) -> BilibiliNotification:
+        resource_text = "动态" if resource.resource_kind == "dynamic" else "视频"
+        owner_prefix = "自己的" if resource.owner_uid == comment_post.author_uid else f"{resource.owner_name} 的"
+        action_text = "回复了评论" if comment_post.is_reply else "发表了评论"
+        title = f"在 {owner_prefix}{resource_text}下{action_text}"
+        body = f"{resource.title}\n{comment_post.text}" if resource.title else comment_post.text
+        return BilibiliNotification(
+            kind="comment",
+            uid=comment_post.author_uid,
+            author_name=comment_post.author_name,
+            title=title,
+            url=resource.url,
+            text=body,
+        )
+
+    @staticmethod
+    def _trim_plain_text(text: str, limit: int) -> str:
+        compact = " ".join(str(text or "").split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(0, limit - 1)].rstrip() + "…"
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_dynamic")
