@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -15,7 +16,6 @@ if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
 from asoul_bilibili import (
-    BilibiliCommentResource,
     KV_BILIBILI_CREDENTIAL,
     KV_BILIBILI_GROUP_ORIGINS,
     KV_BILIBILI_MONITOR_STATE,
@@ -41,6 +41,18 @@ from asoul_schedule import ScheduleService
 GROUP_MESSAGE_TYPE = "GroupMessage"
 MIN_AT_ALL_REMAINING = 1
 QR_CODE_PATH = Path(__file__).resolve().parent / "temp" / "bilibili_login_qrcode.png"
+
+
+@dataclass(frozen=True)
+class CommentTestResource:
+    key: str
+    owner_uid: str
+    owner_name: str
+    resource_kind: str
+    oid: int
+    type_value: int
+    title: str
+    url: str
 
 
 @register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "1.1.0")
@@ -373,14 +385,14 @@ class ASoulPlugin(Star):
         owner_name: str,
         dynamics,
         videos,
-    ) -> list[BilibiliCommentResource]:
-        resources: list[BilibiliCommentResource] = []
+    ) -> list[CommentTestResource]:
+        resources: list[CommentTestResource] = []
 
         for post in dynamics:
             if getattr(post, "comment_oid", 0) <= 0 or getattr(post, "comment_type", 0) <= 0:
                 continue
             resources.append(
-                BilibiliCommentResource(
+                CommentTestResource(
                     key=f"dynamic:{post.comment_type}:{post.comment_oid}",
                     owner_uid=owner_uid,
                     owner_name=owner_name,
@@ -396,7 +408,7 @@ class ASoulPlugin(Star):
             if getattr(post, "comment_oid", 0) <= 0:
                 continue
             resources.append(
-                BilibiliCommentResource(
+                CommentTestResource(
                     key=f"video:{post.comment_oid}",
                     owner_uid=owner_uid,
                     owner_name=owner_name,
@@ -410,7 +422,7 @@ class ASoulPlugin(Star):
 
         return resources
 
-    def _build_comment_test_notification(self, resource: BilibiliCommentResource, comment_post) -> BilibiliNotification:
+    def _build_comment_test_notification(self, resource: CommentTestResource, comment_post) -> BilibiliNotification:
         resource_text = "动态" if resource.resource_kind == "dynamic" else "视频"
         owner_prefix = "自己的" if resource.owner_uid == comment_post.author_uid else f"{resource.owner_name} 的"
         action_text = "回复了评论" if comment_post.is_reply else "发表了评论"
