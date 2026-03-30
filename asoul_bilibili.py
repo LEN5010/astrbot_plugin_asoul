@@ -14,6 +14,8 @@ DEFAULT_BILIBILI_TARGET_UIDS = [
 ]
 DEFAULT_POLL_INTERVAL_SECONDS = 120
 MIN_POLL_INTERVAL_SECONDS = 30
+COMMENT_RESOURCE_LIMIT_PER_KIND = 2
+COMMENT_RECENT_IDS_LIMIT = 20
 BILIBILI_CREDENTIAL_FIELDS = (
     "sessdata",
     "bili_jct",
@@ -39,6 +41,7 @@ class BilibiliPushConfig:
     push_dynamic: bool
     push_video: bool
     push_live: bool
+    push_comment: bool
     request_client: str
     credential_data: Dict[str, str]
 
@@ -57,6 +60,8 @@ class BilibiliDynamicPost:
     url: str
     rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
     image_urls: List[str] = field(default_factory=list)
+    comment_oid: int = 0
+    comment_type: int = 0
 
 
 @dataclass(frozen=True)
@@ -65,6 +70,7 @@ class BilibiliVideoPost:
     title: str
     url: str
     cover_url: str = ""
+    comment_oid: int = 0
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,28 @@ class BilibiliNotification:
     cover_url: str = ""
 
 
+@dataclass(frozen=True)
+class BilibiliCommentResource:
+    key: str
+    owner_uid: str
+    owner_name: str
+    resource_kind: str
+    oid: int
+    type_value: int
+    title: str
+    url: str
+
+
+@dataclass(frozen=True)
+class BilibiliCommentPost:
+    id: str
+    author_uid: str
+    author_name: str
+    text: str
+    created_at: int
+    is_reply: bool
+
+
 def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> BilibiliPushConfig:
     source = raw_config or {}
     poll_interval = int(source.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS) or DEFAULT_POLL_INTERVAL_SECONDS)
@@ -104,6 +132,7 @@ def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> Bilibili
         push_dynamic=bool(source.get("push_dynamic", True)),
         push_video=bool(source.get("push_video", True)),
         push_live=bool(source.get("push_live", True)),
+        push_comment=bool(source.get("push_comment", True)),
         request_client=request_client,
         credential_data=_normalize_credential_data(source),
     )
@@ -159,17 +188,17 @@ class BilibiliGateway:
             self._credential = self._build_credential(self._credential_data)
 
     def _load_modules(self):
-        from bilibili_api import Credential, select_client, user
+        from bilibili_api import Credential, comment, select_client, user
 
         if not self._client_selected:
             select_client(self._request_client)
             self._client_selected = True
-        return user, Credential
+        return user, Credential, comment
 
     def _build_credential(self, credential_data: Dict[str, str]):
         if not credential_data.get("sessdata"):
             return None
-        _, credential_cls = self._load_modules()
+        _, credential_cls, _ = self._load_modules()
         return credential_cls(**credential_data)
 
     def set_credential_data(self, credential_data: Optional[Dict[str, str]]) -> None:
@@ -187,7 +216,7 @@ class BilibiliGateway:
         return bool(self._credential and self._credential.has_sessdata())
 
     def _new_user(self, uid: str):
-        user_module, _ = self._load_modules()
+        user_module, _, _ = self._load_modules()
         kwargs: Dict[str, Any] = {"uid": int(uid)}
         if self._credential is not None:
             kwargs["credential"] = self._credential
@@ -208,6 +237,7 @@ class BilibiliGateway:
         self,
         uid: str,
         stop_at_id: Optional[str],
+        max_items: Optional[int] = None,
     ) -> List[BilibiliDynamicPost]:
         user_obj = self._new_user(uid)
 
@@ -233,10 +263,13 @@ class BilibiliGateway:
                     break
                 seen_ids.add(parsed.id)
                 collected.append(parsed)
+                if max_items is not None and len(collected) >= max_items:
+                    reached_stop = True
+                    break
 
             if reached_stop:
                 break
-            if stop_at_id is None and collected:
+            if stop_at_id is None and collected and max_items is None:
                 break
 
             next_offset = page.get("offset") or page.get("next_offset") or ""
@@ -250,6 +283,7 @@ class BilibiliGateway:
         self,
         uid: str,
         stop_at_id: Optional[str],
+        max_items: Optional[int] = None,
     ) -> List[BilibiliVideoPost]:
         user_obj = self._new_user(uid)
 
@@ -273,13 +307,22 @@ class BilibiliGateway:
                     break
                 seen_ids.add(parsed.id)
                 collected.append(parsed)
+                if max_items is not None and len(collected) >= max_items:
+                    reached_stop = True
+                    break
 
-            if reached_stop or (stop_at_id is None and collected) or len(items) < 30:
+            if reached_stop or (stop_at_id is None and collected and max_items is None) or len(items) < 30:
                 break
 
             page_index += 1
 
         return collected
+
+    async def get_latest_dynamics(self, uid: str, limit: int) -> List[BilibiliDynamicPost]:
+        return await self.get_recent_dynamics(uid, stop_at_id=None, max_items=max(1, limit))
+
+    async def get_latest_videos(self, uid: str, limit: int) -> List[BilibiliVideoPost]:
+        return await self.get_recent_videos(uid, stop_at_id=None, max_items=max(1, limit))
 
     async def get_live_status(self, uid: str) -> Optional[BilibiliLiveStatus]:
         user_obj = self._new_user(uid)
@@ -313,6 +356,38 @@ class BilibiliGateway:
             url=url or "https://live.bilibili.com",
             cover_url=_normalize_url(str(cover_value).strip() if cover_value is not None else ""),
         )
+
+    async def get_recent_comments(self, resource: BilibiliCommentResource) -> List[BilibiliCommentPost]:
+        _, _, comment_module = self._load_modules()
+        comment_type = comment_module.CommentResourceType(resource.type_value)
+        page = await comment_module.get_comments_lazy(
+            oid=resource.oid,
+            type_=comment_type,
+            order=comment_module.OrderType.TIME,
+            credential=self._credential,
+        )
+        replies = page.get("replies")
+        if not isinstance(replies, list):
+            return []
+
+        parsed: List[BilibiliCommentPost] = []
+        seen_ids = set()
+
+        def visit(reply_items: List[Dict[str, Any]]) -> None:
+            for reply in reply_items:
+                if not isinstance(reply, dict):
+                    continue
+                comment_post = self._parse_comment_post(reply)
+                if comment_post and comment_post.id not in seen_ids:
+                    seen_ids.add(comment_post.id)
+                    parsed.append(comment_post)
+                nested_replies = reply.get("replies")
+                if isinstance(nested_replies, list) and nested_replies:
+                    visit([item for item in nested_replies if isinstance(item, dict)])
+
+        visit([item for item in replies if isinstance(item, dict)])
+        parsed.sort(key=lambda item: (item.created_at, _safe_int(item.id)), reverse=True)
+        return parsed
 
     def _extract_dynamic_items(self, page: Dict[str, Any]) -> List[Dict[str, Any]]:
         for key in ("items", "cards", "list"):
@@ -366,12 +441,20 @@ class BilibiliGateway:
             url = f"https://t.bilibili.com/{dynamic_id}"
 
         text = plain_text or "发布了新动态"
+        comment_oid = _safe_int(
+            self._find_first_value(item.get("basic", {}), ("comment_id_str", "comment_id"))
+        )
+        comment_type = _safe_int(
+            self._find_first_value(item.get("basic", {}), ("comment_type",))
+        )
         return BilibiliDynamicPost(
             id=str(dynamic_id),
             text=text,
             url=url,
             rich_nodes=rich_nodes,
             image_urls=image_urls,
+            comment_oid=comment_oid,
+            comment_type=comment_type,
         )
 
     def _extract_dynamic_rich_nodes(self, item: Dict[str, Any]) -> tuple[List[BilibiliRichTextNode], str]:
@@ -465,6 +548,7 @@ class BilibiliGateway:
             title=title or "发布了新视频",
             url=url or "https://www.bilibili.com",
             cover_url=cover_url,
+            comment_oid=_safe_int(aid),
         )
 
     def _extract_nested_text(self, value: Any) -> str:
@@ -484,6 +568,29 @@ class BilibiliGateway:
                 if nested:
                     return nested
         return ""
+
+    def _parse_comment_post(self, reply: Dict[str, Any]) -> Optional[BilibiliCommentPost]:
+        comment_id = reply.get("rpid_str") or reply.get("rpid")
+        if comment_id is None:
+            return None
+
+        member = reply.get("member", {}) if isinstance(reply.get("member"), dict) else {}
+        content = reply.get("content", {}) if isinstance(reply.get("content"), dict) else {}
+        author_uid = str(member.get("mid", "") or "").strip()
+        author_name = str(member.get("uname", "") or "").strip()
+        text = str(content.get("message", "") or "").strip()
+        if not author_uid or not author_name or not text:
+            return None
+
+        parent_id = _safe_int(reply.get("parent"))
+        return BilibiliCommentPost(
+            id=str(comment_id),
+            author_uid=author_uid,
+            author_name=author_name,
+            text=text,
+            created_at=_safe_int(reply.get("ctime")),
+            is_reply=parent_id > 0,
+        )
 
     def _find_first_value(self, value: Any, candidate_keys: Sequence[str]) -> Optional[Any]:
         if isinstance(value, dict):
@@ -604,7 +711,162 @@ class BilibiliMonitorService:
                     uid_state["last_live_active"] = live_status.is_live
                     uid_state["last_live_room_id"] = live_status.room_id
 
+        if config.push_comment:
+            comment_notifications = await self._poll_uid_comments(
+                uid=uid,
+                owner_name=author_name,
+                config=config,
+                uid_state=uid_state,
+            )
+            notifications.extend(comment_notifications)
+
         return uid_state, notifications
+
+    async def _poll_uid_comments(
+        self,
+        uid: str,
+        owner_name: str,
+        config: BilibiliPushConfig,
+        uid_state: Dict[str, Any],
+    ) -> List[BilibiliNotification]:
+        latest_dynamics = await self._gateway.get_latest_dynamics(uid, COMMENT_RESOURCE_LIMIT_PER_KIND)
+        latest_videos = await self._gateway.get_latest_videos(uid, COMMENT_RESOURCE_LIMIT_PER_KIND)
+        resources = self._build_comment_resources(uid, owner_name, latest_dynamics, latest_videos)
+        if not resources:
+            uid_state["comment_resources"] = {}
+            return []
+
+        watched_uids = {target_uid for target_uid in config.target_uids}
+        resource_state_map = uid_state.setdefault("comment_resources", {})
+        active_keys = {resource.key for resource in resources}
+        notifications: List[BilibiliNotification] = []
+
+        for resource in resources:
+            state = resource_state_map.get(resource.key)
+            comments = await self._gateway.get_recent_comments(resource)
+            filtered_comments = [
+                comment_post
+                for comment_post in comments
+                if comment_post.author_uid in watched_uids
+            ]
+
+            if not isinstance(state, dict) or not state.get("initialized"):
+                resource_state_map[resource.key] = self._build_comment_resource_state(filtered_comments, state)
+                continue
+
+            known_ids = {
+                str(item).strip()
+                for item in state.get("recent_comment_ids", [])
+                if str(item).strip()
+            }
+            last_comment_id = str(state.get("last_comment_id", "") or "").strip()
+            if last_comment_id:
+                known_ids.add(last_comment_id)
+
+            new_comments = [
+                comment_post
+                for comment_post in filtered_comments
+                if comment_post.id not in known_ids
+            ]
+            if new_comments:
+                for comment_post in sorted(new_comments, key=lambda item: (item.created_at, _safe_int(item.id))):
+                    notifications.append(self._build_comment_notification(resource, comment_post))
+
+            resource_state_map[resource.key] = self._build_comment_resource_state(filtered_comments, state)
+
+        uid_state["comment_resources"] = {
+            key: value
+            for key, value in resource_state_map.items()
+            if key in active_keys
+        }
+        return notifications
+
+    def _build_comment_resources(
+        self,
+        owner_uid: str,
+        owner_name: str,
+        dynamics: List[BilibiliDynamicPost],
+        videos: List[BilibiliVideoPost],
+    ) -> List[BilibiliCommentResource]:
+        resources: List[BilibiliCommentResource] = []
+
+        for post in dynamics:
+            if post.comment_oid <= 0 or post.comment_type <= 0:
+                continue
+            resources.append(
+                BilibiliCommentResource(
+                    key=f"dynamic:{post.comment_type}:{post.comment_oid}",
+                    owner_uid=owner_uid,
+                    owner_name=owner_name,
+                    resource_kind="dynamic",
+                    oid=post.comment_oid,
+                    type_value=post.comment_type,
+                    title=_trim_text(post.text or "动态", 80),
+                    url=post.url,
+                )
+            )
+
+        for post in videos:
+            if post.comment_oid <= 0:
+                continue
+            resources.append(
+                BilibiliCommentResource(
+                    key=f"video:{post.comment_oid}",
+                    owner_uid=owner_uid,
+                    owner_name=owner_name,
+                    resource_kind="video",
+                    oid=post.comment_oid,
+                    type_value=1,
+                    title=_trim_text(post.title or "视频", 80),
+                    url=post.url,
+                )
+            )
+
+        return resources
+
+    def _build_comment_resource_state(
+        self,
+        comments: List[BilibiliCommentPost],
+        previous_state: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        previous = previous_state if isinstance(previous_state, dict) else {}
+        current_ids = [comment_post.id for comment_post in comments if comment_post.id]
+        merged_ids: List[str] = []
+        seen = set()
+        for comment_id in current_ids + list(previous.get("recent_comment_ids", [])):
+            text = str(comment_id).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged_ids.append(text)
+            if len(merged_ids) >= COMMENT_RECENT_IDS_LIMIT:
+                break
+
+        last_comment_id = current_ids[0] if current_ids else str(previous.get("last_comment_id", "") or "").strip()
+        return {
+            "initialized": True,
+            "last_comment_id": last_comment_id,
+            "recent_comment_ids": merged_ids,
+        }
+
+    def _build_comment_notification(
+        self,
+        resource: BilibiliCommentResource,
+        comment_post: BilibiliCommentPost,
+    ) -> BilibiliNotification:
+        resource_text = "动态" if resource.resource_kind == "dynamic" else "视频"
+        owner_prefix = "自己的" if resource.owner_uid == comment_post.author_uid else f"{resource.owner_name} 的"
+        action_text = "回复了评论" if comment_post.is_reply else "发表了评论"
+        title = f"在 {owner_prefix}{resource_text}下{action_text}"
+        body = f"{resource.title}\n{comment_post.text}" if resource.title else comment_post.text
+        return BilibiliNotification(
+            kind="comment",
+            uid=comment_post.author_uid,
+            author_name=comment_post.author_name,
+            title=title,
+            url=resource.url,
+            text=body,
+        )
 
 
 def _normalize_url(url: str) -> str:
@@ -614,3 +876,17 @@ def _normalize_url(url: str) -> str:
     if text.startswith("//"):
         return f"https:{text}"
     return text
+
+
+def _trim_text(text: str, limit: int) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0

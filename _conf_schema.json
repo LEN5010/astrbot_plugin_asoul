@@ -94,5 +94,11 @@
     "description": "播报开播信息",
     "type": "bool",
     "default": true
+  },
+  "push_comment": {
+    "description": "播报最近资源下的目标评论",
+    "type": "bool",
+    "default": true,
+    "hint": "轮询默认 UID 集合最近动态/视频下的新评论，覆盖互相串台和回复评论场景。"
   }
 }

@@ -228,6 +228,7 @@ class ASoulPlugin(Star):
             "dynamic": "【B站动态】",
             "video": "【B站新视频】",
             "live": "【B站开播】",
+            "comment": "【B站评论】",
         }
         prefix = prefix_map.get(notification.kind, "【B站通知】")
         chain_parts: list[Any] = [Comp.Plain(f"{prefix}{notification.author_name}")]
@@ -238,6 +239,15 @@ class ASoulPlugin(Star):
             for image_url in notification.image_urls:
                 chain_parts.append(Comp.Plain(self._safe_plain_newline()))
                 chain_parts.append(Comp.Image.fromURL(image_url))
+        elif notification.kind == "comment":
+            title = str(notification.title or "").strip()
+            text = str(notification.text or "").strip()
+            detail_parts = [part for part in (title, text) if part]
+            if detail_parts:
+                chain_parts[0] = Comp.Plain(
+                    f"{prefix}{notification.author_name}{self._safe_plain_newline()}"
+                    + self._safe_plain_newline().join(detail_parts)
+                )
         else:
             title = str(notification.title or "").strip()
             if title:
@@ -326,6 +336,29 @@ class ASoulPlugin(Star):
             cover_url=post.cover_url,
         )
 
+    async def _build_comment_test_notifications(self, uid: str) -> list[BilibiliNotification]:
+        owner_name = await self._bilibili_gateway.get_user_name(uid)
+        resources = self._bilibili_monitor._build_comment_resources(
+            uid,
+            owner_name,
+            await self._bilibili_gateway.get_latest_dynamics(uid, 2),
+            await self._bilibili_gateway.get_latest_videos(uid, 2),
+        )
+        notifications: list[BilibiliNotification] = []
+        watched_uids = {target_uid for target_uid in self._bilibili_config.target_uids}
+        for resource in resources:
+            comments = await self._bilibili_gateway.get_recent_comments(resource)
+            filtered_comments = [
+                comment_post
+                for comment_post in comments
+                if comment_post.author_uid in watched_uids
+            ]
+            for comment_post in sorted(filtered_comments, key=lambda item: (item.created_at, int(item.id))):
+                notifications.append(
+                    self._bilibili_monitor._build_comment_notification(resource, comment_post)
+                )
+        return notifications
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_dynamic")
     async def bili_test_dynamic(self, event: AstrMessageEvent, uid: str):
@@ -411,27 +444,47 @@ class ASoulPlugin(Star):
         live_status = await self._bilibili_gateway.get_live_status(uid)
         if live_status is None:
             yield event.plain_result(f"UID {uid} 当前没有抓到直播间信息。")
-            return
-
-        author_name = await self._bilibili_gateway.get_user_name(uid)
-        if not live_status.is_live:
-            yield event.plain_result(
-                f"【B站直播状态】{author_name}\n当前未开播\n{live_status.url}"
-            )
-            return
-
-        yield event.chain_result(
-            self._build_notification_parts(
-                BilibiliNotification(
-                    kind="live",
-                    uid=uid,
-                    author_name=author_name,
-                    title=live_status.title,
-                    url=live_status.url,
-                    cover_url=live_status.cover_url,
+        else:
+            author_name = await self._bilibili_gateway.get_user_name(uid)
+            if not live_status.is_live:
+                yield event.plain_result(
+                    f"【B站直播状态】{author_name}\n当前未开播\n{live_status.url}"
                 )
-            )
-        )
+            else:
+                yield event.chain_result(
+                    self._build_notification_parts(
+                        BilibiliNotification(
+                            kind="live",
+                            uid=uid,
+                            author_name=author_name,
+                            title=live_status.title,
+                            url=live_status.url,
+                            cover_url=live_status.cover_url,
+                        )
+                    )
+                )
+
+        comment_notifications = await self._build_comment_test_notifications(uid)
+        if not comment_notifications:
+            yield event.plain_result(f"UID {uid} 当前最近资源下没有抓到目标评论。")
+        else:
+            for notification in comment_notifications:
+                yield event.chain_result(self._build_notification_parts(notification))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_test_comment")
+    async def bili_test_comment(self, event: AstrMessageEvent, uid: str):
+        error_text = self._ensure_private_bili_command(event)
+        if error_text:
+            yield event.plain_result(error_text)
+            return
+
+        notifications = await self._build_comment_test_notifications(uid)
+        if not notifications:
+            yield event.plain_result(f"UID {uid} 当前最近资源下没有抓到目标评论。")
+            return
+        for notification in notifications:
+            yield event.chain_result(self._build_notification_parts(notification))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_login")
