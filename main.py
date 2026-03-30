@@ -15,6 +15,7 @@ from asoul_bilibili import (
     KV_BILIBILI_MONITOR_STATE,
     BilibiliGateway,
     BilibiliMonitorService,
+    BilibiliNotification,
     BilibiliRichTextNode,
     build_bilibili_push_config,
     normalize_bilibili_credential_data,
@@ -273,6 +274,152 @@ class ASoulPlugin(Star):
         self._bilibili_credential_data = {}
         self._bilibili_gateway.clear_credential()
         await self.delete_kv_data(KV_BILIBILI_CREDENTIAL)
+
+    def _ensure_private_bili_command(self, event: AstrMessageEvent) -> Optional[str]:
+        if event.message_obj.group_id:
+            return "请在私聊中使用这个指令。"
+        if not self._bilibili_gateway.has_credential():
+            return "当前未登录 B 站，请先使用 /bili_login。"
+        return None
+
+    async def _build_dynamic_test_notification(self, uid: str) -> Optional[BilibiliNotification]:
+        posts = await self._bilibili_gateway.get_recent_dynamics(uid, stop_at_id=None)
+        if not posts:
+            return None
+
+        post = posts[0]
+        return BilibiliNotification(
+            kind="dynamic",
+            uid=uid,
+            author_name=await self._bilibili_gateway.get_user_name(uid),
+            title="",
+            url=post.url,
+            text=post.text,
+            rich_nodes=post.rich_nodes,
+            image_urls=post.image_urls,
+        )
+
+    async def _build_video_test_notification(self, uid: str) -> Optional[BilibiliNotification]:
+        posts = await self._bilibili_gateway.get_recent_videos(uid, stop_at_id=None)
+        if not posts:
+            return None
+
+        post = posts[0]
+        return BilibiliNotification(
+            kind="video",
+            uid=uid,
+            author_name=await self._bilibili_gateway.get_user_name(uid),
+            title=post.title,
+            url=post.url,
+            cover_url=post.cover_url,
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_test_dynamic")
+    async def bili_test_dynamic(self, event: AstrMessageEvent, uid: str):
+        error_text = self._ensure_private_bili_command(event)
+        if error_text:
+            yield event.plain_result(error_text)
+            return
+
+        notification = await self._build_dynamic_test_notification(uid)
+        if notification is None:
+            yield event.plain_result(f"UID {uid} 当前没有抓到可用动态。")
+            return
+
+        yield event.chain_result(self._build_notification_parts(notification))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_test_video")
+    async def bili_test_video(self, event: AstrMessageEvent, uid: str):
+        error_text = self._ensure_private_bili_command(event)
+        if error_text:
+            yield event.plain_result(error_text)
+            return
+
+        notification = await self._build_video_test_notification(uid)
+        if notification is None:
+            yield event.plain_result(f"UID {uid} 当前没有抓到可用视频。")
+            return
+
+        yield event.chain_result(self._build_notification_parts(notification))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_test_live")
+    async def bili_test_live(self, event: AstrMessageEvent, uid: str):
+        error_text = self._ensure_private_bili_command(event)
+        if error_text:
+            yield event.plain_result(error_text)
+            return
+
+        live_status = await self._bilibili_gateway.get_live_status(uid)
+        if live_status is None:
+            yield event.plain_result(f"UID {uid} 当前没有抓到直播间信息。")
+            return
+
+        author_name = await self._bilibili_gateway.get_user_name(uid)
+        if not live_status.is_live:
+            yield event.plain_result(
+                f"【B站直播状态】{author_name}\n当前未开播\n{live_status.url}"
+            )
+            return
+
+        notification = BilibiliNotification(
+            kind="live",
+            uid=uid,
+            author_name=author_name,
+            title=live_status.title,
+            url=live_status.url,
+            cover_url=live_status.cover_url,
+        )
+        yield event.chain_result(self._build_notification_parts(notification))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_test_all")
+    async def bili_test_all(self, event: AstrMessageEvent, uid: str):
+        error_text = self._ensure_private_bili_command(event)
+        if error_text:
+            yield event.plain_result(error_text)
+            return
+
+        yield event.plain_result(f"开始测试抓取 UID {uid}")
+
+        dynamic_notification = await self._build_dynamic_test_notification(uid)
+        if dynamic_notification is None:
+            yield event.plain_result(f"UID {uid} 当前没有抓到可用动态。")
+        else:
+            yield event.chain_result(self._build_notification_parts(dynamic_notification))
+
+        video_notification = await self._build_video_test_notification(uid)
+        if video_notification is None:
+            yield event.plain_result(f"UID {uid} 当前没有抓到可用视频。")
+        else:
+            yield event.chain_result(self._build_notification_parts(video_notification))
+
+        live_status = await self._bilibili_gateway.get_live_status(uid)
+        if live_status is None:
+            yield event.plain_result(f"UID {uid} 当前没有抓到直播间信息。")
+            return
+
+        author_name = await self._bilibili_gateway.get_user_name(uid)
+        if not live_status.is_live:
+            yield event.plain_result(
+                f"【B站直播状态】{author_name}\n当前未开播\n{live_status.url}"
+            )
+            return
+
+        yield event.chain_result(
+            self._build_notification_parts(
+                BilibiliNotification(
+                    kind="live",
+                    uid=uid,
+                    author_name=author_name,
+                    title=live_status.title,
+                    url=live_status.url,
+                    cover_url=live_status.cover_url,
+                )
+            )
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_login")
