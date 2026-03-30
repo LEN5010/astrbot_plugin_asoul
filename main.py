@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -8,6 +9,10 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 from bilibili_api import login_v2
+
+PLUGIN_DIR = Path(__file__).resolve().parent
+if str(PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_DIR))
 
 from asoul_bilibili import (
     KV_BILIBILI_CREDENTIAL,
