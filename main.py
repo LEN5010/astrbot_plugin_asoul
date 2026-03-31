@@ -749,6 +749,7 @@ class ASoulPlugin(Star):
             if isinstance(metadata, dict):
                 candidate_names.extend(
                     [
+                        str(metadata.get("id", "") or "").strip().lower(),
                         str(metadata.get("type", "") or "").strip().lower(),
                         str(metadata.get("name", "") or "").strip().lower(),
                     ]
@@ -756,10 +757,19 @@ class ASoulPlugin(Star):
             elif metadata is not None:
                 candidate_names.extend(
                     [
+                        str(getattr(metadata, "id", "") or "").strip().lower(),
                         str(getattr(metadata, "type", "") or "").strip().lower(),
                         str(getattr(metadata, "name", "") or "").strip().lower(),
                     ]
                 )
+
+            candidate_names.extend(
+                [
+                    str(getattr(platform, "id", "") or "").strip().lower(),
+                    str(getattr(platform, "platform_id", "") or "").strip().lower(),
+                    str(getattr(platform, "name", "") or "").strip().lower(),
+                ]
+            )
 
             if normalized_platform_name in {name for name in candidate_names if name}:
                 return platform
