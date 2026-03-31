@@ -259,11 +259,25 @@ class BilibiliGateway:
         stop_at_id: Optional[str],
         max_items: Optional[int] = None,
     ) -> List[BilibiliDynamicPost]:
+        posts, _ = await self.get_recent_dynamics_with_status(
+            uid=uid,
+            stop_at_id=stop_at_id,
+            max_items=max_items,
+        )
+        return posts
+
+    async def get_recent_dynamics_with_status(
+        self,
+        uid: str,
+        stop_at_id: Optional[str],
+        max_items: Optional[int] = None,
+    ) -> tuple[List[BilibiliDynamicPost], bool]:
         user_obj = self._new_user(uid)
 
         offset = ""
         collected: List[BilibiliDynamicPost] = []
         seen_ids = set()
+        stop_found = stop_at_id is None
 
         while True:
             page = await user_obj.get_dynamics_new(offset=offset)
@@ -279,6 +293,7 @@ class BilibiliGateway:
                 if parsed is None or parsed.id in seen_ids:
                     continue
                 if stop_at_id and parsed.id == stop_at_id:
+                    stop_found = True
                     reached_stop = True
                     break
                 seen_ids.add(parsed.id)
@@ -297,7 +312,7 @@ class BilibiliGateway:
                 break
             offset = str(next_offset)
 
-        return collected
+        return collected, stop_found
 
     async def get_recent_videos(
         self,
@@ -305,11 +320,25 @@ class BilibiliGateway:
         stop_at_id: Optional[str],
         max_items: Optional[int] = None,
     ) -> List[BilibiliVideoPost]:
+        posts, _ = await self.get_recent_videos_with_status(
+            uid=uid,
+            stop_at_id=stop_at_id,
+            max_items=max_items,
+        )
+        return posts
+
+    async def get_recent_videos_with_status(
+        self,
+        uid: str,
+        stop_at_id: Optional[str],
+        max_items: Optional[int] = None,
+    ) -> tuple[List[BilibiliVideoPost], bool]:
         user_obj = self._new_user(uid)
 
         page_index = 1
         collected: List[BilibiliVideoPost] = []
         seen_ids = set()
+        stop_found = stop_at_id is None
 
         while True:
             page = await user_obj.get_videos(pn=page_index, ps=30)
@@ -323,6 +352,7 @@ class BilibiliGateway:
                 if parsed is None or parsed.id in seen_ids:
                     continue
                 if stop_at_id and parsed.id == stop_at_id:
+                    stop_found = True
                     reached_stop = True
                     break
                 seen_ids.add(parsed.id)
@@ -336,7 +366,7 @@ class BilibiliGateway:
 
             page_index += 1
 
-        return collected
+        return collected, stop_found
 
     async def get_latest_dynamics(self, uid: str, limit: int) -> List[BilibiliDynamicPost]:
         return await self.get_recent_dynamics(uid, stop_at_id=None, max_items=max(1, limit))
@@ -988,9 +1018,12 @@ class BilibiliMonitorService:
 
         if config.push_dynamic:
             latest_dynamic_id = str(uid_state.get("last_dynamic_id") or "").strip() or None
-            dynamics = await self._gateway.get_recent_dynamics(uid, stop_at_id=latest_dynamic_id)
+            dynamics, dynamic_stop_found = await self._gateway.get_recent_dynamics_with_status(
+                uid,
+                stop_at_id=latest_dynamic_id,
+            )
             if dynamics:
-                if latest_dynamic_id is not None:
+                if latest_dynamic_id is not None and dynamic_stop_found:
                     for post in reversed(dynamics):
                         if post.is_live_room_dynamic:
                             continue
@@ -1010,9 +1043,12 @@ class BilibiliMonitorService:
 
         if config.push_video:
             latest_video_id = str(uid_state.get("last_video_id") or "").strip() or None
-            videos = await self._gateway.get_recent_videos(uid, stop_at_id=latest_video_id)
+            videos, video_stop_found = await self._gateway.get_recent_videos_with_status(
+                uid,
+                stop_at_id=latest_video_id,
+            )
             if videos:
-                if latest_video_id is not None:
+                if latest_video_id is not None and video_stop_found:
                     for post in reversed(videos):
                         notifications.append(
                             BilibiliNotification(

@@ -90,6 +90,22 @@ class FakeBilibiliGateway:
             result.append(post)
         return result
 
+    async def get_recent_dynamics_with_status(self, uid: str, stop_at_id: str | None, max_items=None):
+        posts = self.dynamic_posts.get(uid, [])
+        if stop_at_id is None:
+            result = posts[:1] if max_items is None else posts[: max(1, max_items)]
+            return result, True
+        result = []
+        stop_found = False
+        for post in posts:
+            if post.id == stop_at_id:
+                stop_found = True
+                break
+            result.append(post)
+            if max_items is not None and len(result) >= max_items:
+                break
+        return result, stop_found
+
     async def get_recent_videos(self, uid: str, stop_at_id: str | None):
         posts = self.video_posts.get(uid, [])
         if stop_at_id is None:
@@ -100,6 +116,22 @@ class FakeBilibiliGateway:
                 break
             result.append(post)
         return result
+
+    async def get_recent_videos_with_status(self, uid: str, stop_at_id: str | None, max_items=None):
+        posts = self.video_posts.get(uid, [])
+        if stop_at_id is None:
+            result = posts[:1] if max_items is None else posts[: max(1, max_items)]
+            return result, True
+        result = []
+        stop_found = False
+        for post in posts:
+            if post.id == stop_at_id:
+                stop_found = True
+                break
+            result.append(post)
+            if max_items is not None and len(result) >= max_items:
+                break
+        return result, stop_found
 
     async def get_latest_dynamics(self, uid: str, limit: int):
         return self.dynamic_posts.get(uid, [])[:limit]
@@ -180,6 +212,25 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         self.assertEqual([item.kind for item in notifications], ["dynamic", "video"])
         self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-4")
         self.assertEqual(updated_state["uids"]["100"]["last_video_id"], "BV4")
+
+    def test_stale_cursor_rebuilds_baseline_without_replaying_history(self) -> None:
+        stale_state = {
+            "uids": {
+                "100": {
+                    "author_name": "测试账号",
+                    "last_dynamic_id": "missing-dyn",
+                    "last_video_id": "missing-bv",
+                    "last_live_active": False,
+                    "comment_resources": {},
+                }
+            }
+        }
+
+        updated_state, notifications = asyncio.run(self.service.poll(self.config, stale_state))
+
+        self.assertEqual(notifications, [])
+        self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-3")
+        self.assertEqual(updated_state["uids"]["100"]["last_video_id"], "BV3")
 
     def test_live_notification_only_on_transition_to_live(self) -> None:
         initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
