@@ -1,4 +1,5 @@
 import logging
+import json
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
@@ -328,14 +329,64 @@ class BilibiliGateway:
         user_obj = self._new_user(uid)
         info = await user_obj.get_live_info()
 
-        live_status_value = self._find_first_value(info, ("live_status", "liveStatus", "roomStatus"))
+        live_status_value = self._find_value_by_paths(
+            info,
+            (
+                ("live_status",),
+                ("liveStatus",),
+                ("roomStatus",),
+                ("room_info", "live_status"),
+                ("room_info", "liveStatus"),
+                ("live_room", "live_status"),
+            ),
+        )
         if live_status_value is None:
             return None
 
-        room_id_value = self._find_first_value(info, ("roomid", "room_id", "roomId"))
-        title_value = self._find_first_value(info, ("title", "roomtitle"))
-        url_value = self._find_first_value(info, ("url", "link"))
-        cover_value = self._find_first_value(info, ("cover_from_user", "user_cover", "cover", "keyframe"))
+        room_id_value = self._find_value_by_paths(
+            info,
+            (
+                ("roomid",),
+                ("room_id",),
+                ("roomId",),
+                ("room_info", "room_id"),
+                ("room_info", "roomid"),
+                ("live_room", "room_id"),
+            ),
+        )
+        title_value = self._find_value_by_paths(
+            info,
+            (
+                ("room_info", "title"),
+                ("live_room", "title"),
+                ("room_data", "title"),
+                ("title",),
+                ("roomtitle",),
+            ),
+        )
+        url_value = self._find_value_by_paths(
+            info,
+            (
+                ("room_info", "url"),
+                ("live_room", "url"),
+                ("room_data", "url"),
+                ("url",),
+                ("link",),
+            ),
+        )
+        cover_value = self._find_value_by_paths(
+            info,
+            (
+                ("room_info", "cover"),
+                ("room_info", "cover_from_user"),
+                ("room_info", "user_cover"),
+                ("live_room", "cover"),
+                ("cover_from_user",),
+                ("user_cover",),
+                ("cover",),
+                ("keyframe",),
+            ),
+        )
 
         room_id = str(room_id_value).strip() if room_id_value is not None else ""
         url = _normalize_url(str(url_value).strip() if url_value is not None else "")
@@ -430,12 +481,7 @@ class BilibiliGateway:
         rich_nodes, plain_text = self._extract_dynamic_rich_nodes(item)
         image_urls = self._extract_dynamic_image_urls(item)
 
-        url_value = (
-            self._find_first_value(item.get("basic", {}), ("jump_url",))
-            or item.get("jump_url")
-            or item.get("url")
-            or self._find_first_value(item, ("jump_url", "url"))
-        )
+        url_value = self._extract_dynamic_url(item)
         url = _normalize_url(str(url_value).strip() if url_value is not None else "")
         if not url:
             url = f"https://t.bilibili.com/{dynamic_id}"
@@ -458,6 +504,30 @@ class BilibiliGateway:
         )
 
     def _extract_dynamic_rich_nodes(self, item: Dict[str, Any]) -> tuple[List[BilibiliRichTextNode], str]:
+        nodes, primary_text = self._extract_primary_dynamic_rich_nodes(item)
+        extra_parts = [
+            part
+            for part in (
+                self._extract_dynamic_card_text(item),
+                self._extract_dynamic_forward_text(item),
+            )
+            if part
+        ]
+        plain_text = "\n".join([part for part in [primary_text, *extra_parts] if part]).strip()
+
+        if extra_parts:
+            extra_text = "\n".join(extra_parts)
+            if nodes:
+                prefix = "\n" if primary_text else ""
+                nodes = list(nodes) + [BilibiliRichTextNode(kind="text", text=f"{prefix}{extra_text}")]
+            else:
+                nodes = [BilibiliRichTextNode(kind="text", text=plain_text)]
+        elif not nodes and plain_text:
+            nodes = [BilibiliRichTextNode(kind="text", text=plain_text)]
+
+        return nodes, plain_text
+
+    def _extract_primary_dynamic_rich_nodes(self, item: Dict[str, Any]) -> tuple[List[BilibiliRichTextNode], str]:
         modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
         module_dynamic = modules.get("module_dynamic", {}) if isinstance(modules.get("module_dynamic"), dict) else {}
         desc = module_dynamic.get("desc", {}) if isinstance(module_dynamic.get("desc"), dict) else {}
@@ -495,10 +565,11 @@ class BilibiliGateway:
 
         return nodes, plain_text.strip()
 
-    def _extract_dynamic_image_urls(self, item: Dict[str, Any]) -> List[str]:
+    def _extract_dynamic_image_urls(self, item: Dict[str, Any], include_orig: bool = True) -> List[str]:
         modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
         module_dynamic = modules.get("module_dynamic", {}) if isinstance(modules.get("module_dynamic"), dict) else {}
         major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
+        additional = item.get("additional", {}) if isinstance(item.get("additional"), dict) else {}
         image_urls: List[str] = []
         seen = set()
 
@@ -521,7 +592,200 @@ class BilibiliGateway:
                 continue
             append_candidate(pic.get("src") or pic.get("url") or pic.get("img_src"))
 
+        live_rcmd = self._extract_live_rcmd_payload(major.get("live_rcmd"))
+        append_candidate(self._find_value_by_paths(live_rcmd, (("cover",), ("cover_url",), ("live_play_info", "cover"))))
+
+        for block in (
+            major.get("archive"),
+            major.get("article"),
+            major.get("common"),
+            major.get("live"),
+            additional.get("common"),
+            additional.get("ugc"),
+            additional.get("reserve"),
+        ):
+            if not isinstance(block, dict):
+                continue
+            append_candidate(
+                self._find_value_by_paths(
+                    block,
+                    (
+                        ("cover",),
+                        ("cover_url",),
+                        ("cover_src",),
+                        ("image_url",),
+                        ("image",),
+                        ("head_text", "pic"),
+                    ),
+                )
+            )
+
+        if include_orig:
+            orig = item.get("orig")
+            if isinstance(orig, dict):
+                for image_url in self._extract_dynamic_image_urls(orig, include_orig=False):
+                    append_candidate(image_url)
+
         return image_urls
+
+    def _extract_dynamic_url(self, item: Dict[str, Any]) -> str:
+        url_value = (
+            self._find_first_value(item.get("basic", {}), ("jump_url",))
+            or item.get("jump_url")
+            or item.get("url")
+            or self._find_value_by_paths(
+                item,
+                (
+                    ("modules", "module_dynamic", "major", "archive", "jump_url"),
+                    ("modules", "module_dynamic", "major", "article", "jump_url"),
+                    ("modules", "module_dynamic", "major", "live", "jump_url"),
+                    ("additional", "reserve", "jump_url"),
+                    ("additional", "common", "jump_url"),
+                ),
+            )
+        )
+
+        live_rcmd = self._extract_live_rcmd_payload(
+            self._find_value_by_paths(item, (("modules", "module_dynamic", "major", "live_rcmd"),))
+        )
+        if not url_value:
+            url_value = self._find_value_by_paths(
+                live_rcmd,
+                (
+                    ("link",),
+                    ("room_url",),
+                    ("live_play_info", "link"),
+                    ("live_play_info", "room_url"),
+                ),
+            )
+        return _normalize_url(str(url_value or "").strip())
+
+    def _extract_dynamic_card_text(self, item: Dict[str, Any]) -> str:
+        modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
+        module_dynamic = modules.get("module_dynamic", {}) if isinstance(modules.get("module_dynamic"), dict) else {}
+        major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
+        additional = item.get("additional", {}) if isinstance(item.get("additional"), dict) else {}
+
+        lines: List[str] = []
+        live_rcmd = self._extract_live_rcmd_payload(major.get("live_rcmd"))
+
+        self._append_unique_line(
+            lines,
+            self._find_value_by_paths(
+                live_rcmd,
+                (
+                    ("title",),
+                    ("room_name",),
+                    ("live_play_info", "title"),
+                    ("live_play_info", "room_name"),
+                ),
+            ),
+        )
+
+        for block in (
+            major.get("archive"),
+            major.get("article"),
+            major.get("common"),
+            major.get("live"),
+            major.get("pgc"),
+            additional.get("common"),
+            additional.get("ugc"),
+            additional.get("reserve"),
+        ):
+            if not isinstance(block, dict):
+                continue
+            self._append_unique_line(
+                lines,
+                self._find_value_by_paths(
+                    block,
+                    (
+                        ("title",),
+                        ("head_text", "text"),
+                        ("subtitle",),
+                    ),
+                ),
+            )
+            self._append_unique_line(
+                lines,
+                self._find_value_by_paths(
+                    block,
+                    (
+                        ("desc1", "text"),
+                        ("desc_first",),
+                    ),
+                ),
+            )
+            self._append_unique_line(
+                lines,
+                self._find_value_by_paths(
+                    block,
+                    (
+                        ("desc",),
+                        ("sub_title",),
+                        ("desc2", "text"),
+                        ("desc_second",),
+                        ("reserve_total", "text"),
+                    ),
+                ),
+            )
+            self._append_unique_line(
+                lines,
+                self._find_value_by_paths(
+                    block,
+                    (
+                        ("desc3", "text"),
+                        ("desc3",),
+                    ),
+                ),
+            )
+
+        return "\n".join(lines).strip()
+
+    def _extract_dynamic_forward_text(self, item: Dict[str, Any]) -> str:
+        orig = item.get("orig")
+        if not isinstance(orig, dict):
+            return ""
+
+        modules = orig.get("modules", {}) if isinstance(orig.get("modules"), dict) else {}
+        module_author = modules.get("module_author", {}) if isinstance(modules.get("module_author"), dict) else {}
+        author_name = str(module_author.get("name", "") or "").strip()
+        _, original_text = self._extract_primary_dynamic_rich_nodes(orig)
+        original_card_text = self._extract_dynamic_card_text(orig)
+        combined = "\n".join([part for part in (original_text, original_card_text) if part]).strip()
+        if not combined:
+            return ""
+        if author_name:
+            return f"转发自 {author_name}\n{combined}"
+        return f"转发内容\n{combined}"
+
+    @staticmethod
+    def _append_unique_line(lines: List[str], raw_value: Any) -> None:
+        text = str(raw_value or "").strip()
+        if not text or text in lines:
+            return
+        lines.append(text)
+
+    def _extract_live_rcmd_payload(self, raw_value: Any) -> Dict[str, Any]:
+        if isinstance(raw_value, dict):
+            content = raw_value.get("content")
+            if isinstance(content, dict):
+                return content
+            if isinstance(content, str) and content.strip():
+                try:
+                    parsed = json.loads(content)
+                except json.JSONDecodeError:
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    return parsed
+            return raw_value
+        if isinstance(raw_value, str) and raw_value.strip():
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(parsed, dict):
+                return parsed
+        return {}
 
     def _parse_video_post(self, item: Dict[str, Any]) -> Optional[BilibiliVideoPost]:
         bvid = item.get("bvid") or self._find_first_value(item, ("bvid",))
@@ -606,6 +870,23 @@ class BilibiliGateway:
                 result = self._find_first_value(item, candidate_keys)
                 if result not in (None, ""):
                     return result
+        return None
+
+    def _find_value_by_paths(
+        self,
+        value: Any,
+        candidate_paths: Sequence[Sequence[str]],
+    ) -> Optional[Any]:
+        for path in candidate_paths:
+            current = value
+            matched = True
+            for key in path:
+                if not isinstance(current, dict) or key not in current:
+                    matched = False
+                    break
+                current = current[key]
+            if matched and current not in (None, ""):
+                return current
         return None
 
 
