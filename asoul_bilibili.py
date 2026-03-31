@@ -121,7 +121,10 @@ class BilibiliCommentPost:
 
 def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> BilibiliPushConfig:
     source = raw_config or {}
-    poll_interval = int(source.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS) or DEFAULT_POLL_INTERVAL_SECONDS)
+    poll_interval = _safe_parse_int(
+        source.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS),
+        DEFAULT_POLL_INTERVAL_SECONDS,
+    )
     request_client = str(source.get("request_client", "aiohttp") or "aiohttp").strip().lower()
     if request_client not in {"aiohttp", "httpx", "curl_cffi"}:
         request_client = "aiohttp"
@@ -153,6 +156,20 @@ def _normalize_string_list(raw_value: Any) -> List[str]:
         seen.add(text)
         normalized.append(text)
     return normalized
+
+
+def _safe_parse_int(raw_value: Any, default: int) -> int:
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_bilibili_uid(raw_value: Any) -> str:
+    uid = str(raw_value or "").strip()
+    if not uid or not uid.isdigit():
+        raise ValueError("B站 UID 必须为纯数字字符串")
+    return uid
 
 
 def _normalize_credential_data(raw_value: Any) -> Dict[str, str]:
@@ -219,7 +236,8 @@ class BilibiliGateway:
 
     def _new_user(self, uid: str):
         user_module, _, _ = self._load_modules()
-        kwargs: Dict[str, Any] = {"uid": int(uid)}
+        normalized_uid = normalize_bilibili_uid(uid)
+        kwargs: Dict[str, Any] = {"uid": int(normalized_uid)}
         if self._credential is not None:
             kwargs["credential"] = self._credential
         return user_module.User(**kwargs)

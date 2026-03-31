@@ -26,6 +26,7 @@ from asoul_bilibili import (
     BilibiliRichTextNode,
     build_bilibili_push_config,
     normalize_bilibili_credential_data,
+    normalize_bilibili_uid,
 )
 from asoul_calendar import CalendarRepository
 from asoul_core import (
@@ -183,8 +184,8 @@ class ASoulPlugin(Star):
 
     async def _run_bilibili_monitor_loop(self) -> None:
         logger.info("启动 B 站自动播报任务，轮询间隔 %s 秒", self._bilibili_config.poll_interval_seconds)
-        try:
-            while True:
+        while True:
+            try:
                 if not self._bilibili_gateway.has_credential():
                     if not self._bilibili_missing_login_logged:
                         logger.warning("B 站自动播报未登录，轮询已暂停。请配置凭据或使用 /bili_login 登录。")
@@ -195,9 +196,12 @@ class ASoulPlugin(Star):
                 self._bilibili_missing_login_logged = False
                 await self._poll_bilibili_updates_once()
                 await asyncio.sleep(self._bilibili_config.poll_interval_seconds)
-        except asyncio.CancelledError:
-            logger.info("B 站自动播报任务已停止")
-            raise
+            except asyncio.CancelledError:
+                logger.info("B 站自动播报任务已停止")
+                raise
+            except Exception:
+                logger.exception("B 站自动播报任务执行异常，本轮跳过并等待下次轮询")
+                await asyncio.sleep(self._bilibili_config.poll_interval_seconds)
 
     async def _poll_bilibili_updates_once(self) -> None:
         updated_state, notifications = await self._bilibili_monitor.poll(
@@ -478,12 +482,21 @@ class ASoulPlugin(Star):
             return compact
         return compact[: max(0, limit - 1)].rstrip() + "…"
 
+    @staticmethod
+    def _normalize_command_uid(uid: str) -> str:
+        return normalize_bilibili_uid(uid)
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_dynamic")
     async def bili_test_dynamic(self, event: AstrMessageEvent, uid: str):
         error_text = self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
+            return
+        try:
+            uid = self._normalize_command_uid(uid)
+        except ValueError:
+            yield event.plain_result("UID 格式错误，请输入纯数字 UID。")
             return
 
         notification = await self._build_dynamic_test_notification(uid)
@@ -500,10 +513,13 @@ class ASoulPlugin(Star):
         if error_text:
             yield event.plain_result(error_text)
             return
+        try:
+            uid = self._normalize_command_uid(uid)
+        except ValueError:
+            yield event.plain_result("UID 格式错误，请输入纯数字 UID。")
+            return
 
-        user_obj = self._bilibili_gateway._new_user(uid)
-        page = await user_obj.get_dynamics_new(offset="")
-        payload = page if isinstance(page, dict) else {"payload": page}
+        payload = await self._bilibili_gateway.get_raw_dynamics_page(uid, offset="")
         file_path = self._write_debug_payload_file(
             "dynamic",
             uid,
@@ -522,6 +538,11 @@ class ASoulPlugin(Star):
         if error_text:
             yield event.plain_result(error_text)
             return
+        try:
+            uid = self._normalize_command_uid(uid)
+        except ValueError:
+            yield event.plain_result("UID 格式错误，请输入纯数字 UID。")
+            return
 
         notification = await self._build_video_test_notification(uid)
         if notification is None:
@@ -536,6 +557,11 @@ class ASoulPlugin(Star):
         error_text = self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
+            return
+        try:
+            uid = self._normalize_command_uid(uid)
+        except ValueError:
+            yield event.plain_result("UID 格式错误，请输入纯数字 UID。")
             return
 
         live_status = await self._bilibili_gateway.get_live_status(uid)
@@ -567,10 +593,13 @@ class ASoulPlugin(Star):
         if error_text:
             yield event.plain_result(error_text)
             return
+        try:
+            uid = self._normalize_command_uid(uid)
+        except ValueError:
+            yield event.plain_result("UID 格式错误，请输入纯数字 UID。")
+            return
 
-        user_obj = self._bilibili_gateway._new_user(uid)
-        info = await user_obj.get_live_info()
-        payload = info if isinstance(info, dict) else {"payload": info}
+        payload = await self._bilibili_gateway.get_raw_live_info(uid)
         file_path = self._write_debug_payload_file(
             "live",
             uid,
@@ -627,6 +656,11 @@ class ASoulPlugin(Star):
         if error_text:
             yield event.plain_result(error_text)
             return
+        try:
+            uid = self._normalize_command_uid(uid)
+        except ValueError:
+            yield event.plain_result("UID 格式错误，请输入纯数字 UID。")
+            return
 
         yield event.plain_result(f"开始测试抓取 UID {uid}")
 
@@ -678,6 +712,11 @@ class ASoulPlugin(Star):
         error_text = self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
+            return
+        try:
+            uid = self._normalize_command_uid(uid)
+        except ValueError:
+            yield event.plain_result("UID 格式错误，请输入纯数字 UID。")
             return
 
         notifications = await self._build_comment_test_notifications(uid)

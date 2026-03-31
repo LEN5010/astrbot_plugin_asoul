@@ -12,6 +12,8 @@ from asoul_bilibili import (
     BilibiliPushConfig,
     BilibiliRichTextNode,
     BilibiliVideoPost,
+    build_bilibili_push_config,
+    normalize_bilibili_uid,
 )
 
 
@@ -232,6 +234,22 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         self.assertEqual(updated_notifications[0].kind, "comment")
         self.assertIn("回复了评论", updated_notifications[0].title)
         self.assertEqual(updated_state["uids"]["100"]["comment_resources"]["video:2003"]["last_comment_id"], "9002")
+
+
+class BilibiliConfigParsingTest(unittest.TestCase):
+    def test_build_config_falls_back_when_poll_interval_is_invalid(self) -> None:
+        config = build_bilibili_push_config(
+            {
+                "enabled": True,
+                "poll_interval_seconds": "abc",
+            }
+        )
+
+        self.assertEqual(config.poll_interval_seconds, 60)
+
+    def test_normalize_bilibili_uid_rejects_non_digit_value(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_bilibili_uid("abc123")
 
 
 class BilibiliParsingTest(unittest.TestCase):
