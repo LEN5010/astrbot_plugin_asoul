@@ -26,7 +26,6 @@ from asoul_bilibili import (
     BilibiliRichTextNode,
     build_bilibili_push_config,
     normalize_bilibili_credential_data,
-    normalize_bilibili_uid,
 )
 from asoul_calendar import CalendarRepository
 from asoul_core import (
@@ -484,7 +483,10 @@ class ASoulPlugin(Star):
 
     @staticmethod
     def _normalize_command_uid(uid: str) -> str:
-        return normalize_bilibili_uid(uid)
+        normalized_uid = str(uid or "").strip()
+        if not normalized_uid or not normalized_uid.isdigit():
+            raise ValueError("B站 UID 必须为纯数字字符串")
+        return normalized_uid
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_dynamic")

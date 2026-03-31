@@ -1,9 +1,8 @@
 name: "astrbot_plugin_asoul"
 display_name: "枝江自动推送"
-# 使用双引号，并用 \n 代替真实回车，确保末尾没有多余换行
 desc: "自动推送枝江成员B站信息\n查询今日/明日直播并以图片形式推送"
 author: "LEN5010"
-version: v3.0.0
+version: v3.0.1
 repo: "https://github.com/LEN5010/astrbot_plugin_asoul"
 tags:
   - "ASOUL"
