@@ -3,7 +3,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -38,7 +38,6 @@ from asoul_core import (
 from asoul_render import ScheduleImageRenderer
 from asoul_schedule import ScheduleService
 
-GROUP_MESSAGE_TYPE = "GroupMessage"
 MIN_AT_ALL_REMAINING = 1
 QR_CODE_PATH = Path(__file__).resolve().parent / "temp" / "bilibili_login_qrcode.png"
 
@@ -53,6 +52,13 @@ class CommentTestResource:
     type_value: int
     title: str
     url: str
+
+
+@dataclass(frozen=True)
+class BilibiliPushTarget:
+    group_id: str
+    platform_name: str
+    unified_msg_origin: str
 
 
 @register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "1.1.0")
@@ -202,33 +208,43 @@ class ASoulPlugin(Star):
         if not notifications:
             return
 
-        target_origins = self._get_active_push_origins()
-        if not target_origins:
+        target_entries = self._get_active_push_targets()
+        if not target_entries:
             logger.info("存在 B 站新通知，但当前没有已登记的白名单群")
             return
 
         for notification in notifications:
-            for unified_msg_origin in target_origins:
+            for target in target_entries:
                 try:
-                    chain = await self._build_notification_chain(notification, unified_msg_origin)
-                    await self.context.send_message(unified_msg_origin, chain)
+                    chain = await self._build_notification_chain(notification, target)
+                    await self.context.send_message(target.unified_msg_origin, chain)
                 except Exception:
                     logger.exception("发送 B 站播报失败: uid=%s kind=%s", notification.uid, notification.kind)
 
-    def _get_active_push_origins(self) -> list[str]:
-        origins: list[str] = []
+    def _get_active_push_targets(self) -> list[BilibiliPushTarget]:
+        targets: list[BilibiliPushTarget] = []
         seen = set()
         for group_id in self._bilibili_config.group_whitelist:
             unified_msg_origin = self._bilibili_group_origins.get(group_id)
             if not unified_msg_origin or unified_msg_origin in seen:
                 continue
+            platform_name = self._extract_platform_name(unified_msg_origin)
+            if not platform_name:
+                logger.warning("跳过无法识别平台的群播报目标: group_id=%s", group_id)
+                continue
             seen.add(unified_msg_origin)
-            origins.append(unified_msg_origin)
-        return origins
+            targets.append(
+                BilibiliPushTarget(
+                    group_id=group_id,
+                    platform_name=platform_name,
+                    unified_msg_origin=unified_msg_origin,
+                )
+            )
+        return targets
 
-    async def _build_notification_chain(self, notification, unified_msg_origin: str) -> MessageChain:
+    async def _build_notification_chain(self, notification, target: BilibiliPushTarget) -> MessageChain:
         chain_parts = self._build_notification_parts(notification)
-        if notification.kind == "live" and await self._should_send_live_atall(unified_msg_origin):
+        if notification.kind == "live" and await self._should_send_live_atall(target):
             chain_parts = [Comp.AtAll(), Comp.Plain(" ")] + chain_parts
         return MessageChain(chain_parts)
 
@@ -614,31 +630,29 @@ class ASoulPlugin(Star):
         await self._clear_bilibili_credential()
         yield event.plain_result("已清除当前保存的 B 站登录态。")
 
-    async def _should_send_live_atall(self, unified_msg_origin: str) -> bool:
-        group_ctx = self._extract_group_session(unified_msg_origin)
-        if not group_ctx:
-            logger.info("直播 @全体仅支持群聊会话: %s", unified_msg_origin)
+    async def _should_send_live_atall(self, target: BilibiliPushTarget) -> bool:
+        platform_inst = self._find_platform_by_name(target.platform_name)
+        if not platform_inst:
+            logger.warning("直播 @全体失败：找不到平台实例 %s", target.platform_name)
             return False
 
-        platform_id, group_id = group_ctx
-        platform_inst = self.context.get_platform_inst(platform_id)
-        if not platform_inst:
-            logger.warning("直播 @全体失败：找不到平台实例 %s", platform_id)
+        if not hasattr(platform_inst, "get_client"):
+            logger.warning("直播 @全体失败：平台 %s 不支持 get_client", target.platform_name)
             return False
 
         client = platform_inst.get_client()
         if not client or not hasattr(client, "call_action"):
-            logger.warning("直播 @全体失败：平台 %s 不支持 call_action", platform_id)
+            logger.warning("直播 @全体失败：平台 %s 不支持 call_action", target.platform_name)
             return False
 
         try:
-            group_id_param: int | str = int(group_id) if group_id.isdigit() else group_id
+            group_id_param: int | str = int(target.group_id) if target.group_id.isdigit() else target.group_id
             remain_raw = await client.call_action(
                 "get_group_at_all_remain",
                 group_id=group_id_param,
             )
         except Exception:
-            logger.exception("查询群 %s @全体剩余次数失败", group_id)
+            logger.exception("查询群 %s @全体剩余次数失败", target.group_id)
             return False
 
         remain_data = self._extract_action_data(remain_raw)
@@ -651,30 +665,57 @@ class ASoulPlugin(Star):
         self_remain = int(self_remain_value or 0)
 
         if not can_at_all:
-            logger.info("群 %s 当前不允许 @全体成员", group_id)
+            logger.info("群 %s 当前不允许 @全体成员", target.group_id)
             return False
         if group_remain < MIN_AT_ALL_REMAINING or self_remain < MIN_AT_ALL_REMAINING:
             logger.info(
                 "群 %s @全体次数不足: group=%s, self=%s",
-                group_id,
+                target.group_id,
                 group_remain,
                 self_remain,
             )
             return False
         return True
 
+    def _find_platform_by_name(self, platform_name: str) -> Optional[Any]:
+        platform_manager = getattr(self.context, "platform_manager", None)
+        if platform_manager is None or not hasattr(platform_manager, "get_insts"):
+            return None
+
+        normalized_platform_name = str(platform_name or "").strip().lower()
+        if not normalized_platform_name:
+            return None
+
+        for platform in platform_manager.get_insts():
+            metadata = getattr(platform, "metadata", None)
+            candidate_names: list[str] = []
+
+            if isinstance(metadata, dict):
+                candidate_names.extend(
+                    [
+                        str(metadata.get("type", "") or "").strip().lower(),
+                        str(metadata.get("name", "") or "").strip().lower(),
+                    ]
+                )
+            elif metadata is not None:
+                candidate_names.extend(
+                    [
+                        str(getattr(metadata, "type", "") or "").strip().lower(),
+                        str(getattr(metadata, "name", "") or "").strip().lower(),
+                    ]
+                )
+
+            if normalized_platform_name in {name for name in candidate_names if name}:
+                return platform
+        return None
+
     @staticmethod
-    def _extract_group_session(unified_msg_origin: str) -> Optional[Tuple[str, str]]:
+    def _extract_platform_name(unified_msg_origin: str) -> str:
         try:
-            platform_id, message_type, session_id = unified_msg_origin.split(":", 2)
+            platform_name, _, _ = unified_msg_origin.split(":", 2)
         except ValueError:
-            return None
-        if message_type != GROUP_MESSAGE_TYPE:
-            return None
-        group_id = session_id.split("_")[-1].strip()
-        if not group_id:
-            return None
-        return platform_id, group_id
+            return ""
+        return str(platform_name or "").strip()
 
     @staticmethod
     def _extract_action_data(action_result: Any) -> dict[str, Any]:
