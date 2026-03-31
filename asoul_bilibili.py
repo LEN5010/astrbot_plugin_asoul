@@ -325,6 +325,16 @@ class BilibiliGateway:
     async def get_latest_videos(self, uid: str, limit: int) -> List[BilibiliVideoPost]:
         return await self.get_recent_videos(uid, stop_at_id=None, max_items=max(1, limit))
 
+    async def get_raw_dynamics_page(self, uid: str, offset: str = "") -> Dict[str, Any]:
+        user_obj = self._new_user(uid)
+        page = await user_obj.get_dynamics_new(offset=offset)
+        return page if isinstance(page, dict) else {"payload": page}
+
+    async def get_raw_live_info(self, uid: str) -> Dict[str, Any]:
+        user_obj = self._new_user(uid)
+        info = await user_obj.get_live_info()
+        return info if isinstance(info, dict) else {"payload": info}
+
     async def get_live_status(self, uid: str) -> Optional[BilibiliLiveStatus]:
         user_obj = self._new_user(uid)
         info = await user_obj.get_live_info()

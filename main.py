@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -40,6 +41,7 @@ from asoul_schedule import ScheduleService
 
 MIN_AT_ALL_REMAINING = 1
 QR_CODE_PATH = Path(__file__).resolve().parent / "temp" / "bilibili_login_qrcode.png"
+DEBUG_PAYLOAD_DIR = Path(__file__).resolve().parent / "temp" / "debug_payloads"
 
 
 @dataclass(frozen=True)
@@ -326,6 +328,16 @@ class ASoulPlugin(Star):
         self._bilibili_gateway.clear_credential()
         await self.delete_kv_data(KV_BILIBILI_CREDENTIAL)
 
+    def _write_debug_payload_file(self, kind: str, uid: str, payload: dict[str, Any]) -> Path:
+        DEBUG_PAYLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(DISPLAY_TZ).strftime("%Y%m%d_%H%M%S")
+        file_path = DEBUG_PAYLOAD_DIR / f"{kind}_{uid}_{timestamp}.json"
+        file_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return file_path
+
     def _ensure_private_bili_command(self, event: AstrMessageEvent) -> Optional[str]:
         if event.message_obj.group_id:
             return "请在私聊中使用这个指令。"
@@ -478,6 +490,26 @@ class ASoulPlugin(Star):
         yield event.chain_result(self._build_notification_parts(notification))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_dump_dynamic")
+    async def bili_dump_dynamic(self, event: AstrMessageEvent, uid: str):
+        error_text = self._ensure_private_bili_command(event)
+        if error_text:
+            yield event.plain_result(error_text)
+            return
+
+        payload = await self._bilibili_gateway.get_raw_dynamics_page(uid, offset="")
+        file_path = self._write_debug_payload_file(
+            "dynamic",
+            uid,
+            {
+                "uid": uid,
+                "captured_at": datetime.now(DISPLAY_TZ).isoformat(),
+                "payload": payload,
+            },
+        )
+        yield event.plain_result(f"已导出动态原始 payload: {file_path}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_video")
     async def bili_test_video(self, event: AstrMessageEvent, uid: str):
         error_text = self._ensure_private_bili_command(event)
@@ -521,6 +553,26 @@ class ASoulPlugin(Star):
             cover_url=live_status.cover_url,
         )
         yield event.chain_result(self._build_notification_parts(notification))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_dump_live")
+    async def bili_dump_live(self, event: AstrMessageEvent, uid: str):
+        error_text = self._ensure_private_bili_command(event)
+        if error_text:
+            yield event.plain_result(error_text)
+            return
+
+        payload = await self._bilibili_gateway.get_raw_live_info(uid)
+        file_path = self._write_debug_payload_file(
+            "live",
+            uid,
+            {
+                "uid": uid,
+                "captured_at": datetime.now(DISPLAY_TZ).isoformat(),
+                "payload": payload,
+            },
+        )
+        yield event.plain_result(f"已导出直播原始 payload: {file_path}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_all")
