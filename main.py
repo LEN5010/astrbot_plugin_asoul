@@ -84,15 +84,20 @@ class ASoulPlugin(Star):
         self._bilibili_monitor_state: dict = {}
         self._bilibili_credential_data: dict[str, str] = {}
         self._bilibili_missing_login_logged = False
+        self._bilibili_runtime_initialized = False
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        await self._load_bilibili_runtime_state()
+        await self._ensure_bilibili_runtime_ready()
+
+    async def _ensure_bilibili_runtime_ready(self) -> None:
+        if not self._bilibili_runtime_initialized:
+            await self._load_bilibili_runtime_state()
+            self._bilibili_runtime_initialized = True
+
         if not self._bilibili_config.enabled:
-            logger.info("B 站自动播报未启用")
             return
         if not self._bilibili_config.target_uids:
-            logger.info("B 站自动播报未配置目标 UID")
             return
 
         if self._bilibili_task and not self._bilibili_task.done():
@@ -102,6 +107,7 @@ class ASoulPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def remember_group_origin(self, event: AstrMessageEvent):
+        await self._ensure_bilibili_runtime_ready()
         group_id = str(getattr(event.message_obj, "group_id", "") or "").strip()
         if not group_id:
             return
@@ -170,6 +176,7 @@ class ASoulPlugin(Star):
                 await self._bilibili_task
             except asyncio.CancelledError:
                 pass
+        self._bilibili_runtime_initialized = False
         return None
 
     async def _load_bilibili_runtime_state(self) -> None:
@@ -345,7 +352,8 @@ class ASoulPlugin(Star):
         )
         return file_path
 
-    def _ensure_private_bili_command(self, event: AstrMessageEvent) -> Optional[str]:
+    async def _ensure_private_bili_command(self, event: AstrMessageEvent) -> Optional[str]:
+        await self._ensure_bilibili_runtime_ready()
         if event.message_obj.group_id:
             return "请在私聊中使用这个指令。"
         if not self._bilibili_gateway.has_credential():
@@ -491,7 +499,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_dynamic")
     async def bili_test_dynamic(self, event: AstrMessageEvent, uid: str):
-        error_text = self._ensure_private_bili_command(event)
+        error_text = await self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
             return
@@ -511,7 +519,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_dump_dynamic")
     async def bili_dump_dynamic(self, event: AstrMessageEvent, uid: str):
-        error_text = self._ensure_private_bili_command(event)
+        error_text = await self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
             return
@@ -536,7 +544,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_video")
     async def bili_test_video(self, event: AstrMessageEvent, uid: str):
-        error_text = self._ensure_private_bili_command(event)
+        error_text = await self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
             return
@@ -556,7 +564,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_live")
     async def bili_test_live(self, event: AstrMessageEvent, uid: str):
-        error_text = self._ensure_private_bili_command(event)
+        error_text = await self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
             return
@@ -591,7 +599,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_dump_live")
     async def bili_dump_live(self, event: AstrMessageEvent, uid: str):
-        error_text = self._ensure_private_bili_command(event)
+        error_text = await self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
             return
@@ -654,7 +662,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_all")
     async def bili_test_all(self, event: AstrMessageEvent, uid: str):
-        error_text = self._ensure_private_bili_command(event)
+        error_text = await self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
             return
@@ -711,7 +719,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_comment")
     async def bili_test_comment(self, event: AstrMessageEvent, uid: str):
-        error_text = self._ensure_private_bili_command(event)
+        error_text = await self._ensure_private_bili_command(event)
         if error_text:
             yield event.plain_result(error_text)
             return
@@ -731,6 +739,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_login")
     async def bili_login(self, event: AstrMessageEvent):
+        await self._ensure_bilibili_runtime_ready()
         if event.message_obj.group_id:
             yield event.plain_result("请在私聊中使用 /bili_login。")
             return
@@ -766,6 +775,7 @@ class ASoulPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_logout")
     async def bili_logout(self, event: AstrMessageEvent):
+        await self._ensure_bilibili_runtime_ready()
         await self._clear_bilibili_credential()
         yield event.plain_result("已清除当前保存的 B 站登录态。")
 
