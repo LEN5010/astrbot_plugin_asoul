@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
 from bilibili_api import login_v2
 
@@ -218,8 +218,8 @@ class ASoulPlugin(Star):
         for notification in notifications:
             for target in target_entries:
                 try:
-                    chain = await self._build_notification_chain(notification, target)
-                    await self.context.send_message(target.unified_msg_origin, chain)
+                    result = await self._build_notification_result(notification, target)
+                    await self.context.send_message(target.unified_msg_origin, result)
                 except Exception:
                     logger.exception("发送 B 站播报失败: uid=%s kind=%s", notification.uid, notification.kind)
 
@@ -244,11 +244,15 @@ class ASoulPlugin(Star):
             )
         return targets
 
-    async def _build_notification_chain(self, notification, target: BilibiliPushTarget) -> MessageChain:
+    async def _build_notification_result(
+        self,
+        notification,
+        target: BilibiliPushTarget,
+    ) -> MessageEventResult:
         chain_parts = self._build_notification_parts(notification)
         if notification.kind == "live" and await self._should_send_live_atall(target):
             chain_parts = [Comp.AtAll(), Comp.Plain(" ")] + chain_parts
-        return MessageChain(chain_parts)
+        return MessageEventResult(chain=MessageChain(chain_parts)).use_t2i(False)
 
     @staticmethod
     def _safe_plain_newline() -> str:
@@ -577,6 +581,46 @@ class ASoulPlugin(Star):
             },
         )
         yield event.plain_result(f"已导出直播原始 payload: {file_path}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_test_atall")
+    async def bili_test_atall(self, event: AstrMessageEvent):
+        group_id = str(getattr(event.message_obj, "group_id", "") or "").strip()
+        if not group_id:
+            yield event.plain_result("请在目标群聊中使用 /bili_test_atall。")
+            return
+
+        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not unified_msg_origin:
+            yield event.plain_result("当前群聊上下文缺少 unified_msg_origin，无法测试 @全体。")
+            return
+
+        platform_name = self._extract_platform_name(unified_msg_origin)
+        if not platform_name:
+            yield event.plain_result("当前群聊平台识别失败，无法测试 @全体。")
+            return
+
+        target = BilibiliPushTarget(
+            group_id=group_id,
+            platform_name=platform_name,
+            unified_msg_origin=unified_msg_origin,
+        )
+        if not await self._should_send_live_atall(target):
+            yield event.plain_result("当前群不满足 @全体发送条件，请查看插件日志。")
+            return
+
+        await self.context.send_message(
+            unified_msg_origin,
+            MessageEventResult(
+                chain=MessageChain(
+                    [
+                        Comp.AtAll(),
+                        Comp.Plain(" "),
+                        Comp.Plain("【B站开播测试】这是一条 @全体 功能测试消息。"),
+                    ]
+                )
+            ).use_t2i(False),
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_all")
