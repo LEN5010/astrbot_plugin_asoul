@@ -299,15 +299,15 @@ class BilibiliParsingTest(unittest.TestCase):
                 "module_dynamic": {
                     "desc": {
                         "text": "所以明晚电台跟大家见面好不好呀奶淇琳"
-                    }
-                }
-            },
-            "additional": {
-                "reserve": {
-                    "title": "直播预约：【突击/电台】一起聊聊天~",
-                    "desc1": {"text": "明天 20:00 直播"},
-                    "desc2": {"text": "3191人预约"},
-                    "jump_url": "https://live.bilibili.com/blackboard/reserve",
+                    },
+                    "additional": {
+                        "reserve": {
+                            "title": "直播预约：【突击/电台】一起聊聊天~",
+                            "desc1": {"text": "明天 20:00 直播"},
+                            "desc2": {"text": "3191人预约"},
+                            "jump_url": "https://live.bilibili.com/blackboard/reserve",
+                        }
+                    },
                 }
             },
         }
