@@ -182,6 +182,17 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
     def test_live_notification_only_on_transition_to_live(self) -> None:
         initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
 
+        self.gateway.dynamic_posts["100"].insert(
+            0,
+            BilibiliDynamicPost(
+                id="dyn-live",
+                text="【突击】直播开始了",
+                url="https://live.bilibili.com/123?live_from=85002",
+                rich_nodes=[BilibiliRichTextNode(kind="text", text="【突击】直播开始了")],
+                image_urls=["https://i0.hdslb.com/live-cover.jpg"],
+                is_live_room_dynamic=True,
+            ),
+        )
         self.gateway.live_status["100"] = BilibiliLiveStatus(
             is_live=True,
             title="今晚直播",
@@ -256,6 +267,7 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual(post.url, "https://live.bilibili.com/22632424")
         self.assertIn("先看成龙历险记然后洛克王国世界", post.text)
         self.assertEqual(post.image_urls, ["https://i0.hdslb.com/live-cover.jpg"])
+        self.assertTrue(post.is_live_room_dynamic)
 
     def test_parse_forward_dynamic_includes_original_content(self) -> None:
         item = {

@@ -8,7 +8,7 @@
   "poll_interval_seconds": {
     "description": "轮询间隔（秒）",
     "type": "int",
-    "default": 120,
+    "default": 60,
     "hint": "建议不要过低，避免请求过快触发风控。最小按 30 秒处理。"
   },
   "request_client": {

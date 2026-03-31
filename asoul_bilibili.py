@@ -13,7 +13,7 @@ DEFAULT_BILIBILI_TARGET_UIDS = [
     "703007996",
     "3493085336046382",
 ]
-DEFAULT_POLL_INTERVAL_SECONDS = 120
+DEFAULT_POLL_INTERVAL_SECONDS = 60
 MIN_POLL_INTERVAL_SECONDS = 30
 COMMENT_RESOURCE_LIMIT_PER_KIND = 2
 COMMENT_RECENT_IDS_LIMIT = 20
@@ -63,6 +63,7 @@ class BilibiliDynamicPost:
     image_urls: List[str] = field(default_factory=list)
     comment_oid: int = 0
     comment_type: int = 0
+    is_live_room_dynamic: bool = False
 
 
 @dataclass(frozen=True)
@@ -515,7 +516,20 @@ class BilibiliGateway:
             image_urls=image_urls,
             comment_oid=comment_oid,
             comment_type=comment_type,
+            is_live_room_dynamic=self._is_live_room_dynamic(item),
         )
+
+    def _is_live_room_dynamic(self, item: Dict[str, Any]) -> bool:
+        module_dynamic = self._get_module_dynamic(item)
+        major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
+        if not major:
+            return False
+        if isinstance(major.get("live_rcmd"), dict):
+            return True
+        live_block = major.get("live")
+        if isinstance(live_block, dict) and live_block:
+            return True
+        return False
 
     def _extract_dynamic_rich_nodes(self, item: Dict[str, Any]) -> tuple[List[BilibiliRichTextNode], str]:
         nodes, primary_text = self._extract_primary_dynamic_rich_nodes(item)
@@ -960,6 +974,8 @@ class BilibiliMonitorService:
             if dynamics:
                 if latest_dynamic_id is not None:
                     for post in reversed(dynamics):
+                        if post.is_live_room_dynamic:
+                            continue
                         notifications.append(
                             BilibiliNotification(
                                 kind="dynamic",
