@@ -341,3 +341,30 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual(status.title, "【突击】先看成龙历险记然后洛克王国世界！")
         self.assertEqual(status.url, "https://live.bilibili.com/22632424")
         self.assertEqual(status.cover_url, "https://i0.hdslb.com/live-room-cover.jpg")
+
+    def test_get_live_status_supports_live_room_status_shape(self) -> None:
+        self.gateway.live_info_payload = {
+            "official": {
+                "title": "虚拟偶像团体A-SOUL 所属艺人",
+            },
+            "live_room": {
+                "roomStatus": 1,
+                "liveStatus": 1,
+                "url": "https://live.bilibili.com/22632424?broadcast_type=0&is_room_feed=1",
+                "title": "【突击】和贝拉一起洛克王国世界！",
+                "cover": "https://i0.hdslb.com/bfs/live/new_room_cover/11a9c6e355c7af3b6b62e6a72ef4943ad545c827.jpg",
+                "roomid": 22632424,
+            },
+        }
+
+        status = asyncio.run(self.gateway.get_live_status("672353429"))
+
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertTrue(status.is_live)
+        self.assertEqual(status.room_id, "22632424")
+        self.assertEqual(status.title, "【突击】和贝拉一起洛克王国世界！")
+        self.assertEqual(
+            status.url,
+            "https://live.bilibili.com/22632424?broadcast_type=0&is_room_feed=1",
+        )

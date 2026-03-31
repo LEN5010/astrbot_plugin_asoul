@@ -347,7 +347,10 @@ class BilibiliGateway:
                 ("roomStatus",),
                 ("room_info", "live_status"),
                 ("room_info", "liveStatus"),
+                ("room_info", "roomStatus"),
                 ("live_room", "live_status"),
+                ("live_room", "liveStatus"),
+                ("live_room", "roomStatus"),
             ),
         )
         if live_status_value is None:
@@ -362,6 +365,7 @@ class BilibiliGateway:
                 ("room_info", "room_id"),
                 ("room_info", "roomid"),
                 ("live_room", "room_id"),
+                ("live_room", "roomid"),
             ),
         )
         title_value = self._find_value_by_paths(
