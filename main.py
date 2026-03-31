@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
+from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
 from bilibili_api import login_v2
 
@@ -252,7 +252,7 @@ class ASoulPlugin(Star):
         chain_parts = self._build_notification_parts(notification)
         if notification.kind == "live" and await self._should_send_live_atall(target):
             chain_parts = [Comp.AtAll(), Comp.Plain(" ")] + chain_parts
-        return MessageEventResult(chain=MessageChain(chain_parts)).use_t2i(False)
+        return MessageEventResult(chain=chain_parts).use_t2i(False)
 
     @staticmethod
     def _safe_plain_newline() -> str:
@@ -612,13 +612,11 @@ class ASoulPlugin(Star):
         await self.context.send_message(
             unified_msg_origin,
             MessageEventResult(
-                chain=MessageChain(
-                    [
-                        Comp.AtAll(),
-                        Comp.Plain(" "),
-                        Comp.Plain("【B站开播测试】这是一条 @全体 功能测试消息。"),
-                    ]
-                )
+                chain=[
+                    Comp.AtAll(),
+                    Comp.Plain(" "),
+                    Comp.Plain("【B站开播测试】这是一条 @全体 功能测试消息。"),
+                ]
             ).use_t2i(False),
         )
 
