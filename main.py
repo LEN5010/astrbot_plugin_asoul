@@ -497,7 +497,9 @@ class ASoulPlugin(Star):
             yield event.plain_result(error_text)
             return
 
-        payload = await self._bilibili_gateway.get_raw_dynamics_page(uid, offset="")
+        user_obj = self._bilibili_gateway._new_user(uid)
+        page = await user_obj.get_dynamics_new(offset="")
+        payload = page if isinstance(page, dict) else {"payload": page}
         file_path = self._write_debug_payload_file(
             "dynamic",
             uid,
@@ -562,7 +564,9 @@ class ASoulPlugin(Star):
             yield event.plain_result(error_text)
             return
 
-        payload = await self._bilibili_gateway.get_raw_live_info(uid)
+        user_obj = self._bilibili_gateway._new_user(uid)
+        info = await user_obj.get_live_info()
+        payload = info if isinstance(info, dict) else {"payload": info}
         file_path = self._write_debug_payload_file(
             "live",
             uid,
