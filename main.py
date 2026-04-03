@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -190,6 +191,9 @@ class ASoulPlugin(Star):
 
     async def _run_bilibili_monitor_loop(self) -> None:
         logger.info("启动 B 站自动播报任务，轮询间隔 %s 秒", self._bilibili_config.poll_interval_seconds)
+        uid_states: dict[str, float] = {}
+        next_dispatch_at = 0.0
+
         while True:
             try:
                 if not self._bilibili_gateway.has_credential():
@@ -200,19 +204,48 @@ class ASoulPlugin(Star):
                     continue
 
                 self._bilibili_missing_login_logged = False
-                await self._poll_bilibili_updates_once()
-                await asyncio.sleep(self._bilibili_config.poll_interval_seconds)
+                current_uids = list(self._bilibili_config.target_uids)
+                now = time.monotonic()
+
+                for uid in list(uid_states):
+                    if uid not in current_uids:
+                        uid_states.pop(uid, None)
+
+                for uid in current_uids:
+                    uid_states.setdefault(uid, now)
+
+                if not current_uids:
+                    await asyncio.sleep(2)
+                    continue
+
+                due_uids = [uid for uid in current_uids if uid_states[uid] <= now]
+                if not due_uids:
+                    next_due_at = min(uid_states[uid] for uid in current_uids)
+                    await asyncio.sleep(min(max(next_due_at - now, 0.2), 2.0))
+                    continue
+
+                if now < next_dispatch_at:
+                    await asyncio.sleep(min(max(next_dispatch_at - now, 0.2), 2.0))
+                    continue
+
+                run_uid = min(due_uids, key=lambda uid: (uid_states[uid], uid))
+                await self._poll_bilibili_updates_for_uid(run_uid)
+
+                finished_at = time.monotonic()
+                uid_states[run_uid] = finished_at + self._bilibili_config.poll_interval_seconds
+                next_dispatch_at = finished_at + self._bilibili_config.task_gap_seconds
             except asyncio.CancelledError:
                 logger.info("B 站自动播报任务已停止")
                 raise
             except Exception:
                 logger.exception("B 站自动播报任务执行异常，本轮跳过并等待下次轮询")
-                await asyncio.sleep(self._bilibili_config.poll_interval_seconds)
+                await asyncio.sleep(1)
 
-    async def _poll_bilibili_updates_once(self) -> None:
-        updated_state, notifications = await self._bilibili_monitor.poll(
+    async def _poll_bilibili_updates_for_uid(self, uid: str) -> None:
+        updated_state, notifications = await self._bilibili_monitor.poll_uid(
             config=self._bilibili_config,
             state=self._bilibili_monitor_state,
+            uid=uid,
         )
         self._bilibili_monitor_state = updated_state
         await self.put_kv_data(KV_BILIBILI_MONITOR_STATE, self._bilibili_monitor_state)
@@ -220,6 +253,12 @@ class ASoulPlugin(Star):
         if not notifications:
             return
 
+        await self._dispatch_bilibili_notifications(notifications)
+
+    async def _dispatch_bilibili_notifications(
+        self,
+        notifications: list[BilibiliNotification],
+    ) -> None:
         target_entries = self._get_active_push_targets()
         if not target_entries:
             logger.info("存在 B 站新通知，但当前没有已登记的白名单群")
@@ -574,7 +613,7 @@ class ASoulPlugin(Star):
             yield event.plain_result("UID 格式错误，请输入纯数字 UID。")
             return
 
-        live_status = await self._bilibili_gateway.get_live_status(uid)
+        live_status = await self._bilibili_gateway.get_live_status_by_uid(uid)
         if live_status is None:
             yield event.plain_result(f"UID {uid} 当前没有抓到直播间信息。")
             return
@@ -686,7 +725,7 @@ class ASoulPlugin(Star):
         else:
             yield event.chain_result(self._build_notification_parts(video_notification))
 
-        live_status = await self._bilibili_gateway.get_live_status(uid)
+        live_status = await self._bilibili_gateway.get_live_status_by_uid(uid)
         if live_status is None:
             yield event.plain_result(f"UID {uid} 当前没有抓到直播间信息。")
         else:

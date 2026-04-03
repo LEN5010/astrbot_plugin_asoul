@@ -14,12 +14,13 @@ DEFAULT_BILIBILI_TARGET_UIDS = [
     "703007996",
     "3493085336046382",
 ]
-DEFAULT_POLL_INTERVAL_SECONDS = 60
-MIN_POLL_INTERVAL_SECONDS = 30
+DEFAULT_POLL_INTERVAL_SECONDS = 300
+MIN_POLL_INTERVAL_SECONDS = 60
+DEFAULT_TASK_GAP_SECONDS = 20.0
 COMMENT_RESOURCE_LIMIT_PER_KIND = 2
 COMMENT_RECENT_IDS_LIMIT = 20
 CONTENT_RECENT_IDS_LIMIT = 20
-RECENT_NOTIFICATION_WINDOW_SECONDS = 30 * 60
+RECENT_NOTIFICATION_WINDOW_SECONDS = 5 * 60
 BILIBILI_CREDENTIAL_FIELDS = (
     "sessdata",
     "bili_jct",
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 class BilibiliPushConfig:
     enabled: bool
     poll_interval_seconds: int
+    task_gap_seconds: float
     group_whitelist: List[str]
     target_uids: List[str]
     push_dynamic: bool
@@ -64,10 +66,13 @@ class BilibiliDynamicPost:
     url: str
     rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
     image_urls: List[str] = field(default_factory=list)
+    title: str = ""
+    cover_url: str = ""
     created_at: int = 0
     comment_oid: int = 0
     comment_type: int = 0
     is_live_room_dynamic: bool = False
+    is_video_dynamic: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,10 @@ def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> Bilibili
         source.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS),
         DEFAULT_POLL_INTERVAL_SECONDS,
     )
+    task_gap_seconds = _safe_parse_float(
+        source.get("task_gap_seconds", DEFAULT_TASK_GAP_SECONDS),
+        DEFAULT_TASK_GAP_SECONDS,
+    )
     request_client = str(source.get("request_client", "aiohttp") or "aiohttp").strip().lower()
     if request_client not in {"aiohttp", "httpx", "curl_cffi"}:
         request_client = "aiohttp"
@@ -137,12 +146,13 @@ def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> Bilibili
     return BilibiliPushConfig(
         enabled=bool(source.get("enabled", False)),
         poll_interval_seconds=max(MIN_POLL_INTERVAL_SECONDS, poll_interval),
+        task_gap_seconds=max(0.0, task_gap_seconds),
         group_whitelist=_normalize_string_list(source.get("group_whitelist", [])),
         target_uids=_normalize_string_list(source.get("target_uids", DEFAULT_BILIBILI_TARGET_UIDS)),
         push_dynamic=bool(source.get("push_dynamic", True)),
         push_video=bool(source.get("push_video", True)),
         push_live=bool(source.get("push_live", True)),
-        push_comment=bool(source.get("push_comment", True)),
+        push_comment=bool(source.get("push_comment", False)),
         request_client=request_client,
         credential_data=_normalize_credential_data(source),
     )
@@ -166,6 +176,13 @@ def _normalize_string_list(raw_value: Any) -> List[str]:
 def _safe_parse_int(raw_value: Any, default: int) -> int:
     try:
         return int(raw_value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_parse_float(raw_value: Any, default: float) -> float:
+    try:
+        return float(raw_value)
     except (TypeError, ValueError):
         return default
 
@@ -278,44 +295,24 @@ class BilibiliGateway:
         max_items: Optional[int] = None,
     ) -> tuple[List[BilibiliDynamicPost], bool]:
         user_obj = self._new_user(uid)
-
-        offset = ""
+        page = await user_obj.get_dynamics_new(offset="")
         collected: List[BilibiliDynamicPost] = []
         seen_ids = set()
         stop_found = stop_at_id is None
-
-        while True:
-            page = await user_obj.get_dynamics_new(offset=offset)
-            items = self._extract_dynamic_items(page)
-            if not items:
+        items = self._extract_dynamic_items(page)
+        for item in items:
+            if self._is_pinned_dynamic(item):
+                continue
+            parsed = self._parse_dynamic_post(item)
+            if parsed is None or parsed.id in seen_ids:
+                continue
+            if stop_at_id and parsed.id == stop_at_id:
+                stop_found = True
                 break
-
-            reached_stop = False
-            for item in items:
-                if self._is_pinned_dynamic(item):
-                    continue
-                parsed = self._parse_dynamic_post(item)
-                if parsed is None or parsed.id in seen_ids:
-                    continue
-                if stop_at_id and parsed.id == stop_at_id:
-                    stop_found = True
-                    reached_stop = True
-                    break
-                seen_ids.add(parsed.id)
-                collected.append(parsed)
-                if max_items is not None and len(collected) >= max_items:
-                    reached_stop = True
-                    break
-
-            if reached_stop:
+            seen_ids.add(parsed.id)
+            collected.append(parsed)
+            if max_items is not None and len(collected) >= max_items:
                 break
-            if stop_at_id is None and collected and max_items is None:
-                break
-
-            next_offset = page.get("offset") or page.get("next_offset") or ""
-            if not next_offset or str(next_offset) == str(offset):
-                break
-            offset = str(next_offset)
 
         return collected, stop_found
 
@@ -339,37 +336,22 @@ class BilibiliGateway:
         max_items: Optional[int] = None,
     ) -> tuple[List[BilibiliVideoPost], bool]:
         user_obj = self._new_user(uid)
-
-        page_index = 1
+        page = await user_obj.get_videos(pn=1, ps=30)
         collected: List[BilibiliVideoPost] = []
         seen_ids = set()
         stop_found = stop_at_id is None
-
-        while True:
-            page = await user_obj.get_videos(pn=page_index, ps=30)
-            items = self._extract_video_items(page)
-            if not items:
+        items = self._extract_video_items(page)
+        for item in items:
+            parsed = self._parse_video_post(item)
+            if parsed is None or parsed.id in seen_ids:
+                continue
+            if stop_at_id and parsed.id == stop_at_id:
+                stop_found = True
                 break
-
-            reached_stop = False
-            for item in items:
-                parsed = self._parse_video_post(item)
-                if parsed is None or parsed.id in seen_ids:
-                    continue
-                if stop_at_id and parsed.id == stop_at_id:
-                    stop_found = True
-                    reached_stop = True
-                    break
-                seen_ids.add(parsed.id)
-                collected.append(parsed)
-                if max_items is not None and len(collected) >= max_items:
-                    reached_stop = True
-                    break
-
-            if reached_stop or (stop_at_id is None and collected and max_items is None) or len(items) < 30:
+            seen_ids.add(parsed.id)
+            collected.append(parsed)
+            if max_items is not None and len(collected) >= max_items:
                 break
-
-            page_index += 1
 
         return collected, stop_found
 
@@ -476,6 +458,59 @@ class BilibiliGateway:
             cover_url=_normalize_url(str(cover_value).strip() if cover_value is not None else ""),
         )
 
+    async def get_live_status_by_uid(self, uid: str) -> Optional[BilibiliLiveStatus]:
+        result = await self.get_live_status_by_uids([uid])
+        return result.get(str(uid))
+
+    async def get_live_status_by_uids(
+        self,
+        uids: Sequence[str],
+    ) -> Dict[str, BilibiliLiveStatus]:
+        normalized_uids = [normalize_bilibili_uid(uid) for uid in uids]
+        if not normalized_uids:
+            return {}
+
+        self._load_modules()
+        from bilibili_api.utils.network import Api
+
+        params = {"uids[]": [int(uid) for uid in normalized_uids]}
+        response = await Api(
+            url="https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids",
+            method="GET",
+            verify=False,
+            params={"uids[]": "list<int>: 主播uid列表"},
+            comment="通过主播uid列表获取直播间状态信息",
+            no_csrf=True,
+        ).update_params(**params).result
+        if not isinstance(response, dict):
+            return {}
+
+        result: Dict[str, BilibiliLiveStatus] = {}
+        for uid in normalized_uids:
+            raw_status = response.get(uid) or response.get(int(uid))
+            if not isinstance(raw_status, dict):
+                continue
+            room_id = str(raw_status.get("room_id", "") or "").strip()
+            url = (
+                _normalize_url(str(raw_status.get("url", "") or "").strip())
+                or (f"https://live.bilibili.com/{room_id}" if room_id else "https://live.bilibili.com")
+            )
+            result[uid] = BilibiliLiveStatus(
+                is_live=int(raw_status.get("live_status", 0) or 0) == 1,
+                title=str(raw_status.get("title", "") or "直播已开始"),
+                room_id=room_id,
+                url=url,
+                cover_url=_normalize_url(
+                    str(
+                        raw_status.get("cover_from_user")
+                        or raw_status.get("cover")
+                        or raw_status.get("user_cover")
+                        or ""
+                    ).strip()
+                ),
+            )
+        return result
+
     async def get_recent_comments(self, resource: BilibiliCommentResource) -> List[BilibiliCommentPost]:
         _, _, comment_module = self._load_modules()
         comment_type = comment_module.CommentResourceType(resource.type_value)
@@ -577,16 +612,28 @@ class BilibiliGateway:
                 ),
             )
         )
+        major = self._get_module_dynamic(item).get("major")
+        major = major if isinstance(major, dict) else {}
+        archive = major.get("archive") if isinstance(major.get("archive"), dict) else {}
+        is_video_dynamic = bool(archive) and any(
+            archive.get(key) for key in ("bvid", "aid", "jump_url")
+        )
+        title = str(archive.get("title", "") or "").strip()
+        cover_url = _normalize_url(str(archive.get("cover", "") or "").strip())
+
         return BilibiliDynamicPost(
             id=str(dynamic_id),
             text=text,
             url=url,
             rich_nodes=rich_nodes,
             image_urls=image_urls,
+            title=title,
+            cover_url=cover_url,
             created_at=created_at,
             comment_oid=comment_oid,
             comment_type=comment_type,
             is_live_room_dynamic=self._is_live_room_dynamic(item),
+            is_video_dynamic=is_video_dynamic,
         )
 
     def _is_live_room_dynamic(self, item: Dict[str, Any]) -> bool:
@@ -1063,24 +1110,38 @@ class BilibiliMonitorService:
         state: Optional[Dict[str, Any]],
     ) -> tuple[Dict[str, Any], List[BilibiliNotification]]:
         new_state = deepcopy(state or {})
-        uid_state_map = new_state.setdefault("uids", {})
         notifications: List[BilibiliNotification] = []
 
         for uid in config.target_uids:
-            previous_uid_state = uid_state_map.get(uid, {})
-            try:
-                current_uid_state, uid_notifications = await self._poll_uid(
-                    uid=uid,
-                    config=config,
-                    previous_state=previous_uid_state,
-                )
-            except Exception:
-                logger.exception("轮询 B 站 UID %s 失败", uid)
-                continue
-
-            uid_state_map[uid] = current_uid_state
+            new_state, uid_notifications = await self.poll_uid(
+                config=config,
+                state=new_state,
+                uid=uid,
+            )
             notifications.extend(uid_notifications)
 
+        return new_state, notifications
+
+    async def poll_uid(
+        self,
+        config: BilibiliPushConfig,
+        state: Optional[Dict[str, Any]],
+        uid: str,
+    ) -> tuple[Dict[str, Any], List[BilibiliNotification]]:
+        new_state = deepcopy(state or {})
+        uid_state_map = new_state.setdefault("uids", {})
+        previous_uid_state = uid_state_map.get(uid, {})
+        try:
+            current_uid_state, notifications = await self._poll_uid(
+                uid=uid,
+                config=config,
+                previous_state=previous_uid_state,
+            )
+        except Exception:
+            logger.exception("轮询 B 站 UID %s 失败", uid)
+            return new_state, []
+
+        uid_state_map[uid] = current_uid_state
         return new_state, notifications
 
     async def _poll_uid(
@@ -1096,7 +1157,7 @@ class BilibiliMonitorService:
         notifications: List[BilibiliNotification] = []
         recent_cutoff_ts = max(0, int(time.time()) - RECENT_NOTIFICATION_WINDOW_SECONDS)
 
-        if config.push_dynamic:
+        if config.push_dynamic or config.push_video:
             latest_dynamic_id = str(uid_state.get("last_dynamic_id") or "").strip() or None
             recent_dynamic_ids = self._normalize_recent_ids(
                 uid_state.get("recent_dynamic_ids", [])
@@ -1116,60 +1177,40 @@ class BilibiliMonitorService:
                 for post in reversed(deliver_dynamics):
                     if post.is_live_room_dynamic:
                         continue
-                    notifications.append(
-                        BilibiliNotification(
-                            kind="dynamic",
-                            uid=uid,
-                            author_name=author_name,
-                            title="",
-                            url=post.url,
-                            text=post.text,
-                            rich_nodes=post.rich_nodes,
-                            image_urls=post.image_urls,
+                    if post.is_video_dynamic:
+                        if config.push_video:
+                            notifications.append(
+                                BilibiliNotification(
+                                    kind="video",
+                                    uid=uid,
+                                    author_name=author_name,
+                                    title=post.title or "发布了新视频",
+                                    url=post.url,
+                                    cover_url=post.cover_url or (post.image_urls[0] if post.image_urls else ""),
+                                )
+                            )
+                        continue
+                    if config.push_dynamic:
+                        notifications.append(
+                            BilibiliNotification(
+                                kind="dynamic",
+                                uid=uid,
+                                author_name=author_name,
+                                title="",
+                                url=post.url,
+                                text=post.text,
+                                rich_nodes=post.rich_nodes,
+                                image_urls=post.image_urls,
+                            )
                         )
-                    )
                 uid_state["last_dynamic_id"] = dynamics[0].id
                 uid_state["recent_dynamic_ids"] = self._merge_recent_ids(
                     [post.id for post in dynamics],
                     recent_dynamic_ids,
                 )
 
-        if config.push_video:
-            latest_video_id = str(uid_state.get("last_video_id") or "").strip() or None
-            recent_video_ids = self._normalize_recent_ids(
-                uid_state.get("recent_video_ids", [])
-            )
-            videos, video_stop_found = await self._gateway.get_recent_videos_with_status(
-                uid,
-                stop_at_id=latest_video_id,
-            )
-            if videos:
-                deliver_videos = self._select_posts_for_delivery(
-                    posts=videos,
-                    last_seen_id=latest_video_id,
-                    recent_ids=recent_video_ids,
-                    stop_found=video_stop_found,
-                    cutoff_ts=recent_cutoff_ts,
-                )
-                for post in reversed(deliver_videos):
-                    notifications.append(
-                        BilibiliNotification(
-                            kind="video",
-                            uid=uid,
-                            author_name=author_name,
-                            title=post.title,
-                            url=post.url,
-                            cover_url=post.cover_url,
-                        )
-                    )
-                uid_state["last_video_id"] = videos[0].id
-                uid_state["recent_video_ids"] = self._merge_recent_ids(
-                    [post.id for post in videos],
-                    recent_video_ids,
-                )
-
         if config.push_live:
-            live_status = await self._gateway.get_live_status(uid)
+            live_status = await self._gateway.get_live_status_by_uid(uid)
             if live_status is not None:
                 previous_live_active = uid_state.get("last_live_active")
                 if previous_live_active is None:
