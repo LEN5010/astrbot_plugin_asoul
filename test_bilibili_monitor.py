@@ -1,6 +1,7 @@
 import asyncio
 import json
 import unittest
+from unittest.mock import patch
 
 from asoul_bilibili import (
     BilibiliCommentPost,
@@ -16,6 +17,8 @@ from asoul_bilibili import (
     normalize_bilibili_uid,
 )
 
+NOW_TS = 1_700_000_000
+
 
 class FakeBilibiliGateway:
     def __init__(self) -> None:
@@ -27,6 +30,7 @@ class FakeBilibiliGateway:
                     text="第三条动态",
                     url="https://t.bilibili.com/dyn-3",
                     rich_nodes=[BilibiliRichTextNode(kind="text", text="第三条动态")],
+                    created_at=NOW_TS - 7200,
                     comment_oid=3003,
                     comment_type=17,
                 ),
@@ -35,6 +39,7 @@ class FakeBilibiliGateway:
                     text="第二条动态",
                     url="https://t.bilibili.com/dyn-2",
                     rich_nodes=[BilibiliRichTextNode(kind="text", text="第二条动态")],
+                    created_at=NOW_TS - 7260,
                     comment_oid=3002,
                     comment_type=17,
                 ),
@@ -43,6 +48,7 @@ class FakeBilibiliGateway:
                     text="第一条动态",
                     url="https://t.bilibili.com/dyn-1",
                     rich_nodes=[BilibiliRichTextNode(kind="text", text="第一条动态")],
+                    created_at=NOW_TS - 7320,
                     comment_oid=3001,
                     comment_type=17,
                 ),
@@ -50,9 +56,9 @@ class FakeBilibiliGateway:
         }
         self.video_posts = {
             "100": [
-                BilibiliVideoPost(id="BV3", title="第三个视频", url="https://www.bilibili.com/video/BV3", comment_oid=2003),
-                BilibiliVideoPost(id="BV2", title="第二个视频", url="https://www.bilibili.com/video/BV2", comment_oid=2002),
-                BilibiliVideoPost(id="BV1", title="第一个视频", url="https://www.bilibili.com/video/BV1", comment_oid=2001),
+                BilibiliVideoPost(id="BV3", title="第三个视频", url="https://www.bilibili.com/video/BV3", created_at=NOW_TS - 7200, comment_oid=2003),
+                BilibiliVideoPost(id="BV2", title="第二个视频", url="https://www.bilibili.com/video/BV2", created_at=NOW_TS - 7260, comment_oid=2002),
+                BilibiliVideoPost(id="BV1", title="第一个视频", url="https://www.bilibili.com/video/BV1", created_at=NOW_TS - 7320, comment_oid=2001),
             ]
         }
         self.live_status = {
@@ -181,7 +187,8 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         )
 
     def test_first_poll_only_initializes_state(self) -> None:
-        state, notifications = asyncio.run(self.service.poll(self.config, {}))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            state, notifications = asyncio.run(self.service.poll(self.config, {}))
 
         self.assertEqual(notifications, [])
         self.assertEqual(state["uids"]["100"]["last_dynamic_id"], "dyn-3")
@@ -189,7 +196,8 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         self.assertFalse(state["uids"]["100"]["last_live_active"])
 
     def test_second_poll_sends_all_unseen_dynamic_and_video_updates(self) -> None:
-        initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
 
         self.gateway.dynamic_posts["100"].insert(
             0,
@@ -198,16 +206,17 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
                 text="第四条动态",
                 url="https://t.bilibili.com/dyn-4",
                 rich_nodes=[BilibiliRichTextNode(kind="text", text="第四条动态")],
+                created_at=NOW_TS - 60,
                 comment_oid=3004,
                 comment_type=17,
             ),
         )
         self.gateway.video_posts["100"].insert(
             0,
-            BilibiliVideoPost(id="BV4", title="第四个视频", url="https://www.bilibili.com/video/BV4", comment_oid=2004),
+            BilibiliVideoPost(id="BV4", title="第四个视频", url="https://www.bilibili.com/video/BV4", created_at=NOW_TS - 60, comment_oid=2004),
         )
-
-        updated_state, notifications = asyncio.run(self.service.poll(self.config, initial_state))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            updated_state, notifications = asyncio.run(self.service.poll(self.config, initial_state))
 
         self.assertEqual([item.kind for item in notifications], ["dynamic", "video"])
         self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-4")
@@ -226,14 +235,58 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             }
         }
 
-        updated_state, notifications = asyncio.run(self.service.poll(self.config, stale_state))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            updated_state, notifications = asyncio.run(self.service.poll(self.config, stale_state))
 
         self.assertEqual(notifications, [])
         self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-3")
         self.assertEqual(updated_state["uids"]["100"]["last_video_id"], "BV3")
 
+    def test_stale_cursor_only_replays_recent_posts_within_half_hour(self) -> None:
+        self.gateway.dynamic_posts["100"].insert(
+            0,
+            BilibiliDynamicPost(
+                id="dyn-4",
+                text="第四条动态",
+                url="https://t.bilibili.com/dyn-4",
+                rich_nodes=[BilibiliRichTextNode(kind="text", text="第四条动态")],
+                created_at=NOW_TS - 120,
+                comment_oid=3004,
+                comment_type=17,
+            ),
+        )
+        self.gateway.video_posts["100"].insert(
+            0,
+            BilibiliVideoPost(
+                id="BV4",
+                title="第四个视频",
+                url="https://www.bilibili.com/video/BV4",
+                created_at=NOW_TS - 120,
+                comment_oid=2004,
+            ),
+        )
+        stale_state = {
+            "uids": {
+                "100": {
+                    "author_name": "测试账号",
+                    "last_dynamic_id": "missing-dyn",
+                    "last_video_id": "missing-bv",
+                    "last_live_active": False,
+                    "comment_resources": {},
+                }
+            }
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            updated_state, notifications = asyncio.run(self.service.poll(self.config, stale_state))
+
+        self.assertEqual([item.kind for item in notifications], ["dynamic", "video"])
+        self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-4")
+        self.assertEqual(updated_state["uids"]["100"]["last_video_id"], "BV4")
+
     def test_live_notification_only_on_transition_to_live(self) -> None:
-        initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
 
         self.gateway.dynamic_posts["100"].insert(
             0,
@@ -243,6 +296,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
                 url="https://live.bilibili.com/123?live_from=85002",
                 rich_nodes=[BilibiliRichTextNode(kind="text", text="【突击】直播开始了")],
                 image_urls=["https://i0.hdslb.com/live-cover.jpg"],
+                created_at=NOW_TS - 60,
                 is_live_room_dynamic=True,
             ),
         )
@@ -252,18 +306,21 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             room_id="123",
             url="https://live.bilibili.com/123",
         )
-        updated_state, notifications = asyncio.run(self.service.poll(self.config, initial_state))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            updated_state, notifications = asyncio.run(self.service.poll(self.config, initial_state))
 
         self.assertEqual(len(notifications), 1)
         self.assertEqual(notifications[0].kind, "live")
         self.assertTrue(updated_state["uids"]["100"]["last_live_active"])
 
-        repeated_state, repeated_notifications = asyncio.run(self.service.poll(self.config, updated_state))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            repeated_state, repeated_notifications = asyncio.run(self.service.poll(self.config, updated_state))
         self.assertEqual(repeated_notifications, [])
         self.assertTrue(repeated_state["uids"]["100"]["last_live_active"])
 
     def test_comment_notification_only_for_new_target_comments(self) -> None:
-        initial_state, notifications = asyncio.run(self.service.poll(self.config, {}))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            initial_state, notifications = asyncio.run(self.service.poll(self.config, {}))
 
         self.assertEqual(notifications, [])
 
@@ -279,7 +336,8 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             ),
         )
 
-        updated_state, updated_notifications = asyncio.run(self.service.poll(self.config, initial_state))
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            updated_state, updated_notifications = asyncio.run(self.service.poll(self.config, initial_state))
 
         self.assertEqual(len(updated_notifications), 1)
         self.assertEqual(updated_notifications[0].kind, "comment")

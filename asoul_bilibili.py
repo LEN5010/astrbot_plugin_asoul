@@ -1,5 +1,6 @@
 import logging
 import json
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
@@ -17,6 +18,8 @@ DEFAULT_POLL_INTERVAL_SECONDS = 60
 MIN_POLL_INTERVAL_SECONDS = 30
 COMMENT_RESOURCE_LIMIT_PER_KIND = 2
 COMMENT_RECENT_IDS_LIMIT = 20
+CONTENT_RECENT_IDS_LIMIT = 20
+RECENT_NOTIFICATION_WINDOW_SECONDS = 30 * 60
 BILIBILI_CREDENTIAL_FIELDS = (
     "sessdata",
     "bili_jct",
@@ -61,6 +64,7 @@ class BilibiliDynamicPost:
     url: str
     rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
     image_urls: List[str] = field(default_factory=list)
+    created_at: int = 0
     comment_oid: int = 0
     comment_type: int = 0
     is_live_room_dynamic: bool = False
@@ -72,6 +76,7 @@ class BilibiliVideoPost:
     title: str
     url: str
     cover_url: str = ""
+    created_at: int = 0
     comment_oid: int = 0
 
 
@@ -556,12 +561,29 @@ class BilibiliGateway:
         comment_type = _safe_int(
             self._find_first_value(item.get("basic", {}), ("comment_type",))
         )
+        created_at = _safe_int(
+            self._find_value_by_paths(
+                item,
+                (
+                    ("modules", "module_author", "pub_ts"),
+                    ("modules", "module_author", "pub_ts_str"),
+                    ("modules", "module_author", "ctime"),
+                    ("modules", "module_author", "publish_ts"),
+                    ("modules", "module_author", "publish_time"),
+                    ("basic", "pub_ts"),
+                    ("basic", "ctime"),
+                    ("pub_ts",),
+                    ("ctime",),
+                ),
+            )
+        )
         return BilibiliDynamicPost(
             id=str(dynamic_id),
             text=text,
             url=url,
             rich_nodes=rich_nodes,
             image_urls=image_urls,
+            created_at=created_at,
             comment_oid=comment_oid,
             comment_type=comment_type,
             is_live_room_dynamic=self._is_live_room_dynamic(item),
@@ -890,12 +912,16 @@ class BilibiliGateway:
 
         cover_value = item.get("pic") or self._find_first_value(item, ("pic", "cover"))
         cover_url = _normalize_url(str(cover_value).strip() if cover_value is not None else "")
+        created_at = _safe_int(
+            self._find_first_value(item, ("created", "created_at", "ctime", "pubdate"))
+        )
 
         return BilibiliVideoPost(
             id=str(video_id),
             title=title or "发布了新视频",
             url=url or "https://www.bilibili.com",
             cover_url=cover_url,
+            created_at=created_at,
             comment_oid=_safe_int(aid),
         )
 
@@ -978,6 +1004,59 @@ class BilibiliMonitorService:
     def __init__(self, gateway: BilibiliGateway) -> None:
         self._gateway = gateway
 
+    @staticmethod
+    def _normalize_recent_ids(raw_value: Any) -> List[str]:
+        if not isinstance(raw_value, list):
+            return []
+        normalized: List[str] = []
+        seen = set()
+        for item in raw_value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
+    @staticmethod
+    def _merge_recent_ids(current_ids: List[str], previous_ids: List[str]) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for raw_id in current_ids + previous_ids:
+            text = str(raw_id or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+            if len(merged) >= CONTENT_RECENT_IDS_LIMIT:
+                break
+        return merged
+
+    @staticmethod
+    def _filter_recent_posts(posts: List[Any], cutoff_ts: int) -> List[Any]:
+        return [
+            post
+            for post in posts
+            if getattr(post, "created_at", 0) > 0
+            and int(getattr(post, "created_at", 0)) >= cutoff_ts
+        ]
+
+    def _select_posts_for_delivery(
+        self,
+        posts: List[Any],
+        last_seen_id: Optional[str],
+        recent_ids: List[str],
+        stop_found: bool,
+        cutoff_ts: int,
+    ) -> List[Any]:
+        known_ids = {text for text in ([last_seen_id] + recent_ids) if text}
+        candidate_posts = [post for post in posts if getattr(post, "id", "") not in known_ids]
+        if not candidate_posts:
+            return []
+        if last_seen_id and stop_found:
+            return candidate_posts
+        return self._filter_recent_posts(candidate_posts, cutoff_ts)
+
     async def poll(
         self,
         config: BilibiliPushConfig,
@@ -1015,52 +1094,79 @@ class BilibiliMonitorService:
         uid_state["author_name"] = author_name
 
         notifications: List[BilibiliNotification] = []
+        recent_cutoff_ts = max(0, int(time.time()) - RECENT_NOTIFICATION_WINDOW_SECONDS)
 
         if config.push_dynamic:
             latest_dynamic_id = str(uid_state.get("last_dynamic_id") or "").strip() or None
+            recent_dynamic_ids = self._normalize_recent_ids(
+                uid_state.get("recent_dynamic_ids", [])
+            )
             dynamics, dynamic_stop_found = await self._gateway.get_recent_dynamics_with_status(
                 uid,
                 stop_at_id=latest_dynamic_id,
             )
             if dynamics:
-                if latest_dynamic_id is not None and dynamic_stop_found:
-                    for post in reversed(dynamics):
-                        if post.is_live_room_dynamic:
-                            continue
-                        notifications.append(
-                            BilibiliNotification(
-                                kind="dynamic",
-                                uid=uid,
-                                author_name=author_name,
-                                title="",
-                                url=post.url,
-                                text=post.text,
-                                rich_nodes=post.rich_nodes,
-                                image_urls=post.image_urls,
-                            )
+                deliver_dynamics = self._select_posts_for_delivery(
+                    posts=dynamics,
+                    last_seen_id=latest_dynamic_id,
+                    recent_ids=recent_dynamic_ids,
+                    stop_found=dynamic_stop_found,
+                    cutoff_ts=recent_cutoff_ts,
+                )
+                for post in reversed(deliver_dynamics):
+                    if post.is_live_room_dynamic:
+                        continue
+                    notifications.append(
+                        BilibiliNotification(
+                            kind="dynamic",
+                            uid=uid,
+                            author_name=author_name,
+                            title="",
+                            url=post.url,
+                            text=post.text,
+                            rich_nodes=post.rich_nodes,
+                            image_urls=post.image_urls,
                         )
+                    )
                 uid_state["last_dynamic_id"] = dynamics[0].id
+                uid_state["recent_dynamic_ids"] = self._merge_recent_ids(
+                    [post.id for post in dynamics],
+                    recent_dynamic_ids,
+                )
 
         if config.push_video:
             latest_video_id = str(uid_state.get("last_video_id") or "").strip() or None
+            recent_video_ids = self._normalize_recent_ids(
+                uid_state.get("recent_video_ids", [])
+            )
             videos, video_stop_found = await self._gateway.get_recent_videos_with_status(
                 uid,
                 stop_at_id=latest_video_id,
             )
             if videos:
-                if latest_video_id is not None and video_stop_found:
-                    for post in reversed(videos):
-                        notifications.append(
-                            BilibiliNotification(
-                                kind="video",
-                                uid=uid,
-                                author_name=author_name,
-                                title=post.title,
-                                url=post.url,
-                                cover_url=post.cover_url,
-                            )
+                deliver_videos = self._select_posts_for_delivery(
+                    posts=videos,
+                    last_seen_id=latest_video_id,
+                    recent_ids=recent_video_ids,
+                    stop_found=video_stop_found,
+                    cutoff_ts=recent_cutoff_ts,
+                )
+                for post in reversed(deliver_videos):
+                    notifications.append(
+                        BilibiliNotification(
+                            kind="video",
+                            uid=uid,
+                            author_name=author_name,
+                            title=post.title,
+                            url=post.url,
+                            cover_url=post.cover_url,
                         )
+                    )
                 uid_state["last_video_id"] = videos[0].id
+                uid_state["recent_video_ids"] = self._merge_recent_ids(
+                    [post.id for post in videos],
+                    recent_video_ids,
+                )
 
         if config.push_live:
             live_status = await self._gateway.get_live_status(uid)

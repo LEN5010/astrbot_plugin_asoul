@@ -780,7 +780,11 @@ class ASoulPlugin(Star):
         yield event.plain_result("已清除当前保存的 B 站登录态。")
 
     async def _should_send_live_atall(self, target: BilibiliPushTarget) -> bool:
-        platform_inst = self._find_platform_by_name(target.platform_name)
+        platform_inst = None
+        if hasattr(self.context, "get_platform_inst"):
+            platform_inst = self.context.get_platform_inst(target.platform_name)
+        if not platform_inst:
+            platform_inst = self._find_platform_by_name(target.platform_name)
         if not platform_inst:
             logger.warning("直播 @全体失败：找不到平台实例 %s", target.platform_name)
             return False
