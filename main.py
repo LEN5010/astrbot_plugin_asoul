@@ -81,7 +81,7 @@ class ASoulPlugin(Star):
             self._bilibili_gateway
         )
         self._bilibili_task: asyncio.Task | None = None
-        self._bilibili_group_origins: dict[str, str] = {}
+        self._bilibili_push_targets: dict[str, dict[str, str]] = {}
         self._bilibili_monitor_state: dict = {}
         self._bilibili_credential_data: dict[str, str] = {}
         self._bilibili_missing_login_logged = False
@@ -91,7 +91,17 @@ class ASoulPlugin(Star):
     async def on_astrbot_loaded(self):
         await self._ensure_bilibili_runtime_ready()
 
+    def _refresh_bilibili_config(self) -> None:
+        previous_request_client = self._bilibili_config.request_client
+        self._bilibili_config = build_bilibili_push_config(self.config)
+        if self._bilibili_config.request_client != previous_request_client:
+            self._bilibili_gateway.set_request_client(self._bilibili_config.request_client)
+        self._bilibili_gateway.set_credential_data(
+            self._resolve_bilibili_credential_data(self._bilibili_credential_data)
+        )
+
     async def _ensure_bilibili_runtime_ready(self) -> None:
+        self._refresh_bilibili_config()
         if not self._bilibili_runtime_initialized:
             await self._load_bilibili_runtime_state()
             self._bilibili_runtime_initialized = True
@@ -118,11 +128,26 @@ class ASoulPlugin(Star):
         unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
         if not unified_msg_origin:
             return
-        if self._bilibili_group_origins.get(group_id) == unified_msg_origin:
+        platform_name = self._extract_platform_name(unified_msg_origin)
+        if not platform_name:
             return
 
-        self._bilibili_group_origins[group_id] = unified_msg_origin
-        await self.put_kv_data(KV_BILIBILI_GROUP_ORIGINS, self._bilibili_group_origins)
+        current_target = self._bilibili_push_targets.get(unified_msg_origin)
+        if current_target and current_target.get("group_id") == group_id:
+            return
+
+        next_targets = {
+            origin: target
+            for origin, target in self._bilibili_push_targets.items()
+            if str(target.get("group_id", "") or "").strip() != group_id
+        }
+        next_targets[unified_msg_origin] = {
+            "group_id": group_id,
+            "platform_name": platform_name,
+            "unified_msg_origin": unified_msg_origin,
+        }
+        self._bilibili_push_targets = next_targets
+        await self.put_kv_data(KV_BILIBILI_GROUP_ORIGINS, self._bilibili_push_targets)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_bot_help(self, event: AstrMessageEvent):
@@ -181,10 +206,10 @@ class ASoulPlugin(Star):
         return None
 
     async def _load_bilibili_runtime_state(self) -> None:
-        group_origins = await self.get_kv_data(KV_BILIBILI_GROUP_ORIGINS, {})
+        push_targets = await self.get_kv_data(KV_BILIBILI_GROUP_ORIGINS, {})
         monitor_state = await self.get_kv_data(KV_BILIBILI_MONITOR_STATE, {})
         credential_data = await self.get_kv_data(KV_BILIBILI_CREDENTIAL, {})
-        self._bilibili_group_origins = group_origins if isinstance(group_origins, dict) else {}
+        self._bilibili_push_targets = self._normalize_bilibili_push_targets(push_targets)
         self._bilibili_monitor_state = monitor_state if isinstance(monitor_state, dict) else {}
         self._bilibili_credential_data = self._resolve_bilibili_credential_data(credential_data)
         self._bilibili_gateway.set_credential_data(self._bilibili_credential_data)
@@ -196,6 +221,7 @@ class ASoulPlugin(Star):
 
         while True:
             try:
+                self._refresh_bilibili_config()
                 if not self._bilibili_gateway.has_credential():
                     if not self._bilibili_missing_login_logged:
                         logger.warning("B 站自动播报未登录，轮询已暂停。请配置凭据或使用 /bili_login 登录。")
@@ -274,16 +300,17 @@ class ASoulPlugin(Star):
 
     def _get_active_push_targets(self) -> list[BilibiliPushTarget]:
         targets: list[BilibiliPushTarget] = []
-        seen = set()
-        for group_id in self._bilibili_config.group_whitelist:
-            unified_msg_origin = self._bilibili_group_origins.get(group_id)
-            if not unified_msg_origin or unified_msg_origin in seen:
+        allowed_groups = set(self._bilibili_config.group_whitelist)
+        for unified_msg_origin, raw_target in self._bilibili_push_targets.items():
+            group_id = str(raw_target.get("group_id", "") or "").strip()
+            if not group_id or group_id not in allowed_groups:
                 continue
-            platform_name = self._extract_platform_name(unified_msg_origin)
+            platform_name = str(raw_target.get("platform_name", "") or "").strip()
             if not platform_name:
-                logger.warning("跳过无法识别平台的群播报目标: group_id=%s", group_id)
+                platform_name = self._extract_platform_name(unified_msg_origin)
+            if not platform_name:
+                logger.warning("跳过无法识别平台的群播报目标: group_id=%s umo=%s", group_id, unified_msg_origin)
                 continue
-            seen.add(unified_msg_origin)
             targets.append(
                 BilibiliPushTarget(
                     group_id=group_id,
@@ -369,6 +396,37 @@ class ASoulPlugin(Star):
         if runtime_data:
             return runtime_data
         return normalize_bilibili_credential_data(self._bilibili_config.credential_data)
+
+    def _normalize_bilibili_push_targets(self, raw_value: Any) -> dict[str, dict[str, str]]:
+        if not isinstance(raw_value, dict):
+            return {}
+
+        normalized: dict[str, dict[str, str]] = {}
+        for raw_key, raw_target in raw_value.items():
+            if isinstance(raw_target, str):
+                unified_msg_origin = str(raw_target or "").strip()
+                group_id = str(raw_key or "").strip()
+                platform_name = self._extract_platform_name(unified_msg_origin)
+            elif isinstance(raw_target, dict):
+                unified_msg_origin = str(
+                    raw_target.get("unified_msg_origin", raw_key) or ""
+                ).strip()
+                group_id = str(raw_target.get("group_id", "") or "").strip()
+                platform_name = str(raw_target.get("platform_name", "") or "").strip()
+                if not platform_name:
+                    platform_name = self._extract_platform_name(unified_msg_origin)
+            else:
+                continue
+
+            if not unified_msg_origin or not group_id or not platform_name:
+                continue
+
+            normalized[unified_msg_origin] = {
+                "group_id": group_id,
+                "platform_name": platform_name,
+                "unified_msg_origin": unified_msg_origin,
+            }
+        return normalized
 
     async def _save_bilibili_credential(self, credential_data: dict[str, str]) -> None:
         normalized = normalize_bilibili_credential_data(credential_data)

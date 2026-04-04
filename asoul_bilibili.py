@@ -246,6 +246,15 @@ class BilibiliGateway:
         self._credential_data = _normalize_credential_data(credential_data or {})
         self._credential = self._build_credential(self._credential_data) if self._credential_data else None
 
+    def set_request_client(self, request_client: str) -> None:
+        normalized = str(request_client or "aiohttp").strip().lower()
+        if normalized not in {"aiohttp", "httpx", "curl_cffi"}:
+            normalized = "aiohttp"
+        if normalized == self._request_client:
+            return
+        self._request_client = normalized
+        self._client_selected = False
+
     def clear_credential(self) -> None:
         self._credential_data = {}
         self._credential = None
