@@ -214,6 +214,14 @@ class ASoulPlugin(Star):
     async def _persist_bilibili_monitor_state(self) -> None:
         await self.put_kv_data(KV_BILIBILI_MONITOR_STATE, self._bilibili_monitor_state)
 
+    async def _persist_bilibili_monitor_state_safely(self) -> bool:
+        try:
+            await self._persist_bilibili_monitor_state()
+            return True
+        except Exception:
+            logger.exception("持久化 B 站监控状态失败，将继续使用内存态运行")
+            return False
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def remember_group_origin(self, event: AstrMessageEvent):
         await self._ensure_bilibili_runtime_ready()
@@ -248,7 +256,7 @@ class ASoulPlugin(Star):
         await self.put_kv_data(KV_BILIBILI_GROUP_ORIGINS, self._bilibili_push_targets)
         _, state_changed = self._ensure_bilibili_target_monitor_bucket(unified_msg_origin)
         if state_changed:
-            await self._persist_bilibili_monitor_state()
+            await self._persist_bilibili_monitor_state_safely()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_bot_help(self, event: AstrMessageEvent):
@@ -437,13 +445,13 @@ class ASoulPlugin(Star):
 
             current_uid_state = deepcopy(delivery.uid_state)
             uid_state_map[uid] = deepcopy(current_uid_state)
-            await self._persist_bilibili_monitor_state()
+            await self._persist_bilibili_monitor_state_safely()
 
         if current_uid_state == plan.final_state:
             return
 
         uid_state_map[uid] = deepcopy(plan.final_state)
-        await self._persist_bilibili_monitor_state()
+        await self._persist_bilibili_monitor_state_safely()
 
     def _get_active_push_targets(self) -> list[BilibiliPushTarget]:
         targets: list[BilibiliPushTarget] = []

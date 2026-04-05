@@ -154,6 +154,45 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         self.assertEqual(plugin._bilibili_monitor.fetch_calls, [])
         self.assertEqual(plugin._bilibili_monitor_state, {})
 
+    def test_persist_failure_does_not_block_other_targets_or_memory_state(self) -> None:
+        context = RecordingContext()
+        origin_a = "aiocqhttp:GroupMessage:100"
+        origin_b = "aiocqhttp:GroupMessage:200"
+        plugin = self._new_plugin(context, ["100", "200"])
+        plugin._bilibili_push_targets = {
+            origin_a: {
+                "group_id": "100",
+                "platform_name": "aiocqhttp",
+                "unified_msg_origin": origin_a,
+            },
+            origin_b: {
+                "group_id": "200",
+                "platform_name": "aiocqhttp",
+                "unified_msg_origin": origin_b,
+            },
+        }
+
+        original_put_kv_data = plugin.put_kv_data
+        persist_calls = {"count": 0}
+
+        async def flaky_put_kv_data(key, value):
+            if key == self.main.KV_BILIBILI_MONITOR_STATE:
+                persist_calls["count"] += 1
+                if persist_calls["count"] == 1:
+                    raise RuntimeError("kv store unavailable")
+            return await original_put_kv_data(key, value)
+
+        plugin.put_kv_data = flaky_put_kv_data
+
+        asyncio.run(plugin._poll_bilibili_updates_for_uid("100"))
+
+        self.assertEqual(context.origin_counts[origin_a], 2)
+        self.assertEqual(context.origin_counts[origin_b], 2)
+        state_a = plugin._bilibili_monitor_state["targets"][origin_a]["uids"]["100"]
+        state_b = plugin._bilibili_monitor_state["targets"][origin_b]["uids"]["100"]
+        self.assertEqual(state_a["last_dynamic_id"], "dyn-2")
+        self.assertEqual(state_b["last_dynamic_id"], "dyn-2")
+
 
 if __name__ == "__main__":
     unittest.main()
