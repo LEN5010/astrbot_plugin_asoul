@@ -412,6 +412,44 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         self.assertIn("回复了评论", updated_notifications[0].title)
         self.assertEqual(updated_state["uids"]["100"]["comment_resources"]["video:2003"]["last_comment_id"], "9002")
 
+    def test_second_poll_delivers_two_reserve_dynamics_in_order(self) -> None:
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
+
+        self.gateway.dynamic_posts["100"] = [
+            BilibiliDynamicPost(
+                id="dyn-reserve-2",
+                text="今晚再约一次",
+                url="https://live.bilibili.com/blackboard/reserve-2",
+                rich_nodes=[BilibiliRichTextNode(kind="text", text="今晚再约一次")],
+                created_at=NOW_TS - 30,
+                comment_oid=3012,
+                comment_type=17,
+            ),
+            BilibiliDynamicPost(
+                id="dyn-reserve-1",
+                text="明晚先约一个",
+                url="https://live.bilibili.com/blackboard/reserve-1",
+                rich_nodes=[BilibiliRichTextNode(kind="text", text="明晚先约一个")],
+                created_at=NOW_TS - 60,
+                comment_oid=3011,
+                comment_type=17,
+            ),
+            *self.gateway.dynamic_posts["100"],
+        ]
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            updated_state, notifications = asyncio.run(self.service.poll(self.config, initial_state))
+
+        self.assertEqual(
+            [notification.url for notification in notifications if notification.kind == "dynamic"],
+            [
+                "https://live.bilibili.com/blackboard/reserve-1",
+                "https://live.bilibili.com/blackboard/reserve-2",
+            ],
+        )
+        self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-reserve-2")
+
 
 class BilibiliConfigParsingTest(unittest.TestCase):
     def test_build_config_falls_back_when_poll_interval_is_invalid(self) -> None:

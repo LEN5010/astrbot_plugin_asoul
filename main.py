@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,7 +25,10 @@ from asoul_bilibili import (
     BilibiliGateway,
     BilibiliMonitorService,
     BilibiliNotification,
+    BilibiliPlannedNotification,
     BilibiliRichTextNode,
+    BilibiliUidDeliveryPlan,
+    BilibiliUidSnapshot,
     build_bilibili_push_config,
     normalize_bilibili_credential_data,
 )
@@ -116,6 +120,100 @@ class ASoulPlugin(Star):
 
         self._bilibili_task = asyncio.create_task(self._run_bilibili_monitor_loop())
 
+    @staticmethod
+    def _build_empty_bilibili_monitor_state() -> dict[str, Any]:
+        return {
+            "targets": {},
+            "bootstrap_uids": {},
+        }
+
+    @staticmethod
+    def _normalize_bilibili_uid_state_map(raw_value: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw_value, dict):
+            return {}
+
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_uid, raw_state in raw_value.items():
+            uid = str(raw_uid or "").strip()
+            if not uid or not isinstance(raw_state, dict):
+                continue
+            normalized[uid] = deepcopy(raw_state)
+        return normalized
+
+    def _normalize_bilibili_monitor_state(self, raw_value: Any) -> dict[str, Any]:
+        empty_state = self._build_empty_bilibili_monitor_state()
+        if not isinstance(raw_value, dict):
+            return empty_state
+
+        if "targets" in raw_value or "bootstrap_uids" in raw_value:
+            raw_targets = raw_value.get("targets", {})
+            normalized_targets: dict[str, dict[str, Any]] = {}
+            if isinstance(raw_targets, dict):
+                for raw_origin, raw_target_state in raw_targets.items():
+                    origin = str(raw_origin or "").strip()
+                    if not origin or not isinstance(raw_target_state, dict):
+                        continue
+                    normalized_targets[origin] = {
+                        "uids": self._normalize_bilibili_uid_state_map(
+                            raw_target_state.get("uids", {})
+                        )
+                    }
+
+            return {
+                "targets": normalized_targets,
+                "bootstrap_uids": self._normalize_bilibili_uid_state_map(
+                    raw_value.get("bootstrap_uids", {})
+                ),
+            }
+
+        legacy_uids = self._normalize_bilibili_uid_state_map(raw_value.get("uids", {}))
+        if not legacy_uids:
+            return empty_state
+
+        if not self._bilibili_push_targets:
+            return {
+                "targets": {},
+                "bootstrap_uids": legacy_uids,
+            }
+
+        return {
+            "targets": {
+                origin: {"uids": deepcopy(legacy_uids)}
+                for origin in self._bilibili_push_targets
+            },
+            "bootstrap_uids": {},
+        }
+
+    def _ensure_bilibili_target_monitor_bucket(
+        self, unified_msg_origin: str
+    ) -> tuple[dict[str, Any], bool]:
+        state = self._normalize_bilibili_monitor_state(self._bilibili_monitor_state)
+        targets = state.setdefault("targets", {})
+        origin = str(unified_msg_origin or "").strip()
+        if not origin:
+            self._bilibili_monitor_state = state
+            return {"uids": {}}, False
+
+        changed = False
+        target_state = targets.get(origin)
+        if not isinstance(target_state, dict):
+            seed_uids = {}
+            if not targets:
+                seed_uids = deepcopy(state.get("bootstrap_uids", {}))
+            target_state = {"uids": seed_uids}
+            targets[origin] = target_state
+            changed = True
+        else:
+            target_state["uids"] = self._normalize_bilibili_uid_state_map(
+                target_state.get("uids", {})
+            )
+
+        self._bilibili_monitor_state = state
+        return target_state, changed
+
+    async def _persist_bilibili_monitor_state(self) -> None:
+        await self.put_kv_data(KV_BILIBILI_MONITOR_STATE, self._bilibili_monitor_state)
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def remember_group_origin(self, event: AstrMessageEvent):
         await self._ensure_bilibili_runtime_ready()
@@ -148,6 +246,9 @@ class ASoulPlugin(Star):
         }
         self._bilibili_push_targets = next_targets
         await self.put_kv_data(KV_BILIBILI_GROUP_ORIGINS, self._bilibili_push_targets)
+        _, state_changed = self._ensure_bilibili_target_monitor_bucket(unified_msg_origin)
+        if state_changed:
+            await self._persist_bilibili_monitor_state()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_bot_help(self, event: AstrMessageEvent):
@@ -210,7 +311,7 @@ class ASoulPlugin(Star):
         monitor_state = await self.get_kv_data(KV_BILIBILI_MONITOR_STATE, {})
         credential_data = await self.get_kv_data(KV_BILIBILI_CREDENTIAL, {})
         self._bilibili_push_targets = self._normalize_bilibili_push_targets(push_targets)
-        self._bilibili_monitor_state = monitor_state if isinstance(monitor_state, dict) else {}
+        self._bilibili_monitor_state = self._normalize_bilibili_monitor_state(monitor_state)
         self._bilibili_credential_data = self._resolve_bilibili_credential_data(credential_data)
         self._bilibili_gateway.set_credential_data(self._bilibili_credential_data)
 
@@ -268,35 +369,81 @@ class ASoulPlugin(Star):
                 await asyncio.sleep(1)
 
     async def _poll_bilibili_updates_for_uid(self, uid: str) -> None:
-        updated_state, notifications = await self._bilibili_monitor.poll_uid(
-            config=self._bilibili_config,
-            state=self._bilibili_monitor_state,
-            uid=uid,
-        )
-        self._bilibili_monitor_state = updated_state
-        await self.put_kv_data(KV_BILIBILI_MONITOR_STATE, self._bilibili_monitor_state)
-
-        if not notifications:
-            return
-
-        await self._dispatch_bilibili_notifications(notifications)
-
-    async def _dispatch_bilibili_notifications(
-        self,
-        notifications: list[BilibiliNotification],
-    ) -> None:
         target_entries = self._get_active_push_targets()
         if not target_entries:
             logger.info("存在 B 站新通知，但当前没有已登记的白名单群")
             return
 
-        for notification in notifications:
-            for target in target_entries:
-                try:
-                    result = await self._build_notification_result(notification, target)
-                    await self.context.send_message(target.unified_msg_origin, result)
-                except Exception:
-                    logger.exception("发送 B 站播报失败: uid=%s kind=%s", notification.uid, notification.kind)
+        snapshot_seed_state: dict[str, Any] | None = None
+        for target in target_entries:
+            target_state, _ = self._ensure_bilibili_target_monitor_bucket(
+                target.unified_msg_origin
+            )
+            candidate_state = target_state.get("uids", {}).get(uid)
+            if isinstance(candidate_state, dict) and candidate_state:
+                snapshot_seed_state = deepcopy(candidate_state)
+                break
+
+        snapshot = await self._bilibili_monitor.fetch_uid_snapshot(
+            config=self._bilibili_config,
+            uid=uid,
+            previous_state=snapshot_seed_state,
+        )
+
+        for target in target_entries:
+            target_state, _ = self._ensure_bilibili_target_monitor_bucket(
+                target.unified_msg_origin
+            )
+            target_uid_state = target_state.setdefault("uids", {}).get(uid, {})
+            plan = self._bilibili_monitor.plan_uid_deliveries(
+                config=self._bilibili_config,
+                previous_state=target_uid_state,
+                snapshot=snapshot,
+            )
+            await self._apply_bilibili_delivery_plan_to_target(
+                target=target,
+                uid=uid,
+                plan=plan,
+                snapshot=snapshot,
+            )
+
+    async def _apply_bilibili_delivery_plan_to_target(
+        self,
+        target: BilibiliPushTarget,
+        uid: str,
+        plan: BilibiliUidDeliveryPlan,
+        snapshot: BilibiliUidSnapshot,
+    ) -> None:
+        target_state, _ = self._ensure_bilibili_target_monitor_bucket(
+            target.unified_msg_origin
+        )
+        uid_state_map = target_state.setdefault("uids", {})
+        current_uid_state = deepcopy(uid_state_map.get(uid, {}))
+
+        for delivery in plan.deliveries:
+            try:
+                result = await self._build_notification_result(
+                    delivery.notification, target
+                )
+                await self.context.send_message(target.unified_msg_origin, result)
+            except Exception:
+                logger.exception(
+                    "发送 B 站播报失败: target=%s uid=%s kind=%s",
+                    target.unified_msg_origin,
+                    snapshot.uid,
+                    delivery.notification.kind,
+                )
+                return
+
+            current_uid_state = deepcopy(delivery.uid_state)
+            uid_state_map[uid] = deepcopy(current_uid_state)
+            await self._persist_bilibili_monitor_state()
+
+        if current_uid_state == plan.final_state:
+            return
+
+        uid_state_map[uid] = deepcopy(plan.final_state)
+        await self._persist_bilibili_monitor_state()
 
     def _get_active_push_targets(self) -> list[BilibiliPushTarget]:
         targets: list[BilibiliPushTarget] = []

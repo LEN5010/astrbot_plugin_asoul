@@ -129,6 +129,28 @@ class BilibiliCommentPost:
     is_reply: bool
 
 
+@dataclass(frozen=True)
+class BilibiliUidSnapshot:
+    uid: str
+    author_name: str
+    dynamics: List[BilibiliDynamicPost] = field(default_factory=list)
+    live_status: Optional[BilibiliLiveStatus] = None
+    comment_resources: List[BilibiliCommentResource] = field(default_factory=list)
+    comment_posts: Dict[str, List[BilibiliCommentPost]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BilibiliPlannedNotification:
+    notification: BilibiliNotification
+    uid_state: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BilibiliUidDeliveryPlan:
+    deliveries: List[BilibiliPlannedNotification] = field(default_factory=list)
+    final_state: Dict[str, Any] = field(default_factory=dict)
+
+
 def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> BilibiliPushConfig:
     source = raw_config or {}
     poll_interval = _safe_parse_int(
@@ -1113,6 +1135,271 @@ class BilibiliMonitorService:
             return candidate_posts
         return self._filter_recent_posts(candidate_posts, cutoff_ts)
 
+    @staticmethod
+    def _slice_posts_before_stop(
+        posts: List[Any], stop_at_id: Optional[str]
+    ) -> tuple[List[Any], bool]:
+        if not stop_at_id:
+            return list(posts), True
+
+        collected: List[Any] = []
+        for post in posts:
+            post_id = str(getattr(post, "id", "") or "").strip()
+            if post_id and post_id == stop_at_id:
+                return collected, True
+            collected.append(post)
+        return collected, False
+
+    def _record_dynamic_id(self, uid_state: Dict[str, Any], dyn_id: str) -> None:
+        text = str(dyn_id or "").strip()
+        if not text:
+            return
+
+        recent_ids = self._normalize_recent_ids(uid_state.get("recent_dynamic_ids", []))
+        uid_state["last_dynamic_id"] = text
+        uid_state["recent_dynamic_ids"] = self._merge_recent_ids([text], recent_ids)
+
+    @staticmethod
+    def _record_comment_id(resource_state: Dict[str, Any], comment_id: str) -> None:
+        text = str(comment_id or "").strip()
+        if not text:
+            return
+
+        current_ids = [
+            text,
+            *[
+                str(item).strip()
+                for item in resource_state.get("recent_comment_ids", [])
+                if str(item).strip() and str(item).strip() != text
+            ],
+        ]
+        resource_state["initialized"] = True
+        resource_state["last_comment_id"] = text
+        resource_state["recent_comment_ids"] = current_ids[:COMMENT_RECENT_IDS_LIMIT]
+
+    async def fetch_uid_snapshot(
+        self,
+        config: BilibiliPushConfig,
+        uid: str,
+        previous_state: Optional[Dict[str, Any]] = None,
+    ) -> BilibiliUidSnapshot:
+        previous_uid_state = previous_state if isinstance(previous_state, dict) else {}
+        author_name = previous_uid_state.get("author_name") or await self._gateway.get_user_name(uid)
+
+        dynamics: List[BilibiliDynamicPost] = []
+        if config.push_dynamic or config.push_video or config.push_comment:
+            dynamics, _ = await self._gateway.get_recent_dynamics_with_status(
+                uid,
+                stop_at_id=None,
+                max_items=CONTENT_RECENT_IDS_LIMIT,
+            )
+
+        live_status: Optional[BilibiliLiveStatus] = None
+        if config.push_live:
+            live_status = await self._gateway.get_live_status_by_uid(uid)
+
+        comment_resources: List[BilibiliCommentResource] = []
+        comment_posts: Dict[str, List[BilibiliCommentPost]] = {}
+        if config.push_comment:
+            latest_dynamics = dynamics[:COMMENT_RESOURCE_LIMIT_PER_KIND]
+            latest_videos = await self._gateway.get_latest_videos(
+                uid, COMMENT_RESOURCE_LIMIT_PER_KIND
+            )
+            comment_resources = self._build_comment_resources(
+                uid, author_name, latest_dynamics, latest_videos
+            )
+            watched_uids = {target_uid for target_uid in config.target_uids}
+            for resource in comment_resources:
+                comments = await self._gateway.get_recent_comments(resource)
+                comment_posts[resource.key] = [
+                    comment_post
+                    for comment_post in comments
+                    if comment_post.author_uid in watched_uids
+                ]
+
+        return BilibiliUidSnapshot(
+            uid=uid,
+            author_name=author_name,
+            dynamics=dynamics,
+            live_status=live_status,
+            comment_resources=comment_resources,
+            comment_posts=comment_posts,
+        )
+
+    def plan_uid_deliveries(
+        self,
+        config: BilibiliPushConfig,
+        previous_state: Optional[Dict[str, Any]],
+        snapshot: BilibiliUidSnapshot,
+    ) -> BilibiliUidDeliveryPlan:
+        uid_state = deepcopy(previous_state or {})
+        uid_state["author_name"] = snapshot.author_name
+        deliveries: List[BilibiliPlannedNotification] = []
+        recent_cutoff_ts = max(0, int(time.time()) - RECENT_NOTIFICATION_WINDOW_SECONDS)
+
+        if config.push_dynamic or config.push_video:
+            latest_dynamic_id = str(uid_state.get("last_dynamic_id") or "").strip() or None
+            recent_dynamic_ids = self._normalize_recent_ids(
+                uid_state.get("recent_dynamic_ids", [])
+            )
+            dynamic_window, dynamic_stop_found = self._slice_posts_before_stop(
+                snapshot.dynamics, latest_dynamic_id
+            )
+            deliver_dynamics = self._select_posts_for_delivery(
+                posts=dynamic_window,
+                last_seen_id=latest_dynamic_id,
+                recent_ids=recent_dynamic_ids,
+                stop_found=dynamic_stop_found,
+                cutoff_ts=recent_cutoff_ts,
+            )
+            progress_state = deepcopy(uid_state)
+            for post in reversed(deliver_dynamics):
+                self._record_dynamic_id(progress_state, post.id)
+                if post.is_live_room_dynamic:
+                    continue
+                if post.is_video_dynamic:
+                    if config.push_video:
+                        deliveries.append(
+                            BilibiliPlannedNotification(
+                                notification=BilibiliNotification(
+                                    kind="video",
+                                    uid=snapshot.uid,
+                                    author_name=snapshot.author_name,
+                                    title=post.title or "发布了新视频",
+                                    url=post.url,
+                                    cover_url=post.cover_url
+                                    or (post.image_urls[0] if post.image_urls else ""),
+                                ),
+                                uid_state=deepcopy(progress_state),
+                            )
+                        )
+                    continue
+                if config.push_dynamic:
+                    deliveries.append(
+                        BilibiliPlannedNotification(
+                            notification=BilibiliNotification(
+                                kind="dynamic",
+                                uid=snapshot.uid,
+                                author_name=snapshot.author_name,
+                                title="",
+                                url=post.url,
+                                text=post.text,
+                                rich_nodes=post.rich_nodes,
+                                image_urls=post.image_urls,
+                            ),
+                            uid_state=deepcopy(progress_state),
+                        )
+                    )
+            if dynamic_window:
+                uid_state["last_dynamic_id"] = dynamic_window[0].id
+                uid_state["recent_dynamic_ids"] = self._merge_recent_ids(
+                    [post.id for post in dynamic_window],
+                    recent_dynamic_ids,
+                )
+
+        if config.push_live and snapshot.live_status is not None:
+            previous_live_active = uid_state.get("last_live_active")
+            if previous_live_active is None:
+                uid_state["last_live_active"] = snapshot.live_status.is_live
+                uid_state["last_live_room_id"] = snapshot.live_status.room_id
+            else:
+                if snapshot.live_status.is_live and not bool(previous_live_active):
+                    live_state = deepcopy(uid_state)
+                    live_state["last_live_active"] = snapshot.live_status.is_live
+                    live_state["last_live_room_id"] = snapshot.live_status.room_id
+                    deliveries.append(
+                        BilibiliPlannedNotification(
+                            notification=BilibiliNotification(
+                                kind="live",
+                                uid=snapshot.uid,
+                                author_name=snapshot.author_name,
+                                title=snapshot.live_status.title or "直播已开始",
+                                url=snapshot.live_status.url,
+                                cover_url=snapshot.live_status.cover_url,
+                            ),
+                            uid_state=deepcopy(live_state),
+                        )
+                    )
+                uid_state["last_live_active"] = snapshot.live_status.is_live
+                uid_state["last_live_room_id"] = snapshot.live_status.room_id
+
+        if config.push_comment:
+            resource_state_map = deepcopy(uid_state.get("comment_resources", {}))
+            active_keys = {resource.key for resource in snapshot.comment_resources}
+
+            for resource in snapshot.comment_resources:
+                state = resource_state_map.get(resource.key)
+                filtered_comments = list(snapshot.comment_posts.get(resource.key, []))
+
+                if not filtered_comments:
+                    resource_state_map[resource.key] = self._build_comment_resource_state(
+                        [],
+                        state,
+                    )
+                    continue
+
+                if not isinstance(state, dict) or not state.get("initialized"):
+                    resource_state_map[resource.key] = self._build_comment_resource_state(
+                        filtered_comments,
+                        state,
+                    )
+                    continue
+
+                known_ids = {
+                    str(item).strip()
+                    for item in state.get("recent_comment_ids", [])
+                    if str(item).strip()
+                }
+                last_comment_id = str(state.get("last_comment_id", "") or "").strip()
+                if last_comment_id:
+                    known_ids.add(last_comment_id)
+
+                new_comments = [
+                    comment_post
+                    for comment_post in filtered_comments
+                    if comment_post.id not in known_ids
+                ]
+                comment_progress_state = deepcopy(uid_state)
+                comment_progress_state["comment_resources"] = deepcopy(resource_state_map)
+                resource_progress_state = deepcopy(
+                    comment_progress_state["comment_resources"].get(resource.key, state)
+                    or {}
+                )
+                if not isinstance(resource_progress_state, dict):
+                    resource_progress_state = {}
+
+                for comment_post in sorted(
+                    new_comments, key=lambda item: (item.created_at, _safe_int(item.id))
+                ):
+                    self._record_comment_id(resource_progress_state, comment_post.id)
+                    comment_progress_state["comment_resources"][resource.key] = deepcopy(
+                        resource_progress_state
+                    )
+                    deliveries.append(
+                        BilibiliPlannedNotification(
+                            notification=self._build_comment_notification(
+                                resource, comment_post
+                            ),
+                            uid_state=deepcopy(comment_progress_state),
+                        )
+                    )
+
+                resource_state_map[resource.key] = self._build_comment_resource_state(
+                    filtered_comments,
+                    state,
+                )
+
+            uid_state["comment_resources"] = {
+                key: value
+                for key, value in resource_state_map.items()
+                if key in active_keys
+            }
+
+        return BilibiliUidDeliveryPlan(
+            deliveries=deliveries,
+            final_state=uid_state,
+        )
+
     async def poll(
         self,
         config: BilibiliPushConfig,
@@ -1141,174 +1428,22 @@ class BilibiliMonitorService:
         uid_state_map = new_state.setdefault("uids", {})
         previous_uid_state = uid_state_map.get(uid, {})
         try:
-            current_uid_state, notifications = await self._poll_uid(
+            snapshot = await self.fetch_uid_snapshot(
+                config=config,
                 uid=uid,
+                previous_state=previous_uid_state,
+            )
+            plan = self.plan_uid_deliveries(
                 config=config,
                 previous_state=previous_uid_state,
+                snapshot=snapshot,
             )
         except Exception:
             logger.exception("轮询 B 站 UID %s 失败", uid)
             return new_state, []
 
-        uid_state_map[uid] = current_uid_state
-        return new_state, notifications
-
-    async def _poll_uid(
-        self,
-        uid: str,
-        config: BilibiliPushConfig,
-        previous_state: Dict[str, Any],
-    ) -> tuple[Dict[str, Any], List[BilibiliNotification]]:
-        uid_state = deepcopy(previous_state or {})
-        author_name = uid_state.get("author_name") or await self._gateway.get_user_name(uid)
-        uid_state["author_name"] = author_name
-
-        notifications: List[BilibiliNotification] = []
-        recent_cutoff_ts = max(0, int(time.time()) - RECENT_NOTIFICATION_WINDOW_SECONDS)
-
-        if config.push_dynamic or config.push_video:
-            latest_dynamic_id = str(uid_state.get("last_dynamic_id") or "").strip() or None
-            recent_dynamic_ids = self._normalize_recent_ids(
-                uid_state.get("recent_dynamic_ids", [])
-            )
-            dynamics, dynamic_stop_found = await self._gateway.get_recent_dynamics_with_status(
-                uid,
-                stop_at_id=latest_dynamic_id,
-            )
-            if dynamics:
-                deliver_dynamics = self._select_posts_for_delivery(
-                    posts=dynamics,
-                    last_seen_id=latest_dynamic_id,
-                    recent_ids=recent_dynamic_ids,
-                    stop_found=dynamic_stop_found,
-                    cutoff_ts=recent_cutoff_ts,
-                )
-                for post in reversed(deliver_dynamics):
-                    if post.is_live_room_dynamic:
-                        continue
-                    if post.is_video_dynamic:
-                        if config.push_video:
-                            notifications.append(
-                                BilibiliNotification(
-                                    kind="video",
-                                    uid=uid,
-                                    author_name=author_name,
-                                    title=post.title or "发布了新视频",
-                                    url=post.url,
-                                    cover_url=post.cover_url or (post.image_urls[0] if post.image_urls else ""),
-                                )
-                            )
-                        continue
-                    if config.push_dynamic:
-                        notifications.append(
-                            BilibiliNotification(
-                                kind="dynamic",
-                                uid=uid,
-                                author_name=author_name,
-                                title="",
-                                url=post.url,
-                                text=post.text,
-                                rich_nodes=post.rich_nodes,
-                                image_urls=post.image_urls,
-                            )
-                        )
-                uid_state["last_dynamic_id"] = dynamics[0].id
-                uid_state["recent_dynamic_ids"] = self._merge_recent_ids(
-                    [post.id for post in dynamics],
-                    recent_dynamic_ids,
-                )
-
-        if config.push_live:
-            live_status = await self._gateway.get_live_status_by_uid(uid)
-            if live_status is not None:
-                previous_live_active = uid_state.get("last_live_active")
-                if previous_live_active is None:
-                    uid_state["last_live_active"] = live_status.is_live
-                    uid_state["last_live_room_id"] = live_status.room_id
-                else:
-                    if live_status.is_live and not bool(previous_live_active):
-                        notifications.append(
-                            BilibiliNotification(
-                                kind="live",
-                                uid=uid,
-                                author_name=author_name,
-                                title=live_status.title or "直播已开始",
-                                url=live_status.url,
-                                cover_url=live_status.cover_url,
-                            )
-                        )
-                    uid_state["last_live_active"] = live_status.is_live
-                    uid_state["last_live_room_id"] = live_status.room_id
-
-        if config.push_comment:
-            comment_notifications = await self._poll_uid_comments(
-                uid=uid,
-                owner_name=author_name,
-                config=config,
-                uid_state=uid_state,
-            )
-            notifications.extend(comment_notifications)
-
-        return uid_state, notifications
-
-    async def _poll_uid_comments(
-        self,
-        uid: str,
-        owner_name: str,
-        config: BilibiliPushConfig,
-        uid_state: Dict[str, Any],
-    ) -> List[BilibiliNotification]:
-        latest_dynamics = await self._gateway.get_latest_dynamics(uid, COMMENT_RESOURCE_LIMIT_PER_KIND)
-        latest_videos = await self._gateway.get_latest_videos(uid, COMMENT_RESOURCE_LIMIT_PER_KIND)
-        resources = self._build_comment_resources(uid, owner_name, latest_dynamics, latest_videos)
-        if not resources:
-            uid_state["comment_resources"] = {}
-            return []
-
-        watched_uids = {target_uid for target_uid in config.target_uids}
-        resource_state_map = uid_state.setdefault("comment_resources", {})
-        active_keys = {resource.key for resource in resources}
-        notifications: List[BilibiliNotification] = []
-
-        for resource in resources:
-            state = resource_state_map.get(resource.key)
-            comments = await self._gateway.get_recent_comments(resource)
-            filtered_comments = [
-                comment_post
-                for comment_post in comments
-                if comment_post.author_uid in watched_uids
-            ]
-
-            if not isinstance(state, dict) or not state.get("initialized"):
-                resource_state_map[resource.key] = self._build_comment_resource_state(filtered_comments, state)
-                continue
-
-            known_ids = {
-                str(item).strip()
-                for item in state.get("recent_comment_ids", [])
-                if str(item).strip()
-            }
-            last_comment_id = str(state.get("last_comment_id", "") or "").strip()
-            if last_comment_id:
-                known_ids.add(last_comment_id)
-
-            new_comments = [
-                comment_post
-                for comment_post in filtered_comments
-                if comment_post.id not in known_ids
-            ]
-            if new_comments:
-                for comment_post in sorted(new_comments, key=lambda item: (item.created_at, _safe_int(item.id))):
-                    notifications.append(self._build_comment_notification(resource, comment_post))
-
-            resource_state_map[resource.key] = self._build_comment_resource_state(filtered_comments, state)
-
-        uid_state["comment_resources"] = {
-            key: value
-            for key, value in resource_state_map.items()
-            if key in active_keys
-        }
-        return notifications
+        uid_state_map[uid] = plan.final_state
+        return new_state, [delivery.notification for delivery in plan.deliveries]
 
     def _build_comment_resources(
         self,
