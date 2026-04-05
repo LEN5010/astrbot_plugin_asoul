@@ -332,14 +332,14 @@ class BilibiliGateway:
         stop_found = stop_at_id is None
         items = self._extract_dynamic_items(page)
         for item in items:
-            if self._is_pinned_dynamic(item):
-                continue
             parsed = self._parse_dynamic_post(item)
             if parsed is None or parsed.id in seen_ids:
                 continue
             if stop_at_id and parsed.id == stop_at_id:
                 stop_found = True
                 break
+            if self._is_pinned_dynamic(item):
+                continue
             seen_ids.add(parsed.id)
             collected.append(parsed)
             if max_items is not None and len(collected) >= max_items:

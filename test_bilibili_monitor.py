@@ -163,12 +163,23 @@ class FakeUserForLiveInfo:
         return self.payload
 
 
+class FakeUserForDynamics:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+
+    async def get_dynamics_new(self, offset=""):
+        return self.payload
+
+
 class ParsingGateway(BilibiliGateway):
     def __init__(self) -> None:
         super().__init__(request_client="aiohttp", credential_data={})
         self.live_info_payload = {}
+        self.dynamic_page_payload = None
 
     def _new_user(self, uid: str):
+        if self.dynamic_page_payload is not None:
+            return FakeUserForDynamics(self.dynamic_page_payload)
         return FakeUserForLiveInfo(self.live_info_payload)
 
 
@@ -571,6 +582,53 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertIn("直播预约：【突击/电台】一起聊聊天~", post.text)
         self.assertIn("明天 20:00 直播", post.text)
         self.assertEqual(post.url, "https://live.bilibili.com/blackboard/reserve")
+
+    def test_pinned_latest_dynamic_still_blocks_older_dynamic_replay(self) -> None:
+        self.gateway.dynamic_page_payload = {
+            "items": [
+                {
+                    "id_str": "dyn-5",
+                    "basic": {
+                        "comment_id_str": "3005",
+                        "comment_type": 17,
+                    },
+                    "modules": {
+                        "module_tag": {"text": "置顶"},
+                        "module_author": {
+                            "pub_ts": NOW_TS - 60,
+                        },
+                        "module_dynamic": {
+                            "desc": {"text": "最新动态但被置顶"},
+                        },
+                    },
+                },
+                {
+                    "id_str": "dyn-4",
+                    "basic": {
+                        "comment_id_str": "3004",
+                        "comment_type": 17,
+                    },
+                    "modules": {
+                        "module_author": {
+                            "pub_ts": NOW_TS - 120,
+                        },
+                        "module_dynamic": {
+                            "desc": {"text": "旧的漏发动态"},
+                        },
+                    },
+                },
+            ]
+        }
+
+        posts, stop_found = asyncio.run(
+            self.gateway.get_recent_dynamics_with_status(
+                "100",
+                stop_at_id="dyn-5",
+            )
+        )
+
+        self.assertEqual(posts, [])
+        self.assertTrue(stop_found)
 
     def test_get_live_status_prefers_room_info_title(self) -> None:
         self.gateway.live_info_payload = {
