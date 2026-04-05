@@ -2,6 +2,11 @@ import asyncio
 import copy
 import unittest
 
+from asoul_bilibili import (
+    BilibiliPlannedNotification,
+    BilibiliUidDeliveryPlan,
+    BilibiliUidSnapshot,
+)
 from test_asoul_push_targets import _load_main_module
 
 
@@ -37,7 +42,7 @@ class FakeMonitor:
                 "previous_state": copy.deepcopy(previous_state),
             }
         )
-        return self.main.BilibiliUidSnapshot(
+        return BilibiliUidSnapshot(
             uid=uid,
             author_name="测试账号",
         )
@@ -55,7 +60,7 @@ class FakeMonitor:
             "recent_dynamic_ids": ["dyn-2", "dyn-1"],
         }
         deliveries = [
-            self.main.BilibiliPlannedNotification(
+            BilibiliPlannedNotification(
                 notification=self.main.BilibiliNotification(
                     kind="dynamic",
                     uid=snapshot.uid,
@@ -66,7 +71,7 @@ class FakeMonitor:
                 ),
                 uid_state=state_1,
             ),
-            self.main.BilibiliPlannedNotification(
+            BilibiliPlannedNotification(
                 notification=self.main.BilibiliNotification(
                     kind="dynamic",
                     uid=snapshot.uid,
@@ -78,7 +83,7 @@ class FakeMonitor:
                 uid_state=state_2,
             ),
         ]
-        return self.main.BilibiliUidDeliveryPlan(
+        return BilibiliUidDeliveryPlan(
             deliveries=deliveries,
             final_state=state_2,
         )

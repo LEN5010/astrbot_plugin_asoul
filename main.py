@@ -25,10 +25,7 @@ from asoul_bilibili import (
     BilibiliGateway,
     BilibiliMonitorService,
     BilibiliNotification,
-    BilibiliPlannedNotification,
     BilibiliRichTextNode,
-    BilibiliUidDeliveryPlan,
-    BilibiliUidSnapshot,
     build_bilibili_push_config,
     normalize_bilibili_credential_data,
 )
@@ -419,8 +416,8 @@ class ASoulPlugin(Star):
         self,
         target: BilibiliPushTarget,
         uid: str,
-        plan: BilibiliUidDeliveryPlan,
-        snapshot: BilibiliUidSnapshot,
+        plan,
+        snapshot,
     ) -> None:
         target_state, _ = self._ensure_bilibili_target_monitor_bucket(
             target.unified_msg_origin
