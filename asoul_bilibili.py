@@ -105,6 +105,11 @@ class BilibiliNotification:
     rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
     image_urls: List[str] = field(default_factory=list)
     cover_url: str = ""
+    comment_created_at: int = 0
+    comment_resource_owner_name: str = ""
+    comment_resource_kind: str = ""
+    comment_resource_title: str = ""
+    comment_action_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -127,6 +132,7 @@ class BilibiliCommentPost:
     text: str
     created_at: int
     is_reply: bool
+    image_urls: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1031,7 +1037,8 @@ class BilibiliGateway:
         author_uid = str(member.get("mid", "") or "").strip()
         author_name = str(member.get("uname", "") or "").strip()
         text = str(content.get("message", "") or "").strip()
-        if not author_uid or not author_name or not text:
+        image_urls = self._extract_comment_image_urls(content)
+        if not author_uid or not author_name or (not text and not image_urls):
             return None
 
         parent_id = _safe_int(reply.get("parent"))
@@ -1042,7 +1049,40 @@ class BilibiliGateway:
             text=text,
             created_at=_safe_int(reply.get("ctime")),
             is_reply=parent_id > 0,
+            image_urls=image_urls,
         )
+
+    def _extract_comment_image_urls(self, content: Dict[str, Any]) -> List[str]:
+        if not isinstance(content, dict):
+            return []
+
+        image_urls: List[str] = []
+        seen = set()
+
+        def append_candidate(raw_value: Any) -> None:
+            url = _normalize_url(str(raw_value or "").strip())
+            if not url or url in seen:
+                return
+            seen.add(url)
+            image_urls.append(url)
+
+        pictures = content.get("pictures")
+        if isinstance(pictures, list):
+            for picture in pictures:
+                if not isinstance(picture, dict):
+                    continue
+                for key in ("img_src", "img_url", "url", "src"):
+                    append_candidate(picture.get(key))
+
+        emote = content.get("emote")
+        if isinstance(emote, dict):
+            for raw_item in emote.values():
+                if not isinstance(raw_item, dict):
+                    continue
+                for key in ("url", "icon_url", "emote_url"):
+                    append_candidate(raw_item.get(key))
+
+        return image_urls
 
     def _find_first_value(self, value: Any, candidate_keys: Sequence[str]) -> Optional[Any]:
         if isinstance(value, dict):
@@ -1453,11 +1493,20 @@ class BilibiliMonitorService:
         videos: List[BilibiliVideoPost],
     ) -> List[BilibiliCommentResource]:
         resources: List[BilibiliCommentResource] = []
+        seen_keys = set()
+
+        def append_resource(resource: BilibiliCommentResource) -> None:
+            if resource.key in seen_keys:
+                return
+            seen_keys.add(resource.key)
+            resources.append(resource)
 
         for post in dynamics:
+            if post.is_video_dynamic:
+                continue
             if post.comment_oid <= 0 or post.comment_type <= 0:
                 continue
-            resources.append(
+            append_resource(
                 BilibiliCommentResource(
                     key=f"dynamic:{post.comment_type}:{post.comment_oid}",
                     owner_uid=owner_uid,
@@ -1473,7 +1522,7 @@ class BilibiliMonitorService:
         for post in videos:
             if post.comment_oid <= 0:
                 continue
-            resources.append(
+            append_resource(
                 BilibiliCommentResource(
                     key=f"video:{post.comment_oid}",
                     owner_uid=owner_uid,
@@ -1519,17 +1568,20 @@ class BilibiliMonitorService:
         comment_post: BilibiliCommentPost,
     ) -> BilibiliNotification:
         resource_text = "动态" if resource.resource_kind == "dynamic" else "视频"
-        owner_prefix = "自己的" if resource.owner_uid == comment_post.author_uid else f"{resource.owner_name} 的"
         action_text = "回复了评论" if comment_post.is_reply else "发表了评论"
-        title = f"在 {owner_prefix}{resource_text}下{action_text}"
-        body = f"{resource.title}\n{comment_post.text}" if resource.title else comment_post.text
         return BilibiliNotification(
             kind="comment",
             uid=comment_post.author_uid,
             author_name=comment_post.author_name,
-            title=title,
+            title="",
             url=resource.url,
-            text=body,
+            text=comment_post.text,
+            image_urls=list(comment_post.image_urls),
+            comment_created_at=comment_post.created_at,
+            comment_resource_owner_name=resource.owner_name,
+            comment_resource_kind=resource_text,
+            comment_resource_title=resource.title,
+            comment_action_text=action_text,
         )
 
 

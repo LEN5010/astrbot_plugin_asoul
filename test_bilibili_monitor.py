@@ -420,8 +420,39 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
         self.assertEqual(len(updated_notifications), 1)
         self.assertEqual(updated_notifications[0].kind, "comment")
-        self.assertIn("回复了评论", updated_notifications[0].title)
+        self.assertEqual(updated_notifications[0].comment_action_text, "回复了评论")
+        self.assertEqual(updated_notifications[0].comment_resource_kind, "视频")
+        self.assertEqual(updated_notifications[0].comment_resource_title, "第三个视频")
         self.assertEqual(updated_state["uids"]["100"]["comment_resources"]["video:2003"]["last_comment_id"], "9002")
+
+    def test_video_dynamic_comment_resource_is_not_built_twice(self) -> None:
+        resources = self.service._build_comment_resources(
+            owner_uid="100",
+            owner_name="测试账号",
+            dynamics=[
+                BilibiliDynamicPost(
+                    id="dyn-video-4",
+                    text="投稿了新视频",
+                    url="https://www.bilibili.com/video/BV4",
+                    title="第四个视频",
+                    created_at=NOW_TS - 60,
+                    is_video_dynamic=True,
+                    comment_oid=2004,
+                    comment_type=1,
+                )
+            ],
+            videos=[
+                BilibiliVideoPost(
+                    id="BV4",
+                    title="第四个视频",
+                    url="https://www.bilibili.com/video/BV4",
+                    created_at=NOW_TS - 60,
+                    comment_oid=2004,
+                )
+            ],
+        )
+
+        self.assertEqual([resource.key for resource in resources], ["video:2004"])
 
     def test_second_poll_delivers_two_reserve_dynamics_in_order(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
@@ -629,6 +660,44 @@ class BilibiliParsingTest(unittest.TestCase):
 
         self.assertEqual(posts, [])
         self.assertTrue(stop_found)
+
+    def test_parse_comment_post_preserves_images_and_emotes_without_text(self) -> None:
+        post = self.gateway._parse_comment_post(
+            {
+                "rpid_str": "99001",
+                "ctime": NOW_TS,
+                "parent": 0,
+                "member": {
+                    "mid": "672328094",
+                    "uname": "乃琳Queen",
+                },
+                "content": {
+                    "message": "",
+                    "pictures": [
+                        {"img_src": "//i0.hdslb.com/comment-a.png"},
+                        {"url": "https://i0.hdslb.com/comment-b.png"},
+                    ],
+                    "emote": {
+                        "1": {"url": "https://i0.hdslb.com/emote-a.png"},
+                        "2": {"icon_url": "https://i0.hdslb.com/emote-b.png"},
+                    },
+                },
+            }
+        )
+
+        self.assertIsNotNone(post)
+        assert post is not None
+        self.assertEqual(post.text, "")
+        self.assertEqual(
+            post.image_urls,
+            [
+                "https://i0.hdslb.com/comment-a.png",
+                "https://i0.hdslb.com/comment-b.png",
+                "https://i0.hdslb.com/emote-a.png",
+                "https://i0.hdslb.com/emote-b.png",
+            ],
+        )
+        self.assertFalse(post.is_reply)
 
     def test_get_live_status_prefers_room_info_title(self) -> None:
         self.gateway.live_info_payload = {

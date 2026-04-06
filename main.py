@@ -503,14 +503,42 @@ class ASoulPlugin(Star):
                 chain_parts.append(Comp.Plain(self._safe_plain_newline()))
                 chain_parts.append(Comp.Image.fromURL(image_url))
         elif notification.kind == "comment":
-            title = str(notification.title or "").strip()
-            text = str(notification.text or "").strip()
-            detail_parts = [part for part in (title, text) if part]
-            if detail_parts:
-                chain_parts[0] = Comp.Plain(
-                    f"{prefix}{notification.author_name}{self._safe_plain_newline()}"
-                    + self._safe_plain_newline().join(detail_parts)
+            detail_parts: list[str] = []
+            timestamp = int(getattr(notification, "comment_created_at", 0) or 0)
+            if timestamp > 0:
+                detail_parts.append(
+                    f"{notification.author_name}于{datetime.fromtimestamp(timestamp, DISPLAY_TZ).strftime('%Y-%m-%d %H:%M')}"
                 )
+            resource_owner_name = str(
+                getattr(notification, "comment_resource_owner_name", "") or ""
+            ).strip()
+            resource_kind = str(
+                getattr(notification, "comment_resource_kind", "") or "内容"
+            ).strip() or "内容"
+            resource_title = str(
+                getattr(notification, "comment_resource_title", "") or ""
+            ).strip()
+            action_text = str(
+                getattr(notification, "comment_action_text", "") or "发表了评论"
+            ).strip() or "发表了评论"
+            context_text = (
+                f"在{resource_owner_name}的{resource_kind}"
+                if resource_owner_name
+                else f"在该{resource_kind}"
+            )
+            if resource_title:
+                context_text += f"《{resource_title}》"
+            detail_parts.append(f"{context_text}下{action_text}：")
+            comment_text = str(notification.text or "").strip()
+            if comment_text:
+                detail_parts.append(comment_text)
+            chain_parts[0] = Comp.Plain(
+                f"{prefix}{notification.author_name}{self._safe_plain_newline()}"
+                + self._safe_plain_newline().join(detail_parts)
+            )
+            for image_url in notification.image_urls:
+                chain_parts.append(Comp.Plain(self._safe_plain_newline()))
+                chain_parts.append(Comp.Image.fromURL(image_url))
         else:
             title = str(notification.title or "").strip()
             if title:
@@ -681,11 +709,20 @@ class ASoulPlugin(Star):
         videos,
     ) -> list[CommentTestResource]:
         resources: list[CommentTestResource] = []
+        seen_keys = set()
+
+        def append_resource(resource: CommentTestResource) -> None:
+            if resource.key in seen_keys:
+                return
+            seen_keys.add(resource.key)
+            resources.append(resource)
 
         for post in dynamics:
+            if getattr(post, "is_video_dynamic", False):
+                continue
             if getattr(post, "comment_oid", 0) <= 0 or getattr(post, "comment_type", 0) <= 0:
                 continue
-            resources.append(
+            append_resource(
                 CommentTestResource(
                     key=f"dynamic:{post.comment_type}:{post.comment_oid}",
                     owner_uid=owner_uid,
@@ -701,7 +738,7 @@ class ASoulPlugin(Star):
         for post in videos:
             if getattr(post, "comment_oid", 0) <= 0:
                 continue
-            resources.append(
+            append_resource(
                 CommentTestResource(
                     key=f"video:{post.comment_oid}",
                     owner_uid=owner_uid,
@@ -718,17 +755,20 @@ class ASoulPlugin(Star):
 
     def _build_comment_test_notification(self, resource: CommentTestResource, comment_post) -> BilibiliNotification:
         resource_text = "动态" if resource.resource_kind == "dynamic" else "视频"
-        owner_prefix = "自己的" if resource.owner_uid == comment_post.author_uid else f"{resource.owner_name} 的"
         action_text = "回复了评论" if comment_post.is_reply else "发表了评论"
-        title = f"在 {owner_prefix}{resource_text}下{action_text}"
-        body = f"{resource.title}\n{comment_post.text}" if resource.title else comment_post.text
         return BilibiliNotification(
             kind="comment",
             uid=comment_post.author_uid,
             author_name=comment_post.author_name,
-            title=title,
+            title="",
             url=resource.url,
-            text=body,
+            text=comment_post.text,
+            image_urls=list(getattr(comment_post, "image_urls", []) or []),
+            comment_created_at=getattr(comment_post, "created_at", 0),
+            comment_resource_owner_name=resource.owner_name,
+            comment_resource_kind=resource_text,
+            comment_resource_title=resource.title,
+            comment_action_text=action_text,
         )
 
     @staticmethod
