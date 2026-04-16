@@ -19,6 +19,7 @@ MIN_POLL_INTERVAL_SECONDS = 60
 DEFAULT_TASK_GAP_SECONDS = 20.0
 COMMENT_RESOURCE_LIMIT_PER_KIND = 2
 COMMENT_RECENT_IDS_LIMIT = 20
+COMMENT_FETCH_PAGE_LIMIT = 5
 CONTENT_RECENT_IDS_LIMIT = 20
 RECENT_NOTIFICATION_WINDOW_SECONDS = 5 * 60
 BILIBILI_CREDENTIAL_FIELDS = (
@@ -336,6 +337,7 @@ class BilibiliGateway:
         collected: List[BilibiliDynamicPost] = []
         seen_ids = set()
         stop_found = stop_at_id is None
+        recent_cutoff_ts = max(0, int(time.time()) - RECENT_NOTIFICATION_WINDOW_SECONDS)
         items = self._extract_dynamic_items(page)
         for item in items:
             parsed = self._parse_dynamic_post(item)
@@ -345,7 +347,10 @@ class BilibiliGateway:
                 stop_found = True
                 break
             if self._is_pinned_dynamic(item):
-                continue
+                # Old pinned history should not replay forever, but a just-posted pinned
+                # dynamic still needs one chance to enter the delivery window.
+                if parsed.created_at <= 0 or parsed.created_at < recent_cutoff_ts:
+                    continue
             seen_ids.add(parsed.id)
             collected.append(parsed)
             if max_items is not None and len(collected) >= max_items:
@@ -548,37 +553,91 @@ class BilibiliGateway:
             )
         return result
 
-    async def get_recent_comments(self, resource: BilibiliCommentResource) -> List[BilibiliCommentPost]:
+    async def get_recent_comments(
+        self,
+        resource: BilibiliCommentResource,
+        stop_comment_ids: Optional[Sequence[str]] = None,
+        max_pages: int = COMMENT_FETCH_PAGE_LIMIT,
+    ) -> List[BilibiliCommentPost]:
         _, _, comment_module = self._load_modules()
         comment_type = comment_module.CommentResourceType(resource.type_value)
-        page = await comment_module.get_comments_lazy(
-            oid=resource.oid,
-            type_=comment_type,
-            order=comment_module.OrderType.TIME,
-            credential=self._credential,
-        )
-        replies = page.get("replies")
-        if not isinstance(replies, list):
-            return []
-
         parsed: List[BilibiliCommentPost] = []
         seen_ids = set()
+        stop_ids = {
+            str(comment_id).strip()
+            for comment_id in (stop_comment_ids or [])
+            if str(comment_id).strip()
+        }
 
-        def visit(reply_items: List[Dict[str, Any]]) -> None:
+        def visit(
+            reply_items: List[Dict[str, Any]],
+            page_comments: List[BilibiliCommentPost],
+        ) -> None:
             for reply in reply_items:
                 if not isinstance(reply, dict):
                     continue
                 comment_post = self._parse_comment_post(reply)
-                if comment_post and comment_post.id not in seen_ids:
-                    seen_ids.add(comment_post.id)
-                    parsed.append(comment_post)
+                if comment_post:
+                    page_comments.append(comment_post)
                 nested_replies = reply.get("replies")
                 if isinstance(nested_replies, list) and nested_replies:
-                    visit([item for item in nested_replies if isinstance(item, dict)])
+                    visit(
+                        [item for item in nested_replies if isinstance(item, dict)],
+                        page_comments,
+                    )
 
-        visit([item for item in replies if isinstance(item, dict)])
+        next_offset = ""
+        for _ in range(max(1, int(max_pages or 0))):
+            page = await comment_module.get_comments_lazy(
+                oid=resource.oid,
+                type_=comment_type,
+                offset=next_offset,
+                order=comment_module.OrderType.TIME,
+                credential=self._credential,
+            )
+            if not isinstance(page, dict):
+                break
+
+            replies = page.get("replies")
+            if not isinstance(replies, list) or not replies:
+                break
+
+            page_comments: List[BilibiliCommentPost] = []
+            visit([item for item in replies if isinstance(item, dict)], page_comments)
+            page_comments.sort(
+                key=lambda item: (item.created_at, _safe_int(item.id)),
+                reverse=True,
+            )
+
+            hit_known_comment = False
+            for comment_post in page_comments:
+                if comment_post.id in seen_ids:
+                    continue
+                if comment_post.id in stop_ids:
+                    hit_known_comment = True
+                    break
+                seen_ids.add(comment_post.id)
+                parsed.append(comment_post)
+
+            if hit_known_comment:
+                break
+
+            new_offset = self._extract_comment_next_offset(page)
+            if not new_offset or new_offset == next_offset:
+                break
+            next_offset = new_offset
+
         parsed.sort(key=lambda item: (item.created_at, _safe_int(item.id)), reverse=True)
         return parsed
+
+    def _extract_comment_next_offset(self, page: Dict[str, Any]) -> str:
+        cursor = page.get("cursor")
+        if not isinstance(cursor, dict):
+            return ""
+        pagination_reply = cursor.get("pagination_reply")
+        if not isinstance(pagination_reply, dict):
+            return ""
+        return str(pagination_reply.get("next_offset", "") or "").strip()
 
     def _extract_dynamic_items(self, page: Dict[str, Any]) -> List[Dict[str, Any]]:
         for key in ("items", "cards", "list"):
@@ -1217,6 +1276,24 @@ class BilibiliMonitorService:
         resource_state["last_comment_id"] = text
         resource_state["recent_comment_ids"] = current_ids[:COMMENT_RECENT_IDS_LIMIT]
 
+    @staticmethod
+    def _extract_known_comment_ids(resource_state: Any) -> List[str]:
+        if not isinstance(resource_state, dict):
+            return []
+
+        known_ids: List[str] = []
+        seen = set()
+        recent_comment_ids = resource_state.get("recent_comment_ids", [])
+        if not isinstance(recent_comment_ids, list):
+            recent_comment_ids = []
+        for raw_value in [resource_state.get("last_comment_id"), *recent_comment_ids]:
+            text = str(raw_value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            known_ids.append(text)
+        return known_ids
+
     async def fetch_uid_snapshot(
         self,
         config: BilibiliPushConfig,
@@ -1248,9 +1325,18 @@ class BilibiliMonitorService:
             comment_resources = self._build_comment_resources(
                 uid, author_name, latest_dynamics, latest_videos
             )
+            previous_comment_resources = previous_uid_state.get("comment_resources", {})
+            if not isinstance(previous_comment_resources, dict):
+                previous_comment_resources = {}
             watched_uids = {target_uid for target_uid in config.target_uids}
             for resource in comment_resources:
-                comments = await self._gateway.get_recent_comments(resource)
+                comments = await self._gateway.get_recent_comments(
+                    resource,
+                    stop_comment_ids=self._extract_known_comment_ids(
+                        previous_comment_resources.get(resource.key, {})
+                    ),
+                    max_pages=COMMENT_FETCH_PAGE_LIMIT,
+                )
                 comment_posts[resource.key] = [
                     comment_post
                     for comment_post in comments
