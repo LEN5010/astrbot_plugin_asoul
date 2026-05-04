@@ -44,6 +44,29 @@ class CalendarRepository:
         filtered_events.sort(key=lambda item: item.start)
         return filtered_events
 
+    async def get_live_events_for_days(
+        self,
+        start_day: date,
+        end_day: date,
+    ) -> Dict[date, List[CalendarEvent]]:
+        calendar_events = await self._load_calendar_events()
+        days: Dict[date, List[CalendarEvent]] = {}
+        current_day = start_day
+        while current_day <= end_day:
+            days[current_day] = []
+            current_day += timedelta(days=1)
+
+        for event in calendar_events:
+            if not self._is_livestream_event(event):
+                continue
+            for target_day in days:
+                if self._is_same_day(event, target_day):
+                    days[target_day].append(event)
+
+        for events in days.values():
+            events.sort(key=lambda item: item.start)
+        return days
+
     async def _load_calendar_events(self) -> List[CalendarEvent]:
         now = datetime.now(timezone.utc)
         if now < self._calendar_cache_expires_at and self._calendar_cache:

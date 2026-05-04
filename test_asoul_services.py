@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import date, datetime
 
@@ -50,6 +51,62 @@ class CalendarRepositoryTest(unittest.TestCase):
         )
 
         self.assertTrue(self.repository._is_same_day(event, date(2026, 3, 30)))
+
+    def test_get_live_events_for_days_groups_requested_range_only(self) -> None:
+        events = [
+            CalendarEvent(
+                summary="周二直播",
+                description="",
+                location="",
+                categories="直播",
+                url="",
+                status="CONFIRMED",
+                start=datetime(2026, 3, 31, 20, 0, tzinfo=DISPLAY_TZ),
+                end=datetime(2026, 3, 31, 21, 0, tzinfo=DISPLAY_TZ),
+            ),
+            CalendarEvent(
+                summary="周三直播",
+                description="",
+                location="",
+                categories="直播",
+                url="",
+                status="CONFIRMED",
+                start=datetime(2026, 4, 1, 20, 0, tzinfo=DISPLAY_TZ),
+                end=datetime(2026, 4, 1, 21, 0, tzinfo=DISPLAY_TZ),
+            ),
+            CalendarEvent(
+                summary="周日直播",
+                description="",
+                location="",
+                categories="直播",
+                url="",
+                status="CONFIRMED",
+                start=datetime(2026, 4, 5, 20, 0, tzinfo=DISPLAY_TZ),
+                end=datetime(2026, 4, 5, 21, 0, tzinfo=DISPLAY_TZ),
+            ),
+        ]
+
+        async def fake_load_calendar_events():
+            return events
+
+        self.repository._load_calendar_events = fake_load_calendar_events
+
+        grouped = asyncio.run(
+            self.repository.get_live_events_for_days(
+                date(2026, 4, 1),
+                date(2026, 4, 5),
+            )
+        )
+
+        self.assertEqual(list(grouped), [
+            date(2026, 4, 1),
+            date(2026, 4, 2),
+            date(2026, 4, 3),
+            date(2026, 4, 4),
+            date(2026, 4, 5),
+        ])
+        self.assertEqual([event.summary for event in grouped[date(2026, 4, 1)]], ["周三直播"])
+        self.assertEqual([event.summary for event in grouped[date(2026, 4, 5)]], ["周日直播"])
 
 
 class ScheduleServiceTest(unittest.TestCase):
