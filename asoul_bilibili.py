@@ -2,7 +2,7 @@ import logging
 import json
 import time
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 DEFAULT_BILIBILI_TARGET_UIDS = [
@@ -72,6 +72,7 @@ class BilibiliDynamicPost:
     created_at: int = 0
     comment_oid: int = 0
     comment_type: int = 0
+    is_pinned_dynamic: bool = False
     is_live_room_dynamic: bool = False
     is_video_dynamic: bool = False
 
@@ -337,7 +338,6 @@ class BilibiliGateway:
         collected: List[BilibiliDynamicPost] = []
         seen_ids = set()
         stop_found = stop_at_id is None
-        recent_cutoff_ts = max(0, int(time.time()) - RECENT_NOTIFICATION_WINDOW_SECONDS)
         items = self._extract_dynamic_items(page)
         for item in items:
             parsed = self._parse_dynamic_post(item)
@@ -347,10 +347,7 @@ class BilibiliGateway:
                 stop_found = True
                 break
             if self._is_pinned_dynamic(item):
-                # Old pinned history should not replay forever, but a just-posted pinned
-                # dynamic still needs one chance to enter the delivery window.
-                if parsed.created_at <= 0 or parsed.created_at < recent_cutoff_ts:
-                    continue
+                parsed = replace(parsed, is_pinned_dynamic=True)
             seen_ids.add(parsed.id)
             collected.append(parsed)
             if max_items is not None and len(collected) >= max_items:
@@ -1218,6 +1215,47 @@ class BilibiliMonitorService:
             and int(getattr(post, "created_at", 0)) >= cutoff_ts
         ]
 
+    @staticmethod
+    def _find_post_created_at(posts: List[Any], post_id: Optional[str]) -> int:
+        target_id = str(post_id or "").strip()
+        if not target_id:
+            return 0
+        for post in posts:
+            if str(getattr(post, "id", "") or "").strip() != target_id:
+                continue
+            try:
+                return max(0, int(getattr(post, "created_at", 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    @staticmethod
+    def _select_cursor_post(
+        posts: List[Any],
+        min_created_at: int = 0,
+    ) -> Optional[Any]:
+        candidates = [
+            post
+            for post in posts
+            if str(getattr(post, "id", "") or "").strip()
+            and int(getattr(post, "created_at", 0) or 0) > 0
+            and (
+                min_created_at <= 0
+                or int(getattr(post, "created_at", 0) or 0) > min_created_at
+            )
+        ]
+        if not candidates:
+            if min_created_at > 0:
+                return None
+            return posts[0] if posts else None
+        return max(
+            candidates,
+            key=lambda post: (
+                int(getattr(post, "created_at", 0) or 0),
+                _safe_int(getattr(post, "id", "")),
+            ),
+        )
+
     def _select_posts_for_delivery(
         self,
         posts: List[Any],
@@ -1225,9 +1263,22 @@ class BilibiliMonitorService:
         recent_ids: List[str],
         stop_found: bool,
         cutoff_ts: int,
+        last_seen_created_at: int = 0,
     ) -> List[Any]:
         known_ids = {text for text in ([last_seen_id] + recent_ids) if text}
-        candidate_posts = [post for post in posts if getattr(post, "id", "") not in known_ids]
+        candidate_posts = []
+        for post in posts:
+            post_id = str(getattr(post, "id", "") or "").strip()
+            if not post_id or post_id in known_ids:
+                continue
+            created_at = int(getattr(post, "created_at", 0) or 0)
+            if getattr(post, "is_pinned_dynamic", False):
+                if last_seen_created_at > 0:
+                    if created_at <= last_seen_created_at:
+                        continue
+                elif created_at <= 0 or created_at < cutoff_ts:
+                    continue
+            candidate_posts.append(post)
         if not candidate_posts:
             return []
         if last_seen_id and stop_found:
@@ -1249,7 +1300,12 @@ class BilibiliMonitorService:
             collected.append(post)
         return collected, False
 
-    def _record_dynamic_id(self, uid_state: Dict[str, Any], dyn_id: str) -> None:
+    def _record_dynamic_id(
+        self,
+        uid_state: Dict[str, Any],
+        dyn_id: str,
+        created_at: int = 0,
+    ) -> None:
         text = str(dyn_id or "").strip()
         if not text:
             return
@@ -1257,6 +1313,8 @@ class BilibiliMonitorService:
         recent_ids = self._normalize_recent_ids(uid_state.get("recent_dynamic_ids", []))
         uid_state["last_dynamic_id"] = text
         uid_state["recent_dynamic_ids"] = self._merge_recent_ids([text], recent_ids)
+        if created_at > 0:
+            uid_state["last_dynamic_created_at"] = int(created_at)
 
     @staticmethod
     def _record_comment_id(resource_state: Dict[str, Any], comment_id: str) -> None:
@@ -1371,16 +1429,24 @@ class BilibiliMonitorService:
             dynamic_window, dynamic_stop_found = self._slice_posts_before_stop(
                 snapshot.dynamics, latest_dynamic_id
             )
+            last_dynamic_created_at = self._find_post_created_at(
+                snapshot.dynamics,
+                latest_dynamic_id,
+            )
             deliver_dynamics = self._select_posts_for_delivery(
                 posts=dynamic_window,
                 last_seen_id=latest_dynamic_id,
                 recent_ids=recent_dynamic_ids,
                 stop_found=dynamic_stop_found,
                 cutoff_ts=recent_cutoff_ts,
+                last_seen_created_at=last_dynamic_created_at,
             )
             progress_state = deepcopy(uid_state)
-            for post in reversed(deliver_dynamics):
-                self._record_dynamic_id(progress_state, post.id)
+            for post in sorted(
+                deliver_dynamics,
+                key=lambda item: (item.created_at, _safe_int(item.id)),
+            ):
+                self._record_dynamic_id(progress_state, post.id, post.created_at)
                 if post.is_live_room_dynamic:
                     continue
                 if post.is_video_dynamic:
@@ -1416,8 +1482,14 @@ class BilibiliMonitorService:
                             uid_state=deepcopy(progress_state),
                         )
                     )
-            if dynamic_window:
-                uid_state["last_dynamic_id"] = dynamic_window[0].id
+            cursor_post = self._select_cursor_post(
+                dynamic_window,
+                last_dynamic_created_at,
+            )
+            if cursor_post is not None:
+                uid_state["last_dynamic_id"] = cursor_post.id
+                if getattr(cursor_post, "created_at", 0) > 0:
+                    uid_state["last_dynamic_created_at"] = int(cursor_post.created_at)
                 uid_state["recent_dynamic_ids"] = self._merge_recent_ids(
                     [post.id for post in dynamic_window],
                     recent_dynamic_ids,

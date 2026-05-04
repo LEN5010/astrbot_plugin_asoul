@@ -13,6 +13,7 @@ from asoul_bilibili import (
     BilibiliMonitorService,
     BilibiliPushConfig,
     BilibiliRichTextNode,
+    BilibiliUidSnapshot,
     BilibiliVideoPost,
     build_bilibili_push_config,
     normalize_bilibili_uid,
@@ -579,6 +580,21 @@ class BilibiliParsingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.gateway = ParsingGateway()
 
+    def _dynamic_push_config(self) -> BilibiliPushConfig:
+        return BilibiliPushConfig(
+            enabled=True,
+            poll_interval_seconds=120,
+            task_gap_seconds=20.0,
+            group_whitelist=["123456"],
+            target_uids=["100"],
+            push_dynamic=True,
+            push_video=True,
+            push_live=False,
+            push_comment=False,
+            request_client="aiohttp",
+            credential_data={"sessdata": "test"},
+        )
+
     def test_parse_live_rcmd_dynamic_extracts_title_cover_and_link(self) -> None:
         item = {
             "id_str": "dyn-live",
@@ -755,6 +771,78 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual([post.id for post in posts], ["dyn-6"])
 
     def test_old_pinned_dynamic_is_not_replayed_as_new_update(self) -> None:
+        snapshot = BilibiliUidSnapshot(
+            uid="100",
+            author_name="测试账号",
+            dynamics=[
+                BilibiliDynamicPost(
+                    id="dyn-2",
+                    text="很久之前的老置顶",
+                    url="https://t.bilibili.com/dyn-2",
+                    created_at=NOW_TS - (6 * 60),
+                    is_pinned_dynamic=True,
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-1",
+                    text="当前已处理游标",
+                    url="https://t.bilibili.com/dyn-1",
+                    created_at=NOW_TS - 30,
+                ),
+            ],
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "last_dynamic_id": "dyn-1",
+            "recent_dynamic_ids": ["dyn-1"],
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            plan = BilibiliMonitorService(self.gateway).plan_uid_deliveries(
+                self._dynamic_push_config(),
+                previous_state,
+                snapshot,
+            )
+
+        self.assertEqual(plan.deliveries, [])
+        self.assertEqual(plan.final_state["last_dynamic_id"], "dyn-1")
+
+    def test_pinned_dynamic_newer_than_cursor_is_delivered_even_after_five_minutes(self) -> None:
+        snapshot = BilibiliUidSnapshot(
+            uid="100",
+            author_name="测试账号",
+            dynamics=[
+                BilibiliDynamicPost(
+                    id="dyn-2",
+                    text="刚发出就被置顶的新动态",
+                    url="https://t.bilibili.com/dyn-2",
+                    created_at=NOW_TS - (6 * 60),
+                    is_pinned_dynamic=True,
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-1",
+                    text="当前已处理游标",
+                    url="https://t.bilibili.com/dyn-1",
+                    created_at=NOW_TS - (10 * 60),
+                ),
+            ],
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "last_dynamic_id": "dyn-1",
+            "recent_dynamic_ids": ["dyn-1"],
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            plan = BilibiliMonitorService(self.gateway).plan_uid_deliveries(
+                self._dynamic_push_config(),
+                previous_state,
+                snapshot,
+            )
+
+        self.assertEqual([delivery.notification.text for delivery in plan.deliveries], ["刚发出就被置顶的新动态"])
+        self.assertEqual(plan.final_state["last_dynamic_id"], "dyn-2")
+
+    def test_gateway_marks_pinned_dynamic_without_filtering_it(self) -> None:
         self.gateway.dynamic_page_payload = {
             "items": [
                 {
@@ -800,7 +888,8 @@ class BilibiliParsingTest(unittest.TestCase):
             )
 
         self.assertTrue(stop_found)
-        self.assertEqual(posts, [])
+        self.assertEqual([post.id for post in posts], ["dyn-2"])
+        self.assertTrue(posts[0].is_pinned_dynamic)
 
     def test_parse_comment_post_preserves_images_and_emotes_without_text(self) -> None:
         post = self.gateway._parse_comment_post(
