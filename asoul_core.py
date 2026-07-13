@@ -11,11 +11,12 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 
 TODAY_TRIGGER_TEXTS = {"今日直播"}
 TOMORROW_TRIGGER_TEXTS = {"明日直播"}
+THIS_WEEK_TRIGGER_TEXTS = {"本周直播"}
 HELP_TRIGGER_TEXTS = {"/bot帮助", "bot帮助"}
 HELP_MESSAGE = (
     "鸣潮bot请使用【ww帮助】获取图文\n"
     "自动签到请使用【ww登陆】，然后输入【ww开启自动签到】\n"
-    "asoul推送请使用【今日直播】或【明日直播】"
+    "asoul推送请使用【今日直播】、【明日直播】或【本周直播】"
 )
 NO_NEXT_WEEK_SCHEDULE_TEXT = "还没有下周的直播排表哦"
 
