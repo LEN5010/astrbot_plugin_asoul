@@ -1,5 +1,6 @@
 import asyncio
 import json
+import types
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from asoul_bilibili import (
     BilibiliMonitorService,
     BilibiliPushConfig,
     BilibiliRichTextNode,
+    BilibiliUidSnapshot,
     BilibiliVideoPost,
     build_bilibili_push_config,
     normalize_bilibili_uid,
@@ -23,6 +25,7 @@ NOW_TS = 1_700_000_000
 class FakeBilibiliGateway:
     def __init__(self) -> None:
         self.names = {"100": "测试账号"}
+        self.comment_fetch_requests = []
         self.dynamic_posts = {
             "100": [
                 BilibiliDynamicPost(
@@ -151,7 +154,14 @@ class FakeBilibiliGateway:
     async def get_live_status_by_uid(self, uid: str):
         return self.live_status.get(uid)
 
-    async def get_recent_comments(self, resource: BilibiliCommentResource):
+    async def get_recent_comments(self, resource: BilibiliCommentResource, stop_comment_ids=None, max_pages=None):
+        self.comment_fetch_requests.append(
+            {
+                "key": resource.key,
+                "stop_comment_ids": list(stop_comment_ids or []),
+                "max_pages": max_pages,
+            }
+        )
         return list(self.comments.get(resource.key, []))
 
 
@@ -163,13 +173,46 @@ class FakeUserForLiveInfo:
         return self.payload
 
 
+class FakeUserForDynamics:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+
+    async def get_dynamics_new(self, offset=""):
+        return self.payload
+
+
 class ParsingGateway(BilibiliGateway):
     def __init__(self) -> None:
         super().__init__(request_client="aiohttp", credential_data={})
         self.live_info_payload = {}
+        self.dynamic_page_payload = None
+        self.comment_module = None
 
     def _new_user(self, uid: str):
+        if self.dynamic_page_payload is not None:
+            return FakeUserForDynamics(self.dynamic_page_payload)
         return FakeUserForLiveInfo(self.live_info_payload)
+
+    def _load_modules(self):
+        if self.comment_module is not None:
+            return object(), object(), self.comment_module
+        return super()._load_modules()
+
+
+class FakeCommentModule:
+    class CommentResourceType:
+        def __init__(self, value) -> None:
+            self.value = value
+
+    OrderType = types.SimpleNamespace(TIME="time")
+
+    def __init__(self, pages) -> None:
+        self.pages = pages
+        self.calls: list[str] = []
+
+    async def get_comments_lazy(self, oid, type_, offset="", order=None, credential=None):
+        self.calls.append(str(offset or ""))
+        return self.pages.get(str(offset or ""), {})
 
 
 class BilibiliMonitorServiceTest(unittest.TestCase):
@@ -409,8 +452,68 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
         self.assertEqual(len(updated_notifications), 1)
         self.assertEqual(updated_notifications[0].kind, "comment")
-        self.assertIn("回复了评论", updated_notifications[0].title)
+        self.assertEqual(updated_notifications[0].comment_action_text, "回复了评论")
+        self.assertEqual(updated_notifications[0].comment_resource_kind, "视频")
+        self.assertEqual(updated_notifications[0].comment_resource_title, "第三个视频")
         self.assertEqual(updated_state["uids"]["100"]["comment_resources"]["video:2003"]["last_comment_id"], "9002")
+
+    def test_fetch_uid_snapshot_passes_known_comment_ids_to_comment_fetcher(self) -> None:
+        previous_state = {
+            "author_name": "测试账号",
+            "comment_resources": {
+                "video:2003": {
+                    "initialized": True,
+                    "last_comment_id": "9002",
+                    "recent_comment_ids": ["9002", "9001"],
+                }
+            },
+        }
+
+        asyncio.run(
+            self.service.fetch_uid_snapshot(
+                self.config,
+                "100",
+                previous_state=previous_state,
+            )
+        )
+
+        requests_by_key = {
+            item["key"]: item for item in self.gateway.comment_fetch_requests
+        }
+        self.assertEqual(
+            requests_by_key["video:2003"]["stop_comment_ids"],
+            ["9002", "9001"],
+        )
+        self.assertEqual(requests_by_key["video:2003"]["max_pages"], 5)
+
+    def test_video_dynamic_comment_resource_is_not_built_twice(self) -> None:
+        resources = self.service._build_comment_resources(
+            owner_uid="100",
+            owner_name="测试账号",
+            dynamics=[
+                BilibiliDynamicPost(
+                    id="dyn-video-4",
+                    text="投稿了新视频",
+                    url="https://www.bilibili.com/video/BV4",
+                    title="第四个视频",
+                    created_at=NOW_TS - 60,
+                    is_video_dynamic=True,
+                    comment_oid=2004,
+                    comment_type=1,
+                )
+            ],
+            videos=[
+                BilibiliVideoPost(
+                    id="BV4",
+                    title="第四个视频",
+                    url="https://www.bilibili.com/video/BV4",
+                    created_at=NOW_TS - 60,
+                    comment_oid=2004,
+                )
+            ],
+        )
+
+        self.assertEqual([resource.key for resource in resources], ["video:2004"])
 
     def test_second_poll_delivers_two_reserve_dynamics_in_order(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
@@ -476,6 +579,21 @@ class BilibiliConfigParsingTest(unittest.TestCase):
 class BilibiliParsingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.gateway = ParsingGateway()
+
+    def _dynamic_push_config(self) -> BilibiliPushConfig:
+        return BilibiliPushConfig(
+            enabled=True,
+            poll_interval_seconds=120,
+            task_gap_seconds=20.0,
+            group_whitelist=["123456"],
+            target_uids=["100"],
+            push_dynamic=True,
+            push_video=True,
+            push_live=False,
+            push_comment=False,
+            request_client="aiohttp",
+            credential_data={"sessdata": "test"},
+        )
 
     def test_parse_live_rcmd_dynamic_extracts_title_cover_and_link(self) -> None:
         item = {
@@ -571,6 +689,309 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertIn("直播预约：【突击/电台】一起聊聊天~", post.text)
         self.assertIn("明天 20:00 直播", post.text)
         self.assertEqual(post.url, "https://live.bilibili.com/blackboard/reserve")
+
+    def test_pinned_latest_dynamic_still_blocks_older_dynamic_replay(self) -> None:
+        self.gateway.dynamic_page_payload = {
+            "items": [
+                {
+                    "id_str": "dyn-5",
+                    "basic": {
+                        "comment_id_str": "3005",
+                        "comment_type": 17,
+                    },
+                    "modules": {
+                        "module_tag": {"text": "置顶"},
+                        "module_author": {
+                            "pub_ts": NOW_TS - 60,
+                        },
+                        "module_dynamic": {
+                            "desc": {"text": "最新动态但被置顶"},
+                        },
+                    },
+                },
+                {
+                    "id_str": "dyn-4",
+                    "basic": {
+                        "comment_id_str": "3004",
+                        "comment_type": 17,
+                    },
+                    "modules": {
+                        "module_author": {
+                            "pub_ts": NOW_TS - 120,
+                        },
+                        "module_dynamic": {
+                            "desc": {"text": "旧的漏发动态"},
+                        },
+                    },
+                },
+            ]
+        }
+
+        posts, stop_found = asyncio.run(
+            self.gateway.get_recent_dynamics_with_status(
+                "100",
+                stop_at_id="dyn-5",
+            )
+        )
+
+        self.assertEqual(posts, [])
+        self.assertTrue(stop_found)
+
+    def test_recent_pinned_dynamic_is_still_collected_for_delivery(self) -> None:
+        self.gateway.dynamic_page_payload = {
+            "items": [
+                {
+                    "id_str": "dyn-6",
+                    "basic": {
+                        "comment_id_str": "3006",
+                        "comment_type": 17,
+                    },
+                    "modules": {
+                        "module_tag": {"text": "置顶"},
+                        "module_author": {
+                            "pub_ts": NOW_TS - 60,
+                        },
+                        "module_dynamic": {
+                            "desc": {"text": "刚发出就被置顶的新动态"},
+                        },
+                    },
+                }
+            ]
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            posts, stop_found = asyncio.run(
+                self.gateway.get_recent_dynamics_with_status(
+                    "100",
+                    stop_at_id=None,
+                )
+            )
+
+        self.assertTrue(stop_found)
+        self.assertEqual([post.id for post in posts], ["dyn-6"])
+
+    def test_old_pinned_dynamic_is_not_replayed_as_new_update(self) -> None:
+        snapshot = BilibiliUidSnapshot(
+            uid="100",
+            author_name="测试账号",
+            dynamics=[
+                BilibiliDynamicPost(
+                    id="dyn-2",
+                    text="很久之前的老置顶",
+                    url="https://t.bilibili.com/dyn-2",
+                    created_at=NOW_TS - (6 * 60),
+                    is_pinned_dynamic=True,
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-1",
+                    text="当前已处理游标",
+                    url="https://t.bilibili.com/dyn-1",
+                    created_at=NOW_TS - 30,
+                ),
+            ],
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "last_dynamic_id": "dyn-1",
+            "recent_dynamic_ids": ["dyn-1"],
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            plan = BilibiliMonitorService(self.gateway).plan_uid_deliveries(
+                self._dynamic_push_config(),
+                previous_state,
+                snapshot,
+            )
+
+        self.assertEqual(plan.deliveries, [])
+        self.assertEqual(plan.final_state["last_dynamic_id"], "dyn-1")
+
+    def test_pinned_dynamic_newer_than_cursor_is_delivered_even_after_five_minutes(self) -> None:
+        snapshot = BilibiliUidSnapshot(
+            uid="100",
+            author_name="测试账号",
+            dynamics=[
+                BilibiliDynamicPost(
+                    id="dyn-2",
+                    text="刚发出就被置顶的新动态",
+                    url="https://t.bilibili.com/dyn-2",
+                    created_at=NOW_TS - (6 * 60),
+                    is_pinned_dynamic=True,
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-1",
+                    text="当前已处理游标",
+                    url="https://t.bilibili.com/dyn-1",
+                    created_at=NOW_TS - (10 * 60),
+                ),
+            ],
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "last_dynamic_id": "dyn-1",
+            "recent_dynamic_ids": ["dyn-1"],
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            plan = BilibiliMonitorService(self.gateway).plan_uid_deliveries(
+                self._dynamic_push_config(),
+                previous_state,
+                snapshot,
+            )
+
+        self.assertEqual([delivery.notification.text for delivery in plan.deliveries], ["刚发出就被置顶的新动态"])
+        self.assertEqual(plan.final_state["last_dynamic_id"], "dyn-2")
+
+    def test_gateway_marks_pinned_dynamic_without_filtering_it(self) -> None:
+        self.gateway.dynamic_page_payload = {
+            "items": [
+                {
+                    "id_str": "dyn-2",
+                    "basic": {
+                        "comment_id_str": "3002",
+                        "comment_type": 17,
+                    },
+                    "modules": {
+                        "module_tag": {"text": "置顶"},
+                        "module_author": {
+                            "pub_ts": NOW_TS - (6 * 60),
+                        },
+                        "module_dynamic": {
+                            "desc": {"text": "很久之前的老置顶"},
+                        },
+                    },
+                },
+                {
+                    "id_str": "dyn-1",
+                    "basic": {
+                        "comment_id_str": "3001",
+                        "comment_type": 17,
+                    },
+                    "modules": {
+                        "module_author": {
+                            "pub_ts": NOW_TS - 30,
+                        },
+                        "module_dynamic": {
+                            "desc": {"text": "当前已处理游标"},
+                        },
+                    },
+                },
+            ]
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            posts, stop_found = asyncio.run(
+                self.gateway.get_recent_dynamics_with_status(
+                    "100",
+                    stop_at_id="dyn-1",
+                )
+            )
+
+        self.assertTrue(stop_found)
+        self.assertEqual([post.id for post in posts], ["dyn-2"])
+        self.assertTrue(posts[0].is_pinned_dynamic)
+
+    def test_parse_comment_post_preserves_images_and_emotes_without_text(self) -> None:
+        post = self.gateway._parse_comment_post(
+            {
+                "rpid_str": "99001",
+                "ctime": NOW_TS,
+                "parent": 0,
+                "member": {
+                    "mid": "672328094",
+                    "uname": "乃琳Queen",
+                },
+                "content": {
+                    "message": "",
+                    "pictures": [
+                        {"img_src": "//i0.hdslb.com/comment-a.png"},
+                        {"url": "https://i0.hdslb.com/comment-b.png"},
+                    ],
+                    "emote": {
+                        "1": {"url": "https://i0.hdslb.com/emote-a.png"},
+                        "2": {"icon_url": "https://i0.hdslb.com/emote-b.png"},
+                    },
+                },
+            }
+        )
+
+        self.assertIsNotNone(post)
+        assert post is not None
+        self.assertEqual(post.text, "")
+        self.assertEqual(
+            post.image_urls,
+            [
+                "https://i0.hdslb.com/comment-a.png",
+                "https://i0.hdslb.com/comment-b.png",
+                "https://i0.hdslb.com/emote-a.png",
+                "https://i0.hdslb.com/emote-b.png",
+            ],
+        )
+        self.assertFalse(post.is_reply)
+
+    def test_get_recent_comments_pages_until_known_comment(self) -> None:
+        self.gateway.comment_module = FakeCommentModule(
+            {
+                "": {
+                    "replies": [
+                        {
+                            "rpid_str": "9004",
+                            "ctime": 104,
+                            "parent": 0,
+                            "member": {"mid": "100", "uname": "测试账号"},
+                            "content": {"message": "第四条"},
+                        },
+                        {
+                            "rpid_str": "9003",
+                            "ctime": 103,
+                            "parent": 0,
+                            "member": {"mid": "100", "uname": "测试账号"},
+                            "content": {"message": "第三条"},
+                        },
+                    ],
+                    "cursor": {"pagination_reply": {"next_offset": "page-2"}},
+                },
+                "page-2": {
+                    "replies": [
+                        {
+                            "rpid_str": "9002",
+                            "ctime": 102,
+                            "parent": 0,
+                            "member": {"mid": "100", "uname": "测试账号"},
+                            "content": {"message": "第二条"},
+                        },
+                        {
+                            "rpid_str": "9001",
+                            "ctime": 101,
+                            "parent": 0,
+                            "member": {"mid": "100", "uname": "测试账号"},
+                            "content": {"message": "第一条"},
+                        },
+                    ],
+                    "cursor": {"pagination_reply": {"next_offset": "page-3"}},
+                },
+            }
+        )
+
+        comments = asyncio.run(
+            self.gateway.get_recent_comments(
+                BilibiliCommentResource(
+                    key="video:2003",
+                    owner_uid="100",
+                    owner_name="测试账号",
+                    resource_kind="video",
+                    oid=2003,
+                    type_value=1,
+                    title="第三个视频",
+                    url="https://www.bilibili.com/video/BV3",
+                ),
+                stop_comment_ids=["9002"],
+                max_pages=5,
+            )
+        )
+
+        self.assertEqual([comment.id for comment in comments], ["9004", "9003"])
+        self.assertEqual(self.gateway.comment_module.calls, ["", "page-2"])
 
     def test_get_live_status_prefers_room_info_title(self) -> None:
         self.gateway.live_info_payload = {

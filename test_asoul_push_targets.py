@@ -53,6 +53,10 @@ def _install_astrbot_stubs() -> None:
         def fromFileSystem(path):
             return ("image", path)
 
+        @staticmethod
+        def fromURL(url):
+            return ("image_url", url)
+
     message_components_module = types.ModuleType("astrbot.api.message_components")
     message_components_module.AtAll = type("AtAll", (), {})
     message_components_module.Plain = lambda text="": ("plain", text)
@@ -224,6 +228,34 @@ class ASoulPushTargetTest(unittest.TestCase):
         )
         self.assertIn("aiocqhttp:GroupMessage:100", plugin._bilibili_push_targets)
         self.assertIn("aiocqhttp:GroupMessage:200", plugin._bilibili_push_targets)
+
+    def test_comment_notification_parts_render_new_format_with_images(self) -> None:
+        plugin = self._new_plugin(["100"])
+        notification = self.main.BilibiliNotification(
+            kind="comment",
+            uid="672328094",
+            author_name="乃琳Queen",
+            title="",
+            url="https://www.bilibili.com/video/BV1xx411c7mD",
+            text="今天状态很好",
+            image_urls=["https://i0.hdslb.com/comment-image.png"],
+            comment_created_at=1_700_000_000,
+            comment_resource_owner_name="嘉然今天吃什么",
+            comment_resource_kind="视频",
+            comment_resource_title="鸣潮3.1主线上半！",
+            comment_action_text="发表了评论",
+        )
+
+        parts = plugin._build_notification_parts(notification)
+
+        self.assertEqual(parts[0][0], "plain")
+        self.assertIn("【B站评论】乃琳Queen", parts[0][1])
+        self.assertIn("乃琳Queen于2023-11-15 06:13", parts[0][1])
+        self.assertIn("在嘉然今天吃什么的视频《鸣潮3.1主线上半！》下发表了评论：", parts[0][1])
+        self.assertIn("今天状态很好", parts[0][1])
+        self.assertIn(("image_url", "https://i0.hdslb.com/comment-image.png"), parts)
+        self.assertEqual(parts[-1][0], "plain")
+        self.assertIn("https://www.bilibili.com/video/BV1xx411c7mD", parts[-1][1])
 
 
 if __name__ == "__main__":

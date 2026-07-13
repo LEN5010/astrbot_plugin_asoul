@@ -2,7 +2,7 @@ import logging
 import json
 import time
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 DEFAULT_BILIBILI_TARGET_UIDS = [
@@ -19,6 +19,7 @@ MIN_POLL_INTERVAL_SECONDS = 60
 DEFAULT_TASK_GAP_SECONDS = 20.0
 COMMENT_RESOURCE_LIMIT_PER_KIND = 2
 COMMENT_RECENT_IDS_LIMIT = 20
+COMMENT_FETCH_PAGE_LIMIT = 5
 CONTENT_RECENT_IDS_LIMIT = 20
 RECENT_NOTIFICATION_WINDOW_SECONDS = 5 * 60
 BILIBILI_CREDENTIAL_FIELDS = (
@@ -71,6 +72,7 @@ class BilibiliDynamicPost:
     created_at: int = 0
     comment_oid: int = 0
     comment_type: int = 0
+    is_pinned_dynamic: bool = False
     is_live_room_dynamic: bool = False
     is_video_dynamic: bool = False
 
@@ -105,6 +107,11 @@ class BilibiliNotification:
     rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
     image_urls: List[str] = field(default_factory=list)
     cover_url: str = ""
+    comment_created_at: int = 0
+    comment_resource_owner_name: str = ""
+    comment_resource_kind: str = ""
+    comment_resource_title: str = ""
+    comment_action_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -127,6 +134,7 @@ class BilibiliCommentPost:
     text: str
     created_at: int
     is_reply: bool
+    image_urls: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -332,14 +340,14 @@ class BilibiliGateway:
         stop_found = stop_at_id is None
         items = self._extract_dynamic_items(page)
         for item in items:
-            if self._is_pinned_dynamic(item):
-                continue
             parsed = self._parse_dynamic_post(item)
             if parsed is None or parsed.id in seen_ids:
                 continue
             if stop_at_id and parsed.id == stop_at_id:
                 stop_found = True
                 break
+            if self._is_pinned_dynamic(item):
+                parsed = replace(parsed, is_pinned_dynamic=True)
             seen_ids.add(parsed.id)
             collected.append(parsed)
             if max_items is not None and len(collected) >= max_items:
@@ -542,37 +550,91 @@ class BilibiliGateway:
             )
         return result
 
-    async def get_recent_comments(self, resource: BilibiliCommentResource) -> List[BilibiliCommentPost]:
+    async def get_recent_comments(
+        self,
+        resource: BilibiliCommentResource,
+        stop_comment_ids: Optional[Sequence[str]] = None,
+        max_pages: int = COMMENT_FETCH_PAGE_LIMIT,
+    ) -> List[BilibiliCommentPost]:
         _, _, comment_module = self._load_modules()
         comment_type = comment_module.CommentResourceType(resource.type_value)
-        page = await comment_module.get_comments_lazy(
-            oid=resource.oid,
-            type_=comment_type,
-            order=comment_module.OrderType.TIME,
-            credential=self._credential,
-        )
-        replies = page.get("replies")
-        if not isinstance(replies, list):
-            return []
-
         parsed: List[BilibiliCommentPost] = []
         seen_ids = set()
+        stop_ids = {
+            str(comment_id).strip()
+            for comment_id in (stop_comment_ids or [])
+            if str(comment_id).strip()
+        }
 
-        def visit(reply_items: List[Dict[str, Any]]) -> None:
+        def visit(
+            reply_items: List[Dict[str, Any]],
+            page_comments: List[BilibiliCommentPost],
+        ) -> None:
             for reply in reply_items:
                 if not isinstance(reply, dict):
                     continue
                 comment_post = self._parse_comment_post(reply)
-                if comment_post and comment_post.id not in seen_ids:
-                    seen_ids.add(comment_post.id)
-                    parsed.append(comment_post)
+                if comment_post:
+                    page_comments.append(comment_post)
                 nested_replies = reply.get("replies")
                 if isinstance(nested_replies, list) and nested_replies:
-                    visit([item for item in nested_replies if isinstance(item, dict)])
+                    visit(
+                        [item for item in nested_replies if isinstance(item, dict)],
+                        page_comments,
+                    )
 
-        visit([item for item in replies if isinstance(item, dict)])
+        next_offset = ""
+        for _ in range(max(1, int(max_pages or 0))):
+            page = await comment_module.get_comments_lazy(
+                oid=resource.oid,
+                type_=comment_type,
+                offset=next_offset,
+                order=comment_module.OrderType.TIME,
+                credential=self._credential,
+            )
+            if not isinstance(page, dict):
+                break
+
+            replies = page.get("replies")
+            if not isinstance(replies, list) or not replies:
+                break
+
+            page_comments: List[BilibiliCommentPost] = []
+            visit([item for item in replies if isinstance(item, dict)], page_comments)
+            page_comments.sort(
+                key=lambda item: (item.created_at, _safe_int(item.id)),
+                reverse=True,
+            )
+
+            hit_known_comment = False
+            for comment_post in page_comments:
+                if comment_post.id in seen_ids:
+                    continue
+                if comment_post.id in stop_ids:
+                    hit_known_comment = True
+                    break
+                seen_ids.add(comment_post.id)
+                parsed.append(comment_post)
+
+            if hit_known_comment:
+                break
+
+            new_offset = self._extract_comment_next_offset(page)
+            if not new_offset or new_offset == next_offset:
+                break
+            next_offset = new_offset
+
         parsed.sort(key=lambda item: (item.created_at, _safe_int(item.id)), reverse=True)
         return parsed
+
+    def _extract_comment_next_offset(self, page: Dict[str, Any]) -> str:
+        cursor = page.get("cursor")
+        if not isinstance(cursor, dict):
+            return ""
+        pagination_reply = cursor.get("pagination_reply")
+        if not isinstance(pagination_reply, dict):
+            return ""
+        return str(pagination_reply.get("next_offset", "") or "").strip()
 
     def _extract_dynamic_items(self, page: Dict[str, Any]) -> List[Dict[str, Any]]:
         for key in ("items", "cards", "list"):
@@ -1031,7 +1093,8 @@ class BilibiliGateway:
         author_uid = str(member.get("mid", "") or "").strip()
         author_name = str(member.get("uname", "") or "").strip()
         text = str(content.get("message", "") or "").strip()
-        if not author_uid or not author_name or not text:
+        image_urls = self._extract_comment_image_urls(content)
+        if not author_uid or not author_name or (not text and not image_urls):
             return None
 
         parent_id = _safe_int(reply.get("parent"))
@@ -1042,7 +1105,40 @@ class BilibiliGateway:
             text=text,
             created_at=_safe_int(reply.get("ctime")),
             is_reply=parent_id > 0,
+            image_urls=image_urls,
         )
+
+    def _extract_comment_image_urls(self, content: Dict[str, Any]) -> List[str]:
+        if not isinstance(content, dict):
+            return []
+
+        image_urls: List[str] = []
+        seen = set()
+
+        def append_candidate(raw_value: Any) -> None:
+            url = _normalize_url(str(raw_value or "").strip())
+            if not url or url in seen:
+                return
+            seen.add(url)
+            image_urls.append(url)
+
+        pictures = content.get("pictures")
+        if isinstance(pictures, list):
+            for picture in pictures:
+                if not isinstance(picture, dict):
+                    continue
+                for key in ("img_src", "img_url", "url", "src"):
+                    append_candidate(picture.get(key))
+
+        emote = content.get("emote")
+        if isinstance(emote, dict):
+            for raw_item in emote.values():
+                if not isinstance(raw_item, dict):
+                    continue
+                for key in ("url", "icon_url", "emote_url"):
+                    append_candidate(raw_item.get(key))
+
+        return image_urls
 
     def _find_first_value(self, value: Any, candidate_keys: Sequence[str]) -> Optional[Any]:
         if isinstance(value, dict):
@@ -1119,6 +1215,47 @@ class BilibiliMonitorService:
             and int(getattr(post, "created_at", 0)) >= cutoff_ts
         ]
 
+    @staticmethod
+    def _find_post_created_at(posts: List[Any], post_id: Optional[str]) -> int:
+        target_id = str(post_id or "").strip()
+        if not target_id:
+            return 0
+        for post in posts:
+            if str(getattr(post, "id", "") or "").strip() != target_id:
+                continue
+            try:
+                return max(0, int(getattr(post, "created_at", 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    @staticmethod
+    def _select_cursor_post(
+        posts: List[Any],
+        min_created_at: int = 0,
+    ) -> Optional[Any]:
+        candidates = [
+            post
+            for post in posts
+            if str(getattr(post, "id", "") or "").strip()
+            and int(getattr(post, "created_at", 0) or 0) > 0
+            and (
+                min_created_at <= 0
+                or int(getattr(post, "created_at", 0) or 0) > min_created_at
+            )
+        ]
+        if not candidates:
+            if min_created_at > 0:
+                return None
+            return posts[0] if posts else None
+        return max(
+            candidates,
+            key=lambda post: (
+                int(getattr(post, "created_at", 0) or 0),
+                _safe_int(getattr(post, "id", "")),
+            ),
+        )
+
     def _select_posts_for_delivery(
         self,
         posts: List[Any],
@@ -1126,9 +1263,22 @@ class BilibiliMonitorService:
         recent_ids: List[str],
         stop_found: bool,
         cutoff_ts: int,
+        last_seen_created_at: int = 0,
     ) -> List[Any]:
         known_ids = {text for text in ([last_seen_id] + recent_ids) if text}
-        candidate_posts = [post for post in posts if getattr(post, "id", "") not in known_ids]
+        candidate_posts = []
+        for post in posts:
+            post_id = str(getattr(post, "id", "") or "").strip()
+            if not post_id or post_id in known_ids:
+                continue
+            created_at = int(getattr(post, "created_at", 0) or 0)
+            if getattr(post, "is_pinned_dynamic", False):
+                if last_seen_created_at > 0:
+                    if created_at <= last_seen_created_at:
+                        continue
+                elif created_at <= 0 or created_at < cutoff_ts:
+                    continue
+            candidate_posts.append(post)
         if not candidate_posts:
             return []
         if last_seen_id and stop_found:
@@ -1150,7 +1300,12 @@ class BilibiliMonitorService:
             collected.append(post)
         return collected, False
 
-    def _record_dynamic_id(self, uid_state: Dict[str, Any], dyn_id: str) -> None:
+    def _record_dynamic_id(
+        self,
+        uid_state: Dict[str, Any],
+        dyn_id: str,
+        created_at: int = 0,
+    ) -> None:
         text = str(dyn_id or "").strip()
         if not text:
             return
@@ -1158,6 +1313,8 @@ class BilibiliMonitorService:
         recent_ids = self._normalize_recent_ids(uid_state.get("recent_dynamic_ids", []))
         uid_state["last_dynamic_id"] = text
         uid_state["recent_dynamic_ids"] = self._merge_recent_ids([text], recent_ids)
+        if created_at > 0:
+            uid_state["last_dynamic_created_at"] = int(created_at)
 
     @staticmethod
     def _record_comment_id(resource_state: Dict[str, Any], comment_id: str) -> None:
@@ -1176,6 +1333,24 @@ class BilibiliMonitorService:
         resource_state["initialized"] = True
         resource_state["last_comment_id"] = text
         resource_state["recent_comment_ids"] = current_ids[:COMMENT_RECENT_IDS_LIMIT]
+
+    @staticmethod
+    def _extract_known_comment_ids(resource_state: Any) -> List[str]:
+        if not isinstance(resource_state, dict):
+            return []
+
+        known_ids: List[str] = []
+        seen = set()
+        recent_comment_ids = resource_state.get("recent_comment_ids", [])
+        if not isinstance(recent_comment_ids, list):
+            recent_comment_ids = []
+        for raw_value in [resource_state.get("last_comment_id"), *recent_comment_ids]:
+            text = str(raw_value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            known_ids.append(text)
+        return known_ids
 
     async def fetch_uid_snapshot(
         self,
@@ -1208,9 +1383,18 @@ class BilibiliMonitorService:
             comment_resources = self._build_comment_resources(
                 uid, author_name, latest_dynamics, latest_videos
             )
+            previous_comment_resources = previous_uid_state.get("comment_resources", {})
+            if not isinstance(previous_comment_resources, dict):
+                previous_comment_resources = {}
             watched_uids = {target_uid for target_uid in config.target_uids}
             for resource in comment_resources:
-                comments = await self._gateway.get_recent_comments(resource)
+                comments = await self._gateway.get_recent_comments(
+                    resource,
+                    stop_comment_ids=self._extract_known_comment_ids(
+                        previous_comment_resources.get(resource.key, {})
+                    ),
+                    max_pages=COMMENT_FETCH_PAGE_LIMIT,
+                )
                 comment_posts[resource.key] = [
                     comment_post
                     for comment_post in comments
@@ -1245,16 +1429,24 @@ class BilibiliMonitorService:
             dynamic_window, dynamic_stop_found = self._slice_posts_before_stop(
                 snapshot.dynamics, latest_dynamic_id
             )
+            last_dynamic_created_at = self._find_post_created_at(
+                snapshot.dynamics,
+                latest_dynamic_id,
+            )
             deliver_dynamics = self._select_posts_for_delivery(
                 posts=dynamic_window,
                 last_seen_id=latest_dynamic_id,
                 recent_ids=recent_dynamic_ids,
                 stop_found=dynamic_stop_found,
                 cutoff_ts=recent_cutoff_ts,
+                last_seen_created_at=last_dynamic_created_at,
             )
             progress_state = deepcopy(uid_state)
-            for post in reversed(deliver_dynamics):
-                self._record_dynamic_id(progress_state, post.id)
+            for post in sorted(
+                deliver_dynamics,
+                key=lambda item: (item.created_at, _safe_int(item.id)),
+            ):
+                self._record_dynamic_id(progress_state, post.id, post.created_at)
                 if post.is_live_room_dynamic:
                     continue
                 if post.is_video_dynamic:
@@ -1290,8 +1482,14 @@ class BilibiliMonitorService:
                             uid_state=deepcopy(progress_state),
                         )
                     )
-            if dynamic_window:
-                uid_state["last_dynamic_id"] = dynamic_window[0].id
+            cursor_post = self._select_cursor_post(
+                dynamic_window,
+                last_dynamic_created_at,
+            )
+            if cursor_post is not None:
+                uid_state["last_dynamic_id"] = cursor_post.id
+                if getattr(cursor_post, "created_at", 0) > 0:
+                    uid_state["last_dynamic_created_at"] = int(cursor_post.created_at)
                 uid_state["recent_dynamic_ids"] = self._merge_recent_ids(
                     [post.id for post in dynamic_window],
                     recent_dynamic_ids,
@@ -1453,11 +1651,20 @@ class BilibiliMonitorService:
         videos: List[BilibiliVideoPost],
     ) -> List[BilibiliCommentResource]:
         resources: List[BilibiliCommentResource] = []
+        seen_keys = set()
+
+        def append_resource(resource: BilibiliCommentResource) -> None:
+            if resource.key in seen_keys:
+                return
+            seen_keys.add(resource.key)
+            resources.append(resource)
 
         for post in dynamics:
+            if post.is_video_dynamic:
+                continue
             if post.comment_oid <= 0 or post.comment_type <= 0:
                 continue
-            resources.append(
+            append_resource(
                 BilibiliCommentResource(
                     key=f"dynamic:{post.comment_type}:{post.comment_oid}",
                     owner_uid=owner_uid,
@@ -1473,7 +1680,7 @@ class BilibiliMonitorService:
         for post in videos:
             if post.comment_oid <= 0:
                 continue
-            resources.append(
+            append_resource(
                 BilibiliCommentResource(
                     key=f"video:{post.comment_oid}",
                     owner_uid=owner_uid,
@@ -1519,17 +1726,20 @@ class BilibiliMonitorService:
         comment_post: BilibiliCommentPost,
     ) -> BilibiliNotification:
         resource_text = "动态" if resource.resource_kind == "dynamic" else "视频"
-        owner_prefix = "自己的" if resource.owner_uid == comment_post.author_uid else f"{resource.owner_name} 的"
         action_text = "回复了评论" if comment_post.is_reply else "发表了评论"
-        title = f"在 {owner_prefix}{resource_text}下{action_text}"
-        body = f"{resource.title}\n{comment_post.text}" if resource.title else comment_post.text
         return BilibiliNotification(
             kind="comment",
             uid=comment_post.author_uid,
             author_name=comment_post.author_name,
-            title=title,
+            title="",
             url=resource.url,
-            text=body,
+            text=comment_post.text,
+            image_urls=list(comment_post.image_urls),
+            comment_created_at=comment_post.created_at,
+            comment_resource_owner_name=resource.owner_name,
+            comment_resource_kind=resource_text,
+            comment_resource_title=resource.title,
+            comment_action_text=action_text,
         )
 
 

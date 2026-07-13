@@ -2,7 +2,7 @@ name: "astrbot_plugin_asoul"
 display_name: "枝江自动推送"
 desc: "自动推送枝江成员B站信息\n查询今日/明日直播并以图片形式推送"
 author: "LEN5010"
-version: v3.0.1
+version: v3.0.2
 repo: "https://github.com/LEN5010/astrbot_plugin_asoul"
 tags:
   - "ASOUL"
