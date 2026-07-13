@@ -1,0 +1,62 @@
+{
+  "enabled": {
+    "description": "启用 B 站自动播报",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时不会启动动态/视频/直播轮询任务。"
+  },
+  "poll_interval_seconds": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "建议不要过低，避免请求过快触发风控。最小按 30 秒处理。"
+  },
+  "request_client": {
+    "description": "B 站请求客户端",
+    "type": "string",
+    "default": "aiohttp",
+    "options": ["aiohttp", "httpx", "curl_cffi"],
+    "hint": "默认使用 aiohttp。部署时请确保对应依赖已安装。"
+  },
+  "group_whitelist": {
+    "description": "播报群白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "只有白名单群会被自动登记为主动推送目标。机器人必须先在该群收到过消息。"
+  },
+  "target_uids": {
+    "description": "监控目标 UID 列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "672328094",
+      "672342685",
+      "3537115310721181",
+      "3537115310721781",
+      "672353429",
+      "703007996",
+      "3493085336046382"
+    ],
+    "hint": "用于轮询动态、新视频和直播状态的目标账号 UID。"
+  },
+  "push_dynamic": {
+    "description": "播报新动态",
+    "type": "bool",
+    "default": true
+  },
+  "push_video": {
+    "description": "播报新视频",
+    "type": "bool",
+    "default": true
+  },
+  "push_live": {
+    "description": "播报开播信息",
+    "type": "bool",
+    "default": true
+  }
+}
