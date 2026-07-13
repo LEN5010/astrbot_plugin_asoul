@@ -10,6 +10,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
 
 from asoul_bilibili import (
+    COMMENT_POLL_INTERVAL_SECONDS,
     KV_BILIBILI_CREDENTIAL,
     KV_BILIBILI_GROUP_ORIGINS,
     KV_BILIBILI_MONITOR_STATE,
@@ -43,6 +44,7 @@ class BilibiliRuntime:
         )
         self.monitor = BilibiliMonitorService(self.gateway)
         self.task: asyncio.Task | None = None
+        self.comment_task: asyncio.Task | None = None
         self.push_targets: dict[str, dict[str, str]] = {}
         self.monitor_state: dict[str, Any] = {}
         self.credential_data: dict[str, str] = {}
@@ -55,21 +57,32 @@ class BilibiliRuntime:
             await self.load_state()
             self._runtime_initialized = True
 
-        if not self.push_config.enabled:
-            return
-        if not self.push_config.target_uids:
+        if not self.push_config.enabled or not self.push_config.target_uids:
             return
 
-        if self.task and not self.task.done():
-            return
+        if (
+            self.push_config.push_dynamic
+            or self.push_config.push_video
+            or self.push_config.push_live
+        ) and (not self.task or self.task.done()):
+            self.task = asyncio.create_task(self._run_monitor_loop())
 
-        self.task = asyncio.create_task(self._run_monitor_loop())
+        if self.push_config.push_comment and (
+            not self.comment_task or self.comment_task.done()
+        ):
+            self.comment_task = asyncio.create_task(self._run_comment_monitor_loop())
 
     async def terminate(self) -> None:
         if self.task and not self.task.done():
             self.task.cancel()
             try:
                 await self.task
+            except asyncio.CancelledError:
+                pass
+        if self.comment_task and not self.comment_task.done():
+            self.comment_task.cancel()
+            try:
+                await self.comment_task
             except asyncio.CancelledError:
                 pass
         self._runtime_initialized = False
@@ -270,16 +283,93 @@ class BilibiliRuntime:
                     continue
 
                 run_uid = min(due_uids, key=lambda uid: (uid_states[uid], uid))
-                await self.poll_bilibili_updates_for_uid(run_uid)
-
-                finished_at = time.monotonic()
-                uid_states[run_uid] = finished_at + self.push_config.poll_interval_seconds
-                next_dispatch_at = finished_at + self.push_config.task_gap_seconds
+                try:
+                    await self.poll_bilibili_updates_for_uid(run_uid)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "B 站自动播报 UID 轮询失败，本轮状态未推进: uid=%s",
+                        run_uid,
+                    )
+                finally:
+                    finished_at = time.monotonic()
+                    uid_states[run_uid] = (
+                        finished_at + self.push_config.poll_interval_seconds
+                    )
+                    next_dispatch_at = finished_at + self.push_config.task_gap_seconds
             except asyncio.CancelledError:
                 logger.info("B 站自动播报任务已停止")
                 raise
             except Exception:
                 logger.exception("B 站自动播报任务执行异常，本轮跳过并等待下次轮询")
+                await asyncio.sleep(1)
+
+    async def _run_comment_monitor_loop(self) -> None:
+        logger.info("启动 B 站评论自动播报任务，轮询间隔 %s 秒", COMMENT_POLL_INTERVAL_SECONDS)
+        uid_states: dict[str, float] = {}
+        next_dispatch_at = 0.0
+
+        while True:
+            try:
+                self.refresh_config()
+                if (
+                    not self.push_config.enabled
+                    or not self.push_config.push_comment
+                    or not self.push_config.target_uids
+                ):
+                    await asyncio.sleep(COMMENT_POLL_INTERVAL_SECONDS)
+                    continue
+
+                if not self.gateway.has_credential():
+                    if not self._missing_login_logged:
+                        logger.warning("B 站自动播报未登录，评论轮询已暂停。请配置凭据或使用 /bili_login 登录。")
+                        self._missing_login_logged = True
+                    await asyncio.sleep(COMMENT_POLL_INTERVAL_SECONDS)
+                    continue
+
+                self._missing_login_logged = False
+                current_uids = list(self.push_config.target_uids)
+                now = time.monotonic()
+
+                for uid in list(uid_states):
+                    if uid not in current_uids:
+                        uid_states.pop(uid, None)
+
+                for uid in current_uids:
+                    uid_states.setdefault(uid, now)
+
+                due_uids = [uid for uid in current_uids if uid_states[uid] <= now]
+                if not due_uids:
+                    next_due_at = min(uid_states[uid] for uid in current_uids)
+                    await asyncio.sleep(min(max(next_due_at - now, 0.2), 2.0))
+                    continue
+
+                if now < next_dispatch_at:
+                    await asyncio.sleep(min(max(next_dispatch_at - now, 0.2), 2.0))
+                    continue
+
+                run_uid = min(due_uids, key=lambda uid: (uid_states[uid], uid))
+                try:
+                    await self.poll_bilibili_comments_for_uid(run_uid)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "B 站评论自动播报 UID 轮询失败，本轮状态未推进: uid=%s",
+                        run_uid,
+                    )
+                finally:
+                    finished_at = time.monotonic()
+                    uid_states[run_uid] = (
+                        finished_at + COMMENT_POLL_INTERVAL_SECONDS
+                    )
+                    next_dispatch_at = finished_at + self.push_config.task_gap_seconds
+            except asyncio.CancelledError:
+                logger.info("B 站评论自动播报任务已停止")
+                raise
+            except Exception:
+                logger.exception("B 站评论自动播报任务执行异常，本轮跳过并等待下次轮询")
                 await asyncio.sleep(1)
 
     async def poll_bilibili_updates_for_uid(self, uid: str) -> None:
@@ -310,6 +400,45 @@ class BilibiliRuntime:
             )
             target_uid_state = target_state.setdefault("uids", {}).get(uid, {})
             plan = self.monitor.plan_uid_deliveries(
+                config=self.push_config,
+                previous_state=target_uid_state,
+                snapshot=snapshot,
+            )
+            await self.apply_delivery_plan_to_target(
+                target=target,
+                uid=uid,
+                plan=plan,
+                snapshot=snapshot,
+            )
+
+    async def poll_bilibili_comments_for_uid(self, uid: str) -> None:
+        target_entries = self.get_active_push_targets()
+        if not target_entries:
+            logger.info("存在 B 站新评论通知，但当前没有已登记的白名单群")
+            return
+
+        snapshot_seed_state: dict[str, Any] | None = None
+        for target in target_entries:
+            target_state, _ = self.ensure_target_monitor_bucket(
+                target.unified_msg_origin
+            )
+            candidate_state = target_state.get("uids", {}).get(uid)
+            if isinstance(candidate_state, dict) and candidate_state:
+                snapshot_seed_state = deepcopy(candidate_state)
+                break
+
+        snapshot = await self.monitor.fetch_comment_snapshot(
+            config=self.push_config,
+            uid=uid,
+            previous_state=snapshot_seed_state,
+        )
+
+        for target in target_entries:
+            target_state, _ = self.ensure_target_monitor_bucket(
+                target.unified_msg_origin
+            )
+            target_uid_state = target_state.setdefault("uids", {}).get(uid, {})
+            plan = self.monitor.plan_comment_deliveries(
                 config=self.push_config,
                 previous_state=target_uid_state,
                 snapshot=snapshot,

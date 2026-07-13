@@ -3,11 +3,13 @@ import copy
 import json
 import types
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from asoul_bilibili import (
     BilibiliCommentPost,
     BilibiliCommentResource,
+    BilibiliCommentSnapshot,
     BilibiliDynamicPost,
     BilibiliGateway,
     BilibiliLiveStatus,
@@ -82,9 +84,11 @@ class FakeBilibiliGateway:
                     text="这是旧评论",
                     created_at=100,
                     is_reply=False,
+                    root_id="9001",
                 )
             ]
         }
+        self.sub_comments = {}
 
     async def get_user_name(self, uid: str) -> str:
         return self.names[uid]
@@ -155,15 +159,27 @@ class FakeBilibiliGateway:
     async def get_live_status_by_uid(self, uid: str):
         return self.live_status.get(uid)
 
-    async def get_recent_comments(self, resource: BilibiliCommentResource, stop_comment_ids=None, max_pages=None):
+    async def get_recent_comments(self, resource: BilibiliCommentResource, stop_comment_ids=None, stop_root_ids=None, max_pages=None):
         self.comment_fetch_requests.append(
             {
                 "key": resource.key,
                 "stop_comment_ids": list(stop_comment_ids or []),
+                "stop_root_ids": list(stop_root_ids or []),
                 "max_pages": max_pages,
             }
         )
         return list(self.comments.get(resource.key, []))
+
+    async def get_recent_sub_comments(self, resource: BilibiliCommentResource, root_id: str, stop_comment_ids=None, max_pages=None):
+        self.comment_fetch_requests.append(
+            {
+                "key": resource.key,
+                "root_id": str(root_id),
+                "stop_comment_ids": list(stop_comment_ids or []),
+                "max_pages": max_pages,
+            }
+        )
+        return list(self.sub_comments.get((resource.key, str(root_id)), []))
 
 
 class FakeUserForLiveInfo:
@@ -184,7 +200,11 @@ class FakeUserForDynamics:
 
 class ParsingGateway(BilibiliGateway):
     def __init__(self) -> None:
-        super().__init__(request_client="aiohttp", credential_data={})
+        super().__init__(
+            request_client="aiohttp",
+            credential_data={},
+            comment_request_interval_seconds=0,
+        )
         self.live_info_payload = {}
         self.dynamic_page_payload = None
         self.comment_module = None
@@ -210,10 +230,24 @@ class FakeCommentModule:
     def __init__(self, pages) -> None:
         self.pages = pages
         self.calls: list[str] = []
+        self.sub_comment_pages = {}
 
     async def get_comments_lazy(self, oid, type_, offset="", order=None, credential=None):
         self.calls.append(str(offset or ""))
         return self.pages.get(str(offset or ""), {})
+
+    def Comment(self, oid, type_, rpid, credential=None):
+        return FakeCommentObject(self, str(rpid))
+
+
+class FakeCommentObject:
+    def __init__(self, module: FakeCommentModule, root_id: str) -> None:
+        self.module = module
+        self.root_id = root_id
+
+    async def get_sub_comments(self, page_index=1, page_size=10):
+        self.module.calls.append(f"sub:{self.root_id}:{page_index}:{page_size}")
+        return self.module.sub_comment_pages.get((self.root_id, page_index), {})
 
 
 class BilibiliMonitorServiceTest(unittest.TestCase):
@@ -244,6 +278,23 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             previous_state=previous_uid_state,
         )
         plan = self.service.plan_uid_deliveries(
+            config=self.config,
+            previous_state=previous_uid_state,
+            snapshot=snapshot,
+        )
+        uid_state_map["100"] = plan.final_state
+        return new_state, [delivery.notification for delivery in plan.deliveries]
+
+    async def _poll_comments_uid(self, state):
+        new_state = copy.deepcopy(state or {})
+        uid_state_map = new_state.setdefault("uids", {})
+        previous_uid_state = uid_state_map.get("100", {})
+        snapshot = await self.service.fetch_comment_snapshot(
+            config=self.config,
+            uid="100",
+            previous_state=previous_uid_state,
+        )
+        plan = self.service.plan_comment_deliveries(
             config=self.config,
             previous_state=previous_uid_state,
             snapshot=snapshot,
@@ -449,33 +500,40 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
     def test_comment_notification_only_for_new_target_comments(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            initial_state, notifications = asyncio.run(self._poll_uid({}))
+            initial_state, notifications = asyncio.run(self._poll_comments_uid({}))
 
         self.assertEqual(notifications, [])
-
-        self.gateway.comments["video:2003"].insert(
-            0,
-            BilibiliCommentPost(
-                id="9002",
-                author_uid="100",
-                author_name="测试账号",
-                text="这是新评论",
-                created_at=200,
-                is_reply=True,
-            ),
+        self.assertIn(
+            "video:2003",
+            initial_state["uids"]["100"]["comment_resources"],
         )
 
+        new_reply = BilibiliCommentPost(
+            id="9002",
+            author_uid="100",
+            author_name="测试账号",
+            text="这是新评论",
+            created_at=200,
+            is_reply=True,
+            root_id="9001",
+            parent_id="9001",
+        )
+        self.gateway.comments["video:2003"].insert(0, new_reply)
+        self.gateway.sub_comments[("video:2003", "9001")] = [new_reply]
+
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            updated_state, updated_notifications = asyncio.run(self._poll_uid(initial_state))
+            updated_state, updated_notifications = asyncio.run(self._poll_comments_uid(initial_state))
 
         self.assertEqual(len(updated_notifications), 1)
         self.assertEqual(updated_notifications[0].kind, "comment")
         self.assertEqual(updated_notifications[0].comment_action_text, "回复了评论")
         self.assertEqual(updated_notifications[0].comment_resource_kind, "视频")
         self.assertEqual(updated_notifications[0].comment_resource_title, "第三个视频")
-        self.assertEqual(updated_state["uids"]["100"]["comment_resources"]["video:2003"]["last_comment_id"], "9002")
+        resource_state = updated_state["uids"]["100"]["comment_resources"]["video:2003"]
+        self.assertEqual(resource_state["last_comment_id"], "9002")
+        self.assertEqual(resource_state["roots"]["9001"]["last_reply_id"], "9002")
 
-    def test_fetch_uid_snapshot_passes_known_comment_ids_to_comment_fetcher(self) -> None:
+    def test_fetch_comment_snapshot_passes_known_ids_and_baselines_missing_reply_count(self) -> None:
         previous_state = {
             "author_name": "测试账号",
             "comment_resources": {
@@ -483,12 +541,19 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
                     "initialized": True,
                     "last_comment_id": "9002",
                     "recent_comment_ids": ["9002", "9001"],
+                    "recent_root_ids": ["9001"],
+                    "roots": {
+                        "9001": {
+                            "last_reply_id": "9002",
+                            "recent_reply_ids": ["9002"],
+                        }
+                    },
                 }
             },
         }
 
         asyncio.run(
-            self.service.fetch_uid_snapshot(
+            self.service.fetch_comment_snapshot(
                 self.config,
                 "100",
                 previous_state=previous_state,
@@ -496,13 +561,94 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         )
 
         requests_by_key = {
-            item["key"]: item for item in self.gateway.comment_fetch_requests
+            item["key"]: item
+            for item in self.gateway.comment_fetch_requests
+            if "root_id" not in item
         }
         self.assertEqual(
             requests_by_key["video:2003"]["stop_comment_ids"],
             ["9002", "9001"],
         )
-        self.assertEqual(requests_by_key["video:2003"]["max_pages"], 5)
+        self.assertEqual(
+            requests_by_key["video:2003"]["stop_root_ids"],
+            ["9001"],
+        )
+        self.assertEqual(requests_by_key["video:2003"]["max_pages"], 1)
+
+        sub_requests = [
+            item
+            for item in self.gateway.comment_fetch_requests
+            if item.get("root_id") == "9001"
+        ]
+        self.assertEqual(sub_requests, [])
+
+    def test_fetch_comment_snapshot_scans_sub_comments_only_after_reply_count_grows(self) -> None:
+        self.gateway.comments["video:2003"] = [
+            replace(self.gateway.comments["video:2003"][0], reply_count=2)
+        ]
+        previous_state = {
+            "author_name": "测试账号",
+            "comment_resources": {
+                "video:2003": {
+                    "initialized": True,
+                    "last_comment_id": "9001",
+                    "recent_comment_ids": ["9001"],
+                    "recent_root_ids": ["9001"],
+                    "roots": {
+                        "9001": {
+                            "reply_count": 1,
+                            "recent_reply_ids": ["9000"],
+                        }
+                    },
+                }
+            },
+        }
+
+        asyncio.run(
+            self.service.fetch_comment_snapshot(
+                self.config,
+                "100",
+                previous_state=previous_state,
+            )
+        )
+
+        sub_requests = [
+            item
+            for item in self.gateway.comment_fetch_requests
+            if item.get("root_id") == "9001"
+        ]
+        self.assertEqual(len(sub_requests), 1)
+        self.assertEqual(sub_requests[0]["stop_comment_ids"], ["9000"])
+        root_request = next(
+            item
+            for item in self.gateway.comment_fetch_requests
+            if item["key"] == "video:2003" and "root_id" not in item
+        )
+        self.assertEqual(root_request["max_pages"], 5)
+
+    def test_first_comment_snapshot_does_not_expand_sub_comment_trees(self) -> None:
+        self.gateway.comments["video:2003"] = [
+            replace(self.gateway.comments["video:2003"][0], reply_count=20)
+        ]
+
+        asyncio.run(
+            self.service.fetch_comment_snapshot(
+                self.config,
+                "100",
+                previous_state={},
+            )
+        )
+
+        self.assertFalse(
+            any("root_id" in item for item in self.gateway.comment_fetch_requests)
+        )
+        self.assertTrue(
+            all(
+                item["max_pages"] == 1
+                for item in self.gateway.comment_fetch_requests
+                if "root_id" not in item
+            )
+        )
 
     def test_video_dynamic_comment_resource_is_not_built_twice(self) -> None:
         resources = self.service._build_comment_resources(
@@ -532,6 +678,270 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         )
 
         self.assertEqual([resource.key for resource in resources], ["video:2004"])
+
+    def test_comment_dynamic_resources_ignore_old_pinned_order(self) -> None:
+        dynamics = [
+            BilibiliDynamicPost(
+                id="dyn-old-pinned",
+                text="旧置顶",
+                url="https://t.bilibili.com/dyn-old-pinned",
+                created_at=NOW_TS - 1000,
+                comment_oid=3000,
+                comment_type=17,
+                is_pinned_dynamic=True,
+            ),
+            BilibiliDynamicPost(
+                id="dyn-new-pinned",
+                text="新置顶",
+                url="https://t.bilibili.com/dyn-new-pinned",
+                created_at=NOW_TS - 10,
+                comment_oid=3004,
+                comment_type=17,
+                is_pinned_dynamic=True,
+            ),
+            BilibiliDynamicPost(
+                id="dyn-new-3",
+                text="新动态3",
+                url="https://t.bilibili.com/dyn-new-3",
+                created_at=NOW_TS - 30,
+                comment_oid=3003,
+                comment_type=17,
+            ),
+            BilibiliDynamicPost(
+                id="dyn-new-2",
+                text="新动态2",
+                url="https://t.bilibili.com/dyn-new-2",
+                created_at=NOW_TS - 20,
+                comment_oid=3002,
+                comment_type=17,
+            ),
+            BilibiliDynamicPost(
+                id="dyn-new-1",
+                text="新动态1",
+                url="https://t.bilibili.com/dyn-new-1",
+                created_at=NOW_TS - 40,
+                comment_oid=3001,
+                comment_type=17,
+            ),
+        ]
+
+        selected = self.service._select_recent_comment_dynamics(dynamics)
+
+        self.assertEqual(
+            [post.id for post in selected],
+            ["dyn-new-pinned", "dyn-new-2", "dyn-new-3"],
+        )
+
+    def test_comment_plan_deduplicates_duplicate_reply_ids(self) -> None:
+        resource = BilibiliCommentResource(
+            key="video:2003",
+            owner_uid="100",
+            owner_name="测试账号",
+            resource_kind="video",
+            oid=2003,
+            type_value=1,
+            title="第三个视频",
+            url="https://www.bilibili.com/video/BV3",
+        )
+        reply = BilibiliCommentPost(
+            id="9002",
+            author_uid="100",
+            author_name="测试账号",
+            text="重复回复",
+            created_at=200,
+            is_reply=True,
+            root_id="9001",
+            parent_id="9001",
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "comment_resources": {
+                "video:2003": {
+                    "initialized": True,
+                    "recent_comment_ids": [],
+                    "recent_root_ids": ["9001"],
+                    "roots": {"9001": {"recent_reply_ids": []}},
+                }
+            },
+        }
+
+        plan = self.service.plan_comment_deliveries(
+            self.config,
+            previous_state,
+            BilibiliCommentSnapshot(
+                uid="100",
+                author_name="测试账号",
+                comment_resources=[resource],
+                comment_posts={"video:2003": [reply, reply]},
+            ),
+        )
+
+        self.assertEqual([item.notification.text for item in plan.deliveries], ["重复回复"])
+
+    def test_comment_plan_caches_non_target_comments_without_pushing_them(self) -> None:
+        resource = BilibiliCommentResource(
+            key="video:2003",
+            owner_uid="100",
+            owner_name="测试账号",
+            resource_kind="video",
+            oid=2003,
+            type_value=1,
+            title="第三个视频",
+            url="https://www.bilibili.com/video/BV3",
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "comment_resources": {
+                "video:2003": {
+                    "initialized": True,
+                    "recent_comment_ids": [],
+                    "recent_root_ids": [],
+                    "roots": {},
+                }
+            },
+        }
+        comments = [
+            BilibiliCommentPost(
+                id="9001",
+                author_uid="200",
+                author_name="普通用户",
+                text="普通用户评论",
+                created_at=200,
+                is_reply=False,
+                root_id="9001",
+                reply_count=1,
+            ),
+            BilibiliCommentPost(
+                id="9002",
+                author_uid="100",
+                author_name="测试账号",
+                text="目标账号回复",
+                created_at=300,
+                is_reply=True,
+                root_id="9001",
+                parent_id="9001",
+            ),
+        ]
+
+        plan = self.service.plan_comment_deliveries(
+            self.config,
+            previous_state,
+            BilibiliCommentSnapshot(
+                uid="100",
+                author_name="测试账号",
+                comment_resources=[resource],
+                comment_posts={"video:2003": comments},
+            ),
+        )
+
+        self.assertEqual(
+            [item.notification.text for item in plan.deliveries],
+            ["目标账号回复"],
+        )
+        delivery_state = plan.deliveries[0].uid_state["comment_resources"]["video:2003"]
+        self.assertEqual(delivery_state["recent_comment_ids"], ["9002", "9001"])
+        self.assertEqual(
+            plan.final_state["comment_resources"]["video:2003"]["roots"]["9001"]["reply_count"],
+            1,
+        )
+
+    def test_comment_plan_orders_replies_and_updates_root_cache(self) -> None:
+        resource = BilibiliCommentResource(
+            key="video:2003",
+            owner_uid="100",
+            owner_name="测试账号",
+            resource_kind="video",
+            oid=2003,
+            type_value=1,
+            title="第三个视频",
+            url="https://www.bilibili.com/video/BV3",
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "comment_resources": {
+                "video:2003": {
+                    "initialized": True,
+                    "recent_comment_ids": [],
+                    "recent_root_ids": ["9001"],
+                    "roots": {"9001": {"recent_reply_ids": []}},
+                }
+            },
+        }
+        comments = [
+            BilibiliCommentPost(
+                id="9003",
+                author_uid="100",
+                author_name="测试账号",
+                text="较晚回复",
+                created_at=300,
+                is_reply=True,
+                root_id="9001",
+                parent_id="9001",
+            ),
+            BilibiliCommentPost(
+                id="9002",
+                author_uid="100",
+                author_name="测试账号",
+                text="较早回复",
+                created_at=200,
+                is_reply=True,
+                root_id="9001",
+                parent_id="9001",
+            ),
+        ]
+
+        plan = self.service.plan_comment_deliveries(
+            self.config,
+            previous_state,
+            BilibiliCommentSnapshot(
+                uid="100",
+                author_name="测试账号",
+                comment_resources=[resource],
+                comment_posts={"video:2003": comments},
+            ),
+        )
+
+        self.assertEqual(
+            [item.notification.text for item in plan.deliveries],
+            ["较早回复", "较晚回复"],
+        )
+        root_state = plan.final_state["comment_resources"]["video:2003"]["roots"]["9001"]
+        self.assertEqual(root_state["last_reply_id"], "9003")
+        self.assertEqual(root_state["recent_reply_ids"], ["9003", "9002"])
+
+    def test_comment_plan_prunes_inactive_resources(self) -> None:
+        active_resource = BilibiliCommentResource(
+            key="video:2003",
+            owner_uid="100",
+            owner_name="测试账号",
+            resource_kind="video",
+            oid=2003,
+            type_value=1,
+            title="第三个视频",
+            url="https://www.bilibili.com/video/BV3",
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "comment_resources": {
+                "video:old": {
+                    "initialized": True,
+                    "recent_comment_ids": ["1"],
+                }
+            },
+        }
+
+        plan = self.service.plan_comment_deliveries(
+            self.config,
+            previous_state,
+            BilibiliCommentSnapshot(
+                uid="100",
+                author_name="测试账号",
+                comment_resources=[active_resource],
+                comment_posts={"video:2003": []},
+            ),
+        )
+
+        self.assertEqual(list(plan.final_state["comment_resources"]), ["video:2003"])
 
     def test_second_poll_delivers_two_reserve_dynamics_in_order(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
@@ -1061,6 +1471,7 @@ class BilibiliParsingTest(unittest.TestCase):
                             "rpid_str": "9002",
                             "ctime": 102,
                             "parent": 0,
+                            "rcount": 4,
                             "member": {"mid": "100", "uname": "测试账号"},
                             "content": {"message": "第二条"},
                         },
@@ -1094,8 +1505,75 @@ class BilibiliParsingTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual([comment.id for comment in comments], ["9004", "9003"])
+        self.assertEqual(
+            [comment.id for comment in comments],
+            ["9004", "9003", "9002"],
+        )
+        self.assertEqual(comments[-1].reply_count, 4)
         self.assertEqual(self.gateway.comment_module.calls, ["", "page-2"])
+
+    def test_get_recent_sub_comments_stops_at_known_reply(self) -> None:
+        self.gateway.comment_module = FakeCommentModule({})
+        self.gateway.comment_module.sub_comment_pages = {
+            ("9001", 1): {
+                "replies": [
+                    {
+                        "rpid_str": "9004",
+                        "ctime": 104,
+                        "parent": 9001,
+                        "root": 9001,
+                        "member": {"mid": "100", "uname": "测试账号"},
+                        "content": {"message": "新楼中楼"},
+                    },
+                    {
+                        "rpid_str": "9002",
+                        "ctime": 102,
+                        "parent": 9001,
+                        "root": 9001,
+                        "member": {"mid": "100", "uname": "测试账号"},
+                        "content": {"message": "已知楼中楼"},
+                    },
+                ]
+            },
+            ("9001", 2): {
+                "replies": [
+                    {
+                        "rpid_str": "9000",
+                        "ctime": 100,
+                        "parent": 9001,
+                        "root": 9001,
+                        "member": {"mid": "100", "uname": "测试账号"},
+                        "content": {"message": "不应再翻页"},
+                    }
+                ]
+            },
+        }
+
+        comments = asyncio.run(
+            self.gateway.get_recent_sub_comments(
+                BilibiliCommentResource(
+                    key="video:2003",
+                    owner_uid="100",
+                    owner_name="测试账号",
+                    resource_kind="video",
+                    oid=2003,
+                    type_value=1,
+                    title="第三个视频",
+                    url="https://www.bilibili.com/video/BV3",
+                ),
+                root_id="9001",
+                stop_comment_ids=["9002"],
+                max_pages=3,
+            )
+        )
+
+        self.assertEqual([comment.id for comment in comments], ["9004"])
+        self.assertEqual(comments[0].root_id, "9001")
+        self.assertEqual(comments[0].parent_id, "9001")
+        self.assertEqual(
+            self.gateway.comment_module.calls,
+            ["sub:9001:1:20"],
+        )
 
     def test_get_live_status_prefers_room_info_title(self) -> None:
         self.gateway.live_info_payload = {

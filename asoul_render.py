@@ -369,6 +369,17 @@ class ScheduleImageRenderer:
         return str(output_path)
 
     def _find_font_file(self) -> Optional[str]:
+        plugin_fonts = [
+            PLUGIN_DIR / "font.ttf",
+            PLUGIN_DIR / "font.otf",
+            PLUGIN_DIR / "GenJyuuGothic-Normal-2.ttf",
+        ]
+        for font in plugin_fonts:
+            if font.exists():
+                font_path = str(font)
+                logger.debug("使用字体文件: %s", font_path)
+                return font_path
+
         candidates = [
             "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
             "/usr/share/fonts/opentype/noto/NotoSerifCJKsc-Regular.otf",
@@ -381,15 +392,12 @@ class ScheduleImageRenderer:
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
             "/usr/share/fonts/truetype/arphic/ukai.ttc",
-            str(PLUGIN_DIR / "font.ttf"),
-            str(PLUGIN_DIR / "font.otf"),
-            str(PLUGIN_DIR / "GenJyuuGothic-Normal-2.ttf"),
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/System/Library/Fonts/Hiragino Sans GB.ttc",
             "/System/Library/Fonts/PingFang.ttc",
         ]
         for candidate in candidates:
             if Path(candidate).exists():
+                logger.debug("使用字体文件: %s", candidate)
                 return candidate
 
         fc_match = shutil.which("fc-match")
@@ -403,6 +411,7 @@ class ScheduleImageRenderer:
                 )
                 font_path = result.stdout.strip().splitlines()[0]
                 if font_path and Path(font_path).exists():
+                    logger.debug("使用字体文件: %s", font_path)
                     return font_path
             except Exception:
                 pass
