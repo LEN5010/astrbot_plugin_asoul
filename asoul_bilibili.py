@@ -1282,6 +1282,24 @@ class BilibiliMonitorService:
         if not candidate_posts:
             return []
         if last_seen_id and stop_found:
+            stale_candidate_posts = [
+                post
+                for post in candidate_posts
+                if int(getattr(post, "created_at", 0) or 0) < cutoff_ts
+            ]
+            if stale_candidate_posts:
+                recent_candidate_posts = self._filter_recent_posts(candidate_posts, cutoff_ts)
+                if recent_candidate_posts:
+                    return recent_candidate_posts
+                return [
+                    max(
+                        candidate_posts,
+                        key=lambda post: (
+                            int(getattr(post, "created_at", 0) or 0),
+                            _safe_int(getattr(post, "id", "")),
+                        ),
+                    )
+                ]
             return candidate_posts
         return self._filter_recent_posts(candidate_posts, cutoff_ts)
 
@@ -1426,11 +1444,16 @@ class BilibiliMonitorService:
             recent_dynamic_ids = self._normalize_recent_ids(
                 uid_state.get("recent_dynamic_ids", [])
             )
+            sorted_dynamics = sorted(
+                snapshot.dynamics,
+                key=lambda post: (getattr(post, "created_at", 0) or 0, _safe_int(getattr(post, "id", ""))),
+                reverse=True,
+            )
             dynamic_window, dynamic_stop_found = self._slice_posts_before_stop(
-                snapshot.dynamics, latest_dynamic_id
+                sorted_dynamics, latest_dynamic_id
             )
             last_dynamic_created_at = self._find_post_created_at(
-                snapshot.dynamics,
+                sorted_dynamics,
                 latest_dynamic_id,
             )
             deliver_dynamics = self._select_posts_for_delivery(

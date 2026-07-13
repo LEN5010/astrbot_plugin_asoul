@@ -891,6 +891,92 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual([post.id for post in posts], ["dyn-2"])
         self.assertTrue(posts[0].is_pinned_dynamic)
 
+    def test_pinned_cursor_does_not_block_newer_post_appearing_after_it(self) -> None:
+        """当置顶动态是游标且排在 API 返回列表第一位时，排在它后面的更新非置顶动态不应被遗漏。"""
+        snapshot = BilibiliUidSnapshot(
+            uid="100",
+            author_name="测试账号",
+            dynamics=[
+                BilibiliDynamicPost(
+                    id="dyn-pinned",
+                    text="被置顶的游标",
+                    url="https://t.bilibili.com/dyn-pinned",
+                    created_at=NOW_TS - 120,
+                    is_pinned_dynamic=True,
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-new",
+                    text="发布在置顶之后的新动态",
+                    url="https://t.bilibili.com/dyn-new",
+                    created_at=NOW_TS - 60,
+                ),
+            ],
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "last_dynamic_id": "dyn-pinned",
+            "last_dynamic_created_at": NOW_TS - 120,
+            "recent_dynamic_ids": ["dyn-pinned"],
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            plan = BilibiliMonitorService(self.gateway).plan_uid_deliveries(
+                self._dynamic_push_config(),
+                previous_state,
+                snapshot,
+            )
+
+        self.assertEqual(
+            [d.notification.text for d in plan.deliveries],
+            ["发布在置顶之后的新动态"],
+        )
+
+    def test_stale_pinned_cursor_does_not_replay_days_of_history(self) -> None:
+        snapshot = BilibiliUidSnapshot(
+            uid="100",
+            author_name="测试账号",
+            dynamics=[
+                BilibiliDynamicPost(
+                    id="dyn-recent",
+                    text="最近的新动态",
+                    url="https://t.bilibili.com/dyn-recent",
+                    created_at=NOW_TS - 60,
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-old-missed",
+                    text="几天前遗漏的旧动态",
+                    url="https://t.bilibili.com/dyn-old-missed",
+                    created_at=NOW_TS - (3 * 24 * 60 * 60),
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-pinned",
+                    text="几天前被置顶的游标",
+                    url="https://t.bilibili.com/dyn-pinned",
+                    created_at=NOW_TS - (4 * 24 * 60 * 60),
+                    is_pinned_dynamic=True,
+                ),
+            ],
+        )
+        previous_state = {
+            "author_name": "测试账号",
+            "last_dynamic_id": "dyn-pinned",
+            "last_dynamic_created_at": NOW_TS - (4 * 24 * 60 * 60),
+            "recent_dynamic_ids": ["dyn-pinned"],
+        }
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            plan = BilibiliMonitorService(self.gateway).plan_uid_deliveries(
+                self._dynamic_push_config(),
+                previous_state,
+                snapshot,
+            )
+
+        self.assertEqual(
+            [d.notification.text for d in plan.deliveries],
+            ["最近的新动态"],
+        )
+        self.assertEqual(plan.final_state["last_dynamic_id"], "dyn-recent")
+
     def test_parse_comment_post_preserves_images_and_emotes_without_text(self) -> None:
         post = self.gateway._parse_comment_post(
             {
