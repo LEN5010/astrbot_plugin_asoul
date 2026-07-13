@@ -5,7 +5,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from asoul_calendar import CalendarRepository, _CalendarDownloadResult
-from asoul_core import CALENDAR_USER_AGENT, DISPLAY_TZ, CalendarEvent
+from asoul_core import (
+    CALENDAR_USER_AGENT,
+    DISPLAY_TZ,
+    CalendarEvent,
+    ScheduleItem,
+    parse_live_request,
+)
 from asoul_schedule import ScheduleService
 
 
@@ -266,6 +272,56 @@ class ScheduleServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(self.service._extract_hosts(event), ["嘉然", "乃琳", "贝拉"])
+
+    def test_filter_schedule_items_excludes_supplementary_members(self) -> None:
+        start = datetime(2026, 3, 30, 20, 0, tzinfo=DISPLAY_TZ)
+        items = [
+            ScheduleItem(
+                start=start,
+                start_text="20:00",
+                hosts=["心宜"],
+                hosts_text="心宜",
+                content="单人直播",
+                label="直播",
+            ),
+            ScheduleItem(
+                start=start,
+                start_text="20:00",
+                hosts=["嘉然", "思诺"],
+                hosts_text="嘉然 / 思诺",
+                content="联动直播",
+                label="联动",
+            ),
+            ScheduleItem(
+                start=start,
+                start_text="20:00",
+                hosts=[],
+                hosts_text="待确认",
+                content="待定直播",
+                label="直播",
+            ),
+        ]
+
+        filtered = self.service.exclude_hosts(items, {"心宜", "思诺"})
+
+        self.assertEqual([item.content for item in filtered], ["联动直播", "待定直播"])
+        self.assertEqual(filtered[0].hosts, ["嘉然"])
+        self.assertEqual(filtered[0].hosts_text, "嘉然")
+        self.assertEqual(items[1].hosts, ["嘉然", "思诺"])
+
+
+class LiveRequestParserTest(unittest.TestCase):
+    def test_parse_live_request_accepts_filter_flag_for_all_schedule_commands(self) -> None:
+        for command in ("今日直播", "明日直播", "本周直播"):
+            with self.subTest(command=command):
+                self.assertEqual(parse_live_request(f"{command} -a"), (command, True))
+
+    def test_parse_live_request_preserves_commands_without_filter_flag(self) -> None:
+        self.assertEqual(parse_live_request("今日直播"), ("今日直播", False))
+
+    def test_parse_live_request_rejects_unknown_or_extra_options(self) -> None:
+        self.assertIsNone(parse_live_request("今日直播 -x"))
+        self.assertIsNone(parse_live_request("今日直播 -a extra"))
 
 
 if __name__ == "__main__":

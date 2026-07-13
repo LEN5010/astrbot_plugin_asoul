@@ -19,10 +19,12 @@ from asoul_core import (
     DISPLAY_TZ,
     HELP_MESSAGE,
     HELP_TRIGGER_TEXTS,
+    LIVE_REQUEST_FILTERED_HOSTS,
     NO_NEXT_WEEK_SCHEDULE_TEXT,
     THIS_WEEK_TRIGGER_TEXTS,
     TODAY_TRIGGER_TEXTS,
     TOMORROW_TRIGGER_TEXTS,
+    parse_live_request,
 )
 from asoul_render import ScheduleImageRenderer
 from asoul_schedule import ScheduleService
@@ -78,13 +80,10 @@ class ASoulPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_live_request(self, event: AstrMessageEvent):
         """用户发送“今日直播”“明日直播”或“本周直播”时返回直播安排。"""
-        message_text = event.message_str.strip()
-        if (
-            message_text not in TODAY_TRIGGER_TEXTS
-            and message_text not in TOMORROW_TRIGGER_TEXTS
-            and message_text not in THIS_WEEK_TRIGGER_TEXTS
-        ):
+        parsed_request = parse_live_request(event.message_str)
+        if parsed_request is None:
             return
+        message_text, exclude_filtered_hosts = parsed_request
 
         event.stop_event()
         today = datetime.now(DISPLAY_TZ).date()
@@ -97,10 +96,12 @@ class ASoulPlugin(Star):
                 yield event.plain_result("⚠️ 直播日历暂时不可用，请稍后再试。")
                 return
 
-            day_items = [
-                (target_day, self._schedule_service.build_schedule_items(day_events.get(target_day, [])))
-                for target_day in sorted(day_events)
-            ]
+            day_items = []
+            for target_day in sorted(day_events):
+                items = self._schedule_service.build_schedule_items(day_events.get(target_day, []))
+                if exclude_filtered_hosts:
+                    items = self._schedule_service.exclude_hosts(items, LIVE_REQUEST_FILTERED_HOSTS)
+                day_items.append((target_day, items))
             try:
                 image_url = await self._image_renderer.render_week_schedule_image(
                     day_items,
@@ -141,6 +142,8 @@ class ASoulPlugin(Star):
             return
 
         items = self._schedule_service.build_schedule_items(events)
+        if exclude_filtered_hosts:
+            items = self._schedule_service.exclude_hosts(items, LIVE_REQUEST_FILTERED_HOSTS)
         try:
             image_url = await self._image_renderer.render_schedule_image(items, target_day, title_text)
         except Exception:

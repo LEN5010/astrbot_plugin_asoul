@@ -1,6 +1,7 @@
 import re
+from dataclasses import replace
 from datetime import date, datetime
-from typing import Dict, List, Tuple
+from typing import Collection, Dict, List, Tuple
 
 from asoul_core import ASOUL_CORE_MEMBERS, MEMBER_ALIASES, CalendarEvent, ScheduleItem
 
@@ -34,6 +35,31 @@ class ScheduleService:
         items = list(grouped.values())
         items.sort(key=lambda item: item.start)
         return items
+
+    def exclude_hosts(
+        self,
+        items: List[ScheduleItem],
+        excluded_hosts: Collection[str],
+    ) -> List[ScheduleItem]:
+        excluded = set(excluded_hosts)
+        filtered_items: List[ScheduleItem] = []
+
+        for item in items:
+            remaining_hosts = [host for host in item.hosts if host not in excluded]
+            if item.hosts and not remaining_hosts:
+                continue
+            if remaining_hosts == item.hosts:
+                filtered_items.append(item)
+                continue
+            filtered_items.append(
+                replace(
+                    item,
+                    hosts=remaining_hosts,
+                    hosts_text=" / ".join(remaining_hosts) if remaining_hosts else "待确认",
+                )
+            )
+
+        return filtered_items
 
     def format_schedule_fallback(
         self,

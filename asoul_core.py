@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 PLUGIN_DIR = Path(__file__).resolve().parent
@@ -14,6 +14,9 @@ DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 TODAY_TRIGGER_TEXTS = {"今日直播"}
 TOMORROW_TRIGGER_TEXTS = {"明日直播"}
 THIS_WEEK_TRIGGER_TEXTS = {"本周直播"}
+LIVE_TRIGGER_TEXTS = TODAY_TRIGGER_TEXTS | TOMORROW_TRIGGER_TEXTS | THIS_WEEK_TRIGGER_TEXTS
+LIVE_REQUEST_FILTER_FLAG = "-a"
+LIVE_REQUEST_FILTERED_HOSTS = frozenset({"心宜", "思诺"})
 HELP_TRIGGER_TEXTS = {"/bot帮助", "bot帮助"}
 HELP_MESSAGE = (
     "鸣潮bot请使用【ww帮助】获取图文\n"
@@ -62,6 +65,19 @@ MEMBER_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 )
 ASOUL_CORE_MEMBERS = ["嘉然", "乃琳", "贝拉"]
 AVATAR_NAMES = ("贝拉", "嘉然", "乃琳", "心宜", "思诺")
+
+
+def parse_live_request(message_text: str) -> Optional[Tuple[str, bool]]:
+    parts = message_text.strip().split()
+    if len(parts) == 1 and parts[0] in LIVE_TRIGGER_TEXTS:
+        return parts[0], False
+    if (
+        len(parts) == 2
+        and parts[0] in LIVE_TRIGGER_TEXTS
+        and parts[1] == LIVE_REQUEST_FILTER_FLAG
+    ):
+        return parts[0], True
+    return None
 
 
 @dataclass
