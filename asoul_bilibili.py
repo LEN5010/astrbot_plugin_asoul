@@ -13,7 +13,7 @@ DEFAULT_BILIBILI_TARGET_UIDS = [
     "703007996",
     "3493085336046382",
 ]
-DEFAULT_POLL_INTERVAL_SECONDS = 120
+DEFAULT_POLL_INTERVAL_SECONDS = 60
 MIN_POLL_INTERVAL_SECONDS = 30
 COMMENT_RESOURCE_LIMIT_PER_KIND = 2
 COMMENT_RECENT_IDS_LIMIT = 20
@@ -63,6 +63,7 @@ class BilibiliDynamicPost:
     image_urls: List[str] = field(default_factory=list)
     comment_oid: int = 0
     comment_type: int = 0
+    is_live_room_dynamic: bool = False
 
 
 @dataclass(frozen=True)
@@ -347,7 +348,10 @@ class BilibiliGateway:
                 ("roomStatus",),
                 ("room_info", "live_status"),
                 ("room_info", "liveStatus"),
+                ("room_info", "roomStatus"),
                 ("live_room", "live_status"),
+                ("live_room", "liveStatus"),
+                ("live_room", "roomStatus"),
             ),
         )
         if live_status_value is None:
@@ -362,6 +366,7 @@ class BilibiliGateway:
                 ("room_info", "room_id"),
                 ("room_info", "roomid"),
                 ("live_room", "room_id"),
+                ("live_room", "roomid"),
             ),
         )
         title_value = self._find_value_by_paths(
@@ -511,7 +516,20 @@ class BilibiliGateway:
             image_urls=image_urls,
             comment_oid=comment_oid,
             comment_type=comment_type,
+            is_live_room_dynamic=self._is_live_room_dynamic(item),
         )
+
+    def _is_live_room_dynamic(self, item: Dict[str, Any]) -> bool:
+        module_dynamic = self._get_module_dynamic(item)
+        major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
+        if not major:
+            return False
+        if isinstance(major.get("live_rcmd"), dict):
+            return True
+        live_block = major.get("live")
+        if isinstance(live_block, dict) and live_block:
+            return True
+        return False
 
     def _extract_dynamic_rich_nodes(self, item: Dict[str, Any]) -> tuple[List[BilibiliRichTextNode], str]:
         nodes, primary_text = self._extract_primary_dynamic_rich_nodes(item)
@@ -538,8 +556,7 @@ class BilibiliGateway:
         return nodes, plain_text
 
     def _extract_primary_dynamic_rich_nodes(self, item: Dict[str, Any]) -> tuple[List[BilibiliRichTextNode], str]:
-        modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
-        module_dynamic = modules.get("module_dynamic", {}) if isinstance(modules.get("module_dynamic"), dict) else {}
+        module_dynamic = self._get_module_dynamic(item)
         desc = module_dynamic.get("desc", {}) if isinstance(module_dynamic.get("desc"), dict) else {}
         major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
         opus = major.get("opus", {}) if isinstance(major.get("opus"), dict) else {}
@@ -576,10 +593,9 @@ class BilibiliGateway:
         return nodes, plain_text.strip()
 
     def _extract_dynamic_image_urls(self, item: Dict[str, Any], include_orig: bool = True) -> List[str]:
-        modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
-        module_dynamic = modules.get("module_dynamic", {}) if isinstance(modules.get("module_dynamic"), dict) else {}
+        module_dynamic = self._get_module_dynamic(item)
         major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
-        additional = item.get("additional", {}) if isinstance(item.get("additional"), dict) else {}
+        additional = self._get_dynamic_additional(item)
         image_urls: List[str] = []
         seen = set()
 
@@ -649,8 +665,9 @@ class BilibiliGateway:
                     ("modules", "module_dynamic", "major", "archive", "jump_url"),
                     ("modules", "module_dynamic", "major", "article", "jump_url"),
                     ("modules", "module_dynamic", "major", "live", "jump_url"),
-                    ("additional", "reserve", "jump_url"),
-                    ("additional", "common", "jump_url"),
+                    ("modules", "module_dynamic", "additional", "reserve", "jump_url"),
+                    ("modules", "module_dynamic", "additional", "common", "jump_url"),
+                    ("modules", "module_dynamic", "additional", "ugc", "jump_url"),
                 ),
             )
         )
@@ -671,10 +688,9 @@ class BilibiliGateway:
         return _normalize_url(str(url_value or "").strip())
 
     def _extract_dynamic_card_text(self, item: Dict[str, Any]) -> str:
-        modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
-        module_dynamic = modules.get("module_dynamic", {}) if isinstance(modules.get("module_dynamic"), dict) else {}
+        module_dynamic = self._get_module_dynamic(item)
         major = module_dynamic.get("major", {}) if isinstance(module_dynamic.get("major"), dict) else {}
-        additional = item.get("additional", {}) if isinstance(item.get("additional"), dict) else {}
+        additional = self._get_dynamic_additional(item)
 
         lines: List[str] = []
         live_rcmd = self._extract_live_rcmd_payload(major.get("live_rcmd"))
@@ -796,6 +812,16 @@ class BilibiliGateway:
             if isinstance(parsed, dict):
                 return parsed
         return {}
+
+    def _get_module_dynamic(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
+        module_dynamic = modules.get("module_dynamic")
+        return module_dynamic if isinstance(module_dynamic, dict) else {}
+
+    def _get_dynamic_additional(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        module_dynamic = self._get_module_dynamic(item)
+        additional = module_dynamic.get("additional")
+        return additional if isinstance(additional, dict) else {}
 
     def _parse_video_post(self, item: Dict[str, Any]) -> Optional[BilibiliVideoPost]:
         bvid = item.get("bvid") or self._find_first_value(item, ("bvid",))
@@ -948,6 +974,8 @@ class BilibiliMonitorService:
             if dynamics:
                 if latest_dynamic_id is not None:
                     for post in reversed(dynamics):
+                        if post.is_live_room_dynamic:
+                            continue
                         notifications.append(
                             BilibiliNotification(
                                 kind="dynamic",

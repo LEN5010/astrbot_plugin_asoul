@@ -182,6 +182,17 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
     def test_live_notification_only_on_transition_to_live(self) -> None:
         initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
 
+        self.gateway.dynamic_posts["100"].insert(
+            0,
+            BilibiliDynamicPost(
+                id="dyn-live",
+                text="【突击】直播开始了",
+                url="https://live.bilibili.com/123?live_from=85002",
+                rich_nodes=[BilibiliRichTextNode(kind="text", text="【突击】直播开始了")],
+                image_urls=["https://i0.hdslb.com/live-cover.jpg"],
+                is_live_room_dynamic=True,
+            ),
+        )
         self.gateway.live_status["100"] = BilibiliLiveStatus(
             is_live=True,
             title="今晚直播",
@@ -256,6 +267,7 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual(post.url, "https://live.bilibili.com/22632424")
         self.assertIn("先看成龙历险记然后洛克王国世界", post.text)
         self.assertEqual(post.image_urls, ["https://i0.hdslb.com/live-cover.jpg"])
+        self.assertTrue(post.is_live_room_dynamic)
 
     def test_parse_forward_dynamic_includes_original_content(self) -> None:
         item = {
@@ -299,15 +311,15 @@ class BilibiliParsingTest(unittest.TestCase):
                 "module_dynamic": {
                     "desc": {
                         "text": "所以明晚电台跟大家见面好不好呀奶淇琳"
-                    }
-                }
-            },
-            "additional": {
-                "reserve": {
-                    "title": "直播预约：【突击/电台】一起聊聊天~",
-                    "desc1": {"text": "明天 20:00 直播"},
-                    "desc2": {"text": "3191人预约"},
-                    "jump_url": "https://live.bilibili.com/blackboard/reserve",
+                    },
+                    "additional": {
+                        "reserve": {
+                            "title": "直播预约：【突击/电台】一起聊聊天~",
+                            "desc1": {"text": "明天 20:00 直播"},
+                            "desc2": {"text": "3191人预约"},
+                            "jump_url": "https://live.bilibili.com/blackboard/reserve",
+                        }
+                    },
                 }
             },
         }
@@ -341,3 +353,30 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual(status.title, "【突击】先看成龙历险记然后洛克王国世界！")
         self.assertEqual(status.url, "https://live.bilibili.com/22632424")
         self.assertEqual(status.cover_url, "https://i0.hdslb.com/live-room-cover.jpg")
+
+    def test_get_live_status_supports_live_room_status_shape(self) -> None:
+        self.gateway.live_info_payload = {
+            "official": {
+                "title": "虚拟偶像团体A-SOUL 所属艺人",
+            },
+            "live_room": {
+                "roomStatus": 1,
+                "liveStatus": 1,
+                "url": "https://live.bilibili.com/22632424?broadcast_type=0&is_room_feed=1",
+                "title": "【突击】和贝拉一起洛克王国世界！",
+                "cover": "https://i0.hdslb.com/bfs/live/new_room_cover/11a9c6e355c7af3b6b62e6a72ef4943ad545c827.jpg",
+                "roomid": 22632424,
+            },
+        }
+
+        status = asyncio.run(self.gateway.get_live_status("672353429"))
+
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertTrue(status.is_live)
+        self.assertEqual(status.room_id, "22632424")
+        self.assertEqual(status.title, "【突击】和贝拉一起洛克王国世界！")
+        self.assertEqual(
+            status.url,
+            "https://live.bilibili.com/22632424?broadcast_type=0&is_room_feed=1",
+        )
