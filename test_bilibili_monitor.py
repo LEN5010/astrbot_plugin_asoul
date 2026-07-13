@@ -6,6 +6,7 @@ from asoul_bilibili import (
     BilibiliLiveStatus,
     BilibiliMonitorService,
     BilibiliPushConfig,
+    BilibiliRichTextNode,
     BilibiliVideoPost,
 )
 
@@ -15,9 +16,24 @@ class FakeBilibiliGateway:
         self.names = {"100": "测试账号"}
         self.dynamic_posts = {
             "100": [
-                BilibiliDynamicPost(id="dyn-3", text="第三条动态", url="https://t.bilibili.com/dyn-3"),
-                BilibiliDynamicPost(id="dyn-2", text="第二条动态", url="https://t.bilibili.com/dyn-2"),
-                BilibiliDynamicPost(id="dyn-1", text="第一条动态", url="https://t.bilibili.com/dyn-1"),
+                BilibiliDynamicPost(
+                    id="dyn-3",
+                    text="第三条动态",
+                    url="https://t.bilibili.com/dyn-3",
+                    rich_nodes=[BilibiliRichTextNode(kind="text", text="第三条动态")],
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-2",
+                    text="第二条动态",
+                    url="https://t.bilibili.com/dyn-2",
+                    rich_nodes=[BilibiliRichTextNode(kind="text", text="第二条动态")],
+                ),
+                BilibiliDynamicPost(
+                    id="dyn-1",
+                    text="第一条动态",
+                    url="https://t.bilibili.com/dyn-1",
+                    rich_nodes=[BilibiliRichTextNode(kind="text", text="第一条动态")],
+                ),
             ]
         }
         self.video_posts = {
@@ -78,6 +94,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             push_video=True,
             push_live=True,
             request_client="aiohttp",
+            credential_data={"sessdata": "test"},
         )
 
     def test_first_poll_only_initializes_state(self) -> None:
@@ -93,7 +110,12 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
         self.gateway.dynamic_posts["100"].insert(
             0,
-            BilibiliDynamicPost(id="dyn-4", text="第四条动态", url="https://t.bilibili.com/dyn-4"),
+            BilibiliDynamicPost(
+                id="dyn-4",
+                text="第四条动态",
+                url="https://t.bilibili.com/dyn-4",
+                rich_nodes=[BilibiliRichTextNode(kind="text", text="第四条动态")],
+            ),
         )
         self.gateway.video_posts["100"].insert(
             0,

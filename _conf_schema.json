@@ -18,6 +18,42 @@
     "options": ["aiohttp", "httpx", "curl_cffi"],
     "hint": "默认使用 aiohttp。部署时请确保对应依赖已安装。"
   },
+  "sessdata": {
+    "description": "B 站 SESSDATA",
+    "type": "string",
+    "default": "",
+    "hint": "可选。若已配置，将直接作为登录凭据使用。"
+  },
+  "bili_jct": {
+    "description": "B 站 bili_jct",
+    "type": "string",
+    "default": "",
+    "hint": "可选。建议与 SESSDATA 一起填写。"
+  },
+  "buvid3": {
+    "description": "B 站 buvid3",
+    "type": "string",
+    "default": "",
+    "hint": "可选。部分风控场景下建议提供。"
+  },
+  "buvid4": {
+    "description": "B 站 buvid4",
+    "type": "string",
+    "default": "",
+    "hint": "可选。部分风控场景下建议提供。"
+  },
+  "dedeuserid": {
+    "description": "B 站 DedeUserID",
+    "type": "string",
+    "default": "",
+    "hint": "可选。登录成功后通常会自动获得。"
+  },
+  "ac_time_value": {
+    "description": "B 站 ac_time_value",
+    "type": "string",
+    "default": "",
+    "hint": "可选。用于更完整地保存登录态。"
+  },
   "group_whitelist": {
     "description": "播报群白名单",
     "type": "list",
