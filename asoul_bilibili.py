@@ -20,11 +20,13 @@ MIN_POLL_INTERVAL_SECONDS = 60
 DEFAULT_TASK_GAP_SECONDS = 20.0
 COMMENT_RESOURCE_LIMIT_PER_KIND = 3
 COMMENT_RECENT_IDS_LIMIT = 20
+COMMENT_ROOT_WINDOW_LIMIT = 20
 COMMENT_FETCH_PAGE_LIMIT = 5
 COMMENT_SUB_COMMENT_PAGE_LIMIT = 3
 COMMENT_SUB_COMMENT_PAGE_SIZE = 20
-COMMENT_POLL_INTERVAL_SECONDS = 60
-COMMENT_REQUEST_INTERVAL_SECONDS = 1.0
+COMMENT_POLL_INTERVAL_SECONDS = 180
+COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS = 600
+COMMENT_REQUEST_INTERVAL_SECONDS = 2.0
 CONTENT_RECENT_IDS_LIMIT = 20
 RECENT_NOTIFICATION_WINDOW_SECONDS = 5 * 60
 BILIBILI_CREDENTIAL_FIELDS = (
@@ -159,6 +161,7 @@ class BilibiliCommentSnapshot:
     author_name: str
     comment_resources: List[BilibiliCommentResource] = field(default_factory=list)
     comment_posts: Dict[str, List[BilibiliCommentPost]] = field(default_factory=dict)
+    resource_errors: Dict[str, Exception] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -429,11 +432,30 @@ class BilibiliGateway:
 
         return collected, stop_found
 
-    async def get_latest_dynamics(self, uid: str, limit: int) -> List[BilibiliDynamicPost]:
-        return await self.get_recent_dynamics(uid, stop_at_id=None, max_items=max(1, limit))
+    async def get_comment_resource_dynamics(
+        self, uid: str, limit: int
+    ) -> List[BilibiliDynamicPost]:
+        return await self._execute_comment_request(
+            lambda: self.get_recent_dynamics(
+                uid,
+                stop_at_id=None,
+                max_items=max(1, limit),
+            )
+        )
 
-    async def get_latest_videos(self, uid: str, limit: int) -> List[BilibiliVideoPost]:
-        return await self.get_recent_videos(uid, stop_at_id=None, max_items=max(1, limit))
+    async def get_comment_resource_videos(
+        self, uid: str, limit: int
+    ) -> List[BilibiliVideoPost]:
+        return await self._execute_comment_request(
+            lambda: self.get_recent_videos(
+                uid,
+                stop_at_id=None,
+                max_items=max(1, limit),
+            )
+        )
+
+    async def get_comment_resource_owner_name(self, uid: str) -> str:
+        return await self._execute_comment_request(lambda: self.get_user_name(uid))
 
     async def get_raw_dynamics_page(self, uid: str, offset: str = "") -> Dict[str, Any]:
         user_obj = self._new_user(uid)
@@ -688,6 +710,57 @@ class BilibiliGateway:
             next_offset = new_offset
 
         parsed.sort(key=lambda item: (item.created_at, _safe_int(item.id)), reverse=True)
+        return parsed
+
+    async def get_comment_window(
+        self,
+        resource: BilibiliCommentResource,
+        max_roots: int = COMMENT_ROOT_WINDOW_LIMIT,
+    ) -> List[BilibiliCommentPost]:
+        _, _, comment_module = self._load_modules()
+        comment_type = comment_module.CommentResourceType(resource.type_value)
+        page = await self._execute_comment_request(
+            lambda: comment_module.get_comments_lazy(
+                oid=resource.oid,
+                type_=comment_type,
+                offset="",
+                order=comment_module.OrderType.TIME,
+                credential=self._credential,
+            )
+        )
+        if not isinstance(page, dict):
+            return []
+
+        replies = page.get("replies")
+        if not isinstance(replies, list):
+            return []
+
+        parsed: List[BilibiliCommentPost] = []
+        seen_ids = set()
+
+        def append_reply(reply: Dict[str, Any], root_id: str = "") -> None:
+            comment_post = self._parse_comment_post(reply, root_id=root_id)
+            if comment_post is None or comment_post.id in seen_ids:
+                return
+            seen_ids.add(comment_post.id)
+            parsed.append(comment_post)
+            nested_replies = reply.get("replies")
+            if not isinstance(nested_replies, list):
+                return
+            nested_root_id = comment_post.root_id or comment_post.id
+            for nested_reply in nested_replies:
+                if isinstance(nested_reply, dict):
+                    append_reply(nested_reply, nested_root_id)
+
+        root_limit = max(1, int(max_roots or 0))
+        for reply in replies[:root_limit]:
+            if isinstance(reply, dict):
+                append_reply(reply)
+
+        parsed.sort(
+            key=lambda item: (item.created_at, _safe_int(item.id)),
+            reverse=True,
+        )
         return parsed
 
     async def get_recent_sub_comments(
@@ -1586,25 +1659,6 @@ class BilibiliMonitorService:
                     known_ids.append(text)
         return known_ids
 
-    def _extract_known_root_ids(self, resource_state: Any) -> List[str]:
-        if not isinstance(resource_state, dict):
-            return []
-
-        known_ids: List[str] = []
-        seen = set()
-        recent_root_ids = resource_state.get("recent_root_ids", [])
-        if not isinstance(recent_root_ids, list):
-            recent_root_ids = []
-        roots = resource_state.get("roots", {})
-        root_keys = list(roots) if isinstance(roots, dict) else []
-        for raw_value in [*recent_root_ids, *root_keys]:
-            text = str(raw_value or "").strip()
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            known_ids.append(text)
-        return known_ids
-
     def _extract_known_reply_ids(self, resource_state: Any, root_id: str) -> List[str]:
         if not isinstance(resource_state, dict):
             return []
@@ -1689,35 +1743,40 @@ class BilibiliMonitorService:
             live_status=live_status,
         )
 
+    async def discover_comment_resources(
+        self,
+        uid: str,
+        author_name: str,
+    ) -> List[BilibiliCommentResource]:
+        dynamics = await self._gateway.get_comment_resource_dynamics(
+            uid,
+            CONTENT_RECENT_IDS_LIMIT,
+        )
+        videos = await self._gateway.get_comment_resource_videos(
+            uid,
+            CONTENT_RECENT_IDS_LIMIT,
+        )
+        return self._build_comment_resources(
+            uid,
+            author_name,
+            self._select_recent_comment_dynamics(dynamics),
+            self._select_recent_comment_videos(videos),
+        )
+
     async def fetch_comment_snapshot(
         self,
-        config: BilibiliPushConfig,
         uid: str,
+        author_name: str,
+        comment_resources: Sequence[BilibiliCommentResource],
         previous_state: Optional[Dict[str, Any]] = None,
     ) -> BilibiliCommentSnapshot:
         previous_uid_state = previous_state if isinstance(previous_state, dict) else {}
-        author_name = previous_uid_state.get("author_name") or await self._gateway.get_user_name(uid)
-
-        dynamics, _ = await self._gateway.get_recent_dynamics_with_status(
-            uid,
-            stop_at_id=None,
-            max_items=CONTENT_RECENT_IDS_LIMIT,
-        )
-        latest_dynamics = self._select_recent_comment_dynamics(dynamics)
-        latest_videos = self._select_recent_comment_videos(
-            await self._gateway.get_latest_videos(uid, CONTENT_RECENT_IDS_LIMIT)
-        )
-        comment_resources = self._build_comment_resources(
-            uid,
-            author_name,
-            latest_dynamics,
-            latest_videos,
-        )
         previous_comment_resources = previous_uid_state.get("comment_resources", {})
         if not isinstance(previous_comment_resources, dict):
             previous_comment_resources = {}
 
         comment_posts: Dict[str, List[BilibiliCommentPost]] = {}
+        resource_errors: Dict[str, Exception] = {}
         for resource in comment_resources:
             previous_resource_state = previous_comment_resources.get(resource.key, {})
             resource_initialized = bool(
@@ -1731,20 +1790,14 @@ class BilibiliMonitorService:
             )
             if not isinstance(previous_roots, dict):
                 previous_roots = {}
-            has_reply_count_baseline = any(
-                isinstance(root_state, dict) and "reply_count" in root_state
-                for root_state in previous_roots.values()
-            )
-            comments = await self._gateway.get_recent_comments(
-                resource,
-                stop_comment_ids=self._extract_known_comment_ids(previous_resource_state),
-                stop_root_ids=self._extract_known_root_ids(previous_resource_state),
-                max_pages=(
-                    COMMENT_FETCH_PAGE_LIMIT
-                    if resource_initialized and has_reply_count_baseline
-                    else 1
-                ),
-            )
+            try:
+                comments = await self._gateway.get_comment_window(
+                    resource,
+                    max_roots=COMMENT_ROOT_WINDOW_LIMIT,
+                )
+            except Exception as exc:
+                resource_errors[resource.key] = exc
+                continue
 
             roots_to_fetch: List[str] = []
             inline_reply_counts: Dict[str, int] = {}
@@ -1771,18 +1824,22 @@ class BilibiliMonitorService:
                     if root_comment.reply_count > _safe_int(previous_reply_count):
                         roots_to_fetch.append(root_id)
 
-            for root_id in roots_to_fetch:
-                comments.extend(
-                    await self._gateway.get_recent_sub_comments(
-                        resource,
-                        root_id=root_id,
-                        stop_comment_ids=self._extract_known_reply_ids(
-                            previous_resource_state,
-                            root_id,
-                        ),
-                        max_pages=COMMENT_SUB_COMMENT_PAGE_LIMIT,
+            try:
+                for root_id in roots_to_fetch:
+                    comments.extend(
+                        await self._gateway.get_recent_sub_comments(
+                            resource,
+                            root_id=root_id,
+                            stop_comment_ids=self._extract_known_reply_ids(
+                                previous_resource_state,
+                                root_id,
+                            ),
+                            max_pages=COMMENT_SUB_COMMENT_PAGE_LIMIT,
+                        )
                     )
-                )
+            except Exception as exc:
+                resource_errors[resource.key] = exc
+                continue
 
             observed_comments: List[BilibiliCommentPost] = []
             seen_comment_ids = set()
@@ -1796,8 +1853,9 @@ class BilibiliMonitorService:
         return BilibiliCommentSnapshot(
             uid=uid,
             author_name=author_name,
-            comment_resources=comment_resources,
+            comment_resources=list(comment_resources),
             comment_posts=comment_posts,
+            resource_errors=resource_errors,
         )
 
     def plan_uid_deliveries(
@@ -1932,8 +1990,12 @@ class BilibiliMonitorService:
         deliveries: List[BilibiliPlannedNotification] = []
         resource_state_map = deepcopy(uid_state.get("comment_resources", {}))
         active_keys = {resource.key for resource in snapshot.comment_resources}
+        progress_states: Dict[str, Dict[str, Any]] = {}
+        pending_comments: List[tuple[BilibiliCommentResource, BilibiliCommentPost]] = []
 
         for resource in snapshot.comment_resources:
+            if resource.key not in snapshot.comment_posts:
+                continue
             state = resource_state_map.get(resource.key)
             observed_comments = list(snapshot.comment_posts.get(resource.key, []))
 
@@ -1945,36 +2007,43 @@ class BilibiliMonitorService:
                 continue
 
             known_ids = set(self._extract_known_comment_ids(state))
-            new_comments: List[BilibiliCommentPost] = []
             seen_new_ids = set()
             for comment_post in observed_comments:
                 if comment_post.id in known_ids or comment_post.id in seen_new_ids:
                     continue
                 seen_new_ids.add(comment_post.id)
-                new_comments.append(comment_post)
+                pending_comments.append((resource, comment_post))
+            progress_states[resource.key] = deepcopy(state)
 
-            resource_progress_state = deepcopy(state)
-            for comment_post in sorted(
-                new_comments, key=lambda item: (item.created_at, _safe_int(item.id))
-            ):
-                self._record_comment_post(resource_progress_state, comment_post)
-                if comment_post.author_uid not in config.target_uids:
-                    continue
-                comment_progress_state = deepcopy(uid_state)
-                comment_progress_state["comment_resources"] = deepcopy(resource_state_map)
-                comment_progress_state["comment_resources"][resource.key] = deepcopy(
-                    resource_progress_state
+        for resource, comment_post in sorted(
+            pending_comments,
+            key=lambda item: (item[1].created_at, _safe_int(item[1].id)),
+        ):
+            resource_progress_state = progress_states[resource.key]
+            self._record_comment_post(resource_progress_state, comment_post)
+            if comment_post.author_uid not in config.target_uids:
+                continue
+            comment_progress_state = deepcopy(uid_state)
+            comment_progress_state["comment_resources"] = deepcopy(resource_state_map)
+            comment_progress_state["comment_resources"].update(
+                {
+                    key: deepcopy(value)
+                    for key, value in progress_states.items()
+                }
+            )
+            deliveries.append(
+                BilibiliPlannedNotification(
+                    notification=self._build_comment_notification(
+                        resource, comment_post
+                    ),
+                    uid_state=comment_progress_state,
                 )
-                deliveries.append(
-                    BilibiliPlannedNotification(
-                        notification=self._build_comment_notification(
-                            resource, comment_post
-                        ),
-                        uid_state=deepcopy(comment_progress_state),
-                    )
-                )
+            )
 
-            resource_state_map[resource.key] = self._build_comment_resource_state(
+        for resource_key in progress_states:
+            state = resource_state_map.get(resource_key)
+            observed_comments = snapshot.comment_posts[resource_key]
+            resource_state_map[resource_key] = self._build_comment_resource_state(
                 observed_comments,
                 state,
             )
@@ -2064,6 +2133,22 @@ class BilibiliMonitorService:
             comments, key=lambda item: (item.created_at, _safe_int(item.id))
         ):
             self._record_comment_post(next_state, comment_post)
+        active_root_ids = self._normalize_recent_ids(
+            [
+                str(comment_post.root_id or comment_post.id)
+                for comment_post in comments
+                if str(comment_post.root_id or comment_post.id).strip()
+            ]
+        )[:COMMENT_ROOT_WINDOW_LIMIT]
+        roots = next_state.get("roots", {})
+        if not isinstance(roots, dict):
+            roots = {}
+        next_state["recent_root_ids"] = active_root_ids
+        next_state["roots"] = {
+            root_id: roots[root_id]
+            for root_id in active_root_ids
+            if root_id in roots
+        }
         return next_state
 
     def _build_comment_notification(

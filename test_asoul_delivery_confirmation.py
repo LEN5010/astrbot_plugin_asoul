@@ -5,6 +5,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from asoul_bilibili import (
+    BilibiliCommentResource,
     BilibiliCommentSnapshot,
     KV_BILIBILI_MONITOR_STATE,
     BilibiliNotification,
@@ -93,7 +94,9 @@ class FakeMonitor:
             final_state=state_2,
         )
 
-    async def fetch_comment_snapshot(self, config, uid, previous_state=None):
+    async def fetch_comment_snapshot(
+        self, uid, author_name, comment_resources, previous_state=None
+    ):
         self.fetch_calls.append(
             {
                 "uid": uid,
@@ -103,7 +106,9 @@ class FakeMonitor:
         )
         return BilibiliCommentSnapshot(
             uid=uid,
-            author_name="测试账号",
+            author_name=author_name,
+            comment_resources=list(comment_resources),
+            comment_posts={resource.key: [] for resource in comment_resources},
         )
 
     def plan_comment_deliveries(self, config, previous_state, snapshot):
@@ -193,6 +198,21 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
             },
         )
         plugin._bilibili_runtime.monitor = FakeMonitor(self.main)
+        resource = BilibiliCommentResource(
+            key="video:2003",
+            owner_uid="100",
+            owner_name="测试账号",
+            resource_kind="video",
+            oid=2003,
+            type_value=1,
+            title="第三个视频",
+            url="https://www.bilibili.com/video/BV3",
+        )
+
+        async def load_catalog(uid: str, author_name: str):
+            return "测试账号", [resource]
+
+        plugin._bilibili_runtime.ensure_comment_resource_catalog = load_catalog
         return plugin
 
     def test_single_target_confirms_only_after_each_successful_send(self) -> None:

@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
@@ -7,7 +8,12 @@ from test_asoul_push_targets import _install_astrbot_stubs, _load_main_module
 
 _install_astrbot_stubs()
 
-from asoul_bilibili_runtime import COMMENT_POLL_STATE_KEY, BilibiliRuntime
+from asoul_bilibili import BilibiliGateway
+from asoul_bilibili_runtime import (
+    COMMENT_POLL_STATE_KEY,
+    COMMENT_RESOURCE_CATALOGS_KEY,
+    BilibiliRuntime,
+)
 
 
 NOW_TS = 1_700_000_000
@@ -129,33 +135,48 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
             before_target_state,
         )
 
-    def test_status_text_reports_comment_runtime_state(self) -> None:
+    def test_failed_resource_discovery_preserves_persisted_catalog(self) -> None:
         _, runtime = self._new_runtime()
-        runtime._runtime_initialized = True
         runtime.monitor_state = {
             "targets": {},
             "bootstrap_uids": {},
-            COMMENT_POLL_STATE_KEY: {
+            COMMENT_POLL_STATE_KEY: {},
+            COMMENT_RESOURCE_CATALOGS_KEY: {
                 "100": {
-                    "last_attempt_at": NOW_TS,
-                    "last_success_at": 0,
-                    "last_result": "error",
-                    "last_error": {
-                        "at": NOW_TS,
-                        "category": "risk_control",
-                        "code": "412",
-                        "message": "请求被 B 站风控拒绝",
-                    }
+                    "last_attempt_at": NOW_TS - 601,
+                    "last_success_at": NOW_TS - 700,
+                    "author_name": "测试账号",
+                    "resources": [
+                        {
+                            "key": "video:2003",
+                            "owner_uid": "100",
+                            "owner_name": "测试账号",
+                            "resource_kind": "video",
+                            "oid": 2003,
+                            "type_value": 1,
+                            "title": "第三个视频",
+                            "url": "https://www.bilibili.com/video/BV3",
+                        }
+                    ],
                 }
             },
         }
 
-        text = asyncio.run(runtime.build_bilibili_status_text())
+        async def fail_discovery(uid: str, author_name: str):
+            raise FakeRiskControlError()
 
-        self.assertIn("【B站评论推送状态】", text)
-        self.assertIn("UID 100", text)
-        self.assertIn("risk_control/412", text)
-        self.assertIn("请求被 B 站风控拒绝", text)
+        runtime.monitor.discover_comment_resources = fail_discovery
+        with patch("asoul_bilibili_runtime.time.time", return_value=NOW_TS):
+            author_name, resources = asyncio.run(
+                runtime.ensure_comment_resource_catalog("100", "测试账号")
+            )
+
+        self.assertEqual(author_name, "测试账号")
+        self.assertEqual([resource.key for resource in resources], ["video:2003"])
+        entry = runtime.monitor_state[COMMENT_RESOURCE_CATALOGS_KEY]["100"]
+        self.assertEqual(entry["last_attempt_at"], NOW_TS)
+        self.assertEqual(entry["last_success_at"], NOW_TS - 700)
+        self.assertEqual(entry["resources"][0]["key"], "video:2003")
 
     def test_update_and_comment_poll_for_same_uid_do_not_overlap(self) -> None:
         _, runtime = self._new_runtime()
@@ -182,21 +203,26 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
 
         self.assertEqual(max_active, 1)
 
-    def test_bili_status_command_is_thin_runtime_wrapper(self) -> None:
-        plugin, _ = self._new_runtime()
+    def test_comment_gateway_spaces_all_monitor_requests(self) -> None:
+        gateway = BilibiliGateway(comment_request_interval_seconds=2.0)
+        calls: list[str] = []
+        sleeps: list[float] = []
 
-        class Event:
-            @staticmethod
-            def plain_result(text: str) -> str:
-                return text
+        async def fake_get_user_name(uid: str) -> str:
+            calls.append(uid)
+            return "测试账号"
 
-        async def collect_results() -> list[str]:
-            return [item async for item in plugin.bili_status(Event())]
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
 
-        results = asyncio.run(collect_results())
+        gateway.get_user_name = fake_get_user_name
+        gateway._next_comment_request_at = time.monotonic() + 2.0
+        with patch("asoul_bilibili.asyncio.sleep", new=fake_sleep):
+            asyncio.run(gateway.get_comment_resource_owner_name("100"))
 
-        self.assertEqual(len(results), 1)
-        self.assertIn("【B站评论推送状态】", results[0])
+        self.assertEqual(calls, ["100"])
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 1.9)
 
 
 if __name__ == "__main__":
