@@ -4,10 +4,12 @@ from pathlib import Path
 from typing import List, Tuple
 from zoneinfo import ZoneInfo
 
-CALENDAR_URL = "https://asoul.love/calendar.ics"
-CALENDAR_TTL = timedelta(minutes=10)
-DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 PLUGIN_DIR = Path(__file__).resolve().parent
+CALENDAR_URL = "https://asoul.love/calendar.ics"
+CALENDAR_USER_AGENT = "asasfans"
+CALENDAR_TTL = timedelta(minutes=30)
+CALENDAR_CACHE_PATH = PLUGIN_DIR / "temp" / "calendar_cache.json"
+DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 
 TODAY_TRIGGER_TEXTS = {"今日直播"}
 TOMORROW_TRIGGER_TEXTS = {"明日直播"}

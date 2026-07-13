@@ -5,6 +5,12 @@
     "default": false,
     "hint": "关闭时不会启动动态/视频/直播轮询任务。"
   },
+  "calendar_cache_minutes": {
+    "description": "直播日历缓存时间（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "用于限制 calendar.ics 请求频率。小于 10 会按 10 处理；建议保持 30 或更高。"
+  },
   "poll_interval_seconds": {
     "description": "轮询间隔（秒）",
     "type": "int",

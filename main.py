@@ -45,6 +45,22 @@ from asoul_schedule import ScheduleService
 MIN_AT_ALL_REMAINING = 1
 QR_CODE_PATH = Path(__file__).resolve().parent / "temp" / "bilibili_login_qrcode.png"
 DEBUG_PAYLOAD_DIR = Path(__file__).resolve().parent / "temp" / "debug_payloads"
+DEFAULT_CALENDAR_CACHE_MINUTES = 30
+MIN_CALENDAR_CACHE_MINUTES = 10
+
+
+def _build_calendar_cache_ttl(config: Any) -> timedelta:
+    raw_minutes: Any = DEFAULT_CALENDAR_CACHE_MINUTES
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        raw_minutes = getter("calendar_cache_minutes", DEFAULT_CALENDAR_CACHE_MINUTES)
+
+    try:
+        minutes = int(raw_minutes)
+    except (TypeError, ValueError):
+        minutes = DEFAULT_CALENDAR_CACHE_MINUTES
+
+    return timedelta(minutes=max(MIN_CALENDAR_CACHE_MINUTES, minutes))
 
 
 @dataclass(frozen=True)
@@ -71,7 +87,9 @@ class ASoulPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config or {}
-        self._calendar_repository = CalendarRepository()
+        self._calendar_repository = CalendarRepository(
+            cache_ttl=_build_calendar_cache_ttl(self.config)
+        )
         self._schedule_service = ScheduleService()
         self._image_renderer = ScheduleImageRenderer()
         self._bilibili_config = build_bilibili_push_config(self.config)

@@ -1,14 +1,19 @@
 import asyncio
+import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib import request
+from urllib import error, request
 from zoneinfo import ZoneInfo
 
 from asoul_core import (
+    CALENDAR_CACHE_PATH,
     CALENDAR_TTL,
     CALENDAR_URL,
+    CALENDAR_USER_AGENT,
     DISPLAY_TZ,
     LIVE_KEYWORDS,
     NON_LIVE_KEYWORDS,
@@ -18,20 +23,36 @@ from asoul_core import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _CalendarDownloadResult:
+    text: Optional[str]
+    etag: str = ""
+    last_modified: str = ""
+    not_modified: bool = False
+
+
 class CalendarRepository:
     def __init__(
         self,
         calendar_url: str = CALENDAR_URL,
         cache_ttl: timedelta = CALENDAR_TTL,
         display_tz: ZoneInfo = DISPLAY_TZ,
-        user_agent: str = "astrbot-plugin-asoul/1.1.0",
+        user_agent: str = CALENDAR_USER_AGENT,
+        cache_path: Optional[Path] = CALENDAR_CACHE_PATH,
+        failure_retry_delay: timedelta = timedelta(minutes=5),
     ) -> None:
         self._calendar_url = calendar_url
         self._cache_ttl = cache_ttl
         self._display_tz = display_tz
         self._user_agent = user_agent
+        self._cache_path = Path(cache_path) if cache_path is not None else None
+        self._failure_retry_delay = failure_retry_delay
         self._calendar_cache: List[CalendarEvent] = []
+        self._calendar_cache_text = ""
         self._calendar_cache_expires_at = datetime.min.replace(tzinfo=timezone.utc)
+        self._calendar_etag = ""
+        self._calendar_last_modified = ""
+        self._disk_cache_loaded = False
         self._calendar_lock = asyncio.Lock()
 
     async def get_live_events_for_day(self, target_day: date) -> List[CalendarEvent]:
@@ -69,26 +90,72 @@ class CalendarRepository:
 
     async def _load_calendar_events(self) -> List[CalendarEvent]:
         now = datetime.now(timezone.utc)
-        if now < self._calendar_cache_expires_at and self._calendar_cache:
+        if now < self._calendar_cache_expires_at and self._calendar_cache_text:
             return list(self._calendar_cache)
 
         async with self._calendar_lock:
             now = datetime.now(timezone.utc)
-            if now < self._calendar_cache_expires_at and self._calendar_cache:
+            if now < self._calendar_cache_expires_at and self._calendar_cache_text:
                 return list(self._calendar_cache)
 
+            if not self._disk_cache_loaded:
+                self._load_disk_cache()
+                now = datetime.now(timezone.utc)
+                if now < self._calendar_cache_expires_at and self._calendar_cache_text:
+                    return list(self._calendar_cache)
+
             try:
-                text = await asyncio.to_thread(self._download_calendar_text)
+                result = await asyncio.to_thread(self._download_calendar)
+                now = datetime.now(timezone.utc)
+                expires_at = now + self._cache_ttl
+                if result.not_modified:
+                    if not self._calendar_cache_text:
+                        raise RuntimeError("日历服务返回 304，但本地没有可用缓存")
+                    self._calendar_cache_expires_at = expires_at
+                    self._disk_cache_loaded = True
+                    self._write_disk_cache_safely(now, expires_at)
+                    return list(self._calendar_cache)
+
+                text = result.text or ""
                 events = self._parse_calendar(text)
             except Exception:
-                if self._calendar_cache:
+                if self._calendar_cache_text:
                     logger.warning("直播日历刷新失败，继续使用缓存数据")
+                    self._calendar_cache_expires_at = (
+                        datetime.now(timezone.utc) + self._failure_retry_delay
+                    )
                     return list(self._calendar_cache)
                 raise
 
             self._calendar_cache = events
-            self._calendar_cache_expires_at = now + self._cache_ttl
+            self._calendar_cache_text = text
+            self._calendar_cache_expires_at = expires_at
+            self._calendar_etag = result.etag
+            self._calendar_last_modified = result.last_modified
+            self._disk_cache_loaded = True
+            self._write_disk_cache_safely(now, expires_at)
             return list(events)
+
+    def _download_calendar(self) -> _CalendarDownloadResult:
+        headers = {"User-Agent": self._user_agent}
+        if self._calendar_etag:
+            headers["If-None-Match"] = self._calendar_etag
+        if self._calendar_last_modified:
+            headers["If-Modified-Since"] = self._calendar_last_modified
+
+        req = request.Request(self._calendar_url, headers=headers)
+        try:
+            with request.urlopen(req, timeout=10) as resp:
+                charset = resp.headers.get_content_charset() or "utf-8"
+                return _CalendarDownloadResult(
+                    text=resp.read().decode(charset, errors="replace"),
+                    etag=str(resp.headers.get("ETag") or ""),
+                    last_modified=str(resp.headers.get("Last-Modified") or ""),
+                )
+        except error.HTTPError as exc:
+            if exc.code == 304:
+                return _CalendarDownloadResult(text=None, not_modified=True)
+            raise
 
     def _download_calendar_text(self) -> str:
         req = request.Request(
@@ -98,6 +165,72 @@ class CalendarRepository:
         with request.urlopen(req, timeout=10) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
             return resp.read().decode(charset, errors="replace")
+
+    def _load_disk_cache(self) -> None:
+        self._disk_cache_loaded = True
+        if self._cache_path is None:
+            return
+
+        try:
+            raw = json.loads(self._cache_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.warning("读取直播日历磁盘缓存失败，将重新请求日历", exc_info=True)
+            return
+
+        if not isinstance(raw, dict):
+            return
+        text = raw.get("text")
+        if not isinstance(text, str) or not text:
+            return
+
+        try:
+            events = self._parse_calendar(text)
+        except Exception:
+            logger.warning("解析直播日历磁盘缓存失败，将重新请求日历", exc_info=True)
+            return
+
+        self._calendar_cache = events
+        self._calendar_cache_text = text
+        self._calendar_cache_expires_at = self._parse_cache_datetime(raw.get("expires_at"))
+        self._calendar_etag = str(raw.get("etag") or "")
+        self._calendar_last_modified = str(raw.get("last_modified") or "")
+
+    def _write_disk_cache_safely(self, fetched_at: datetime, expires_at: datetime) -> None:
+        if self._cache_path is None or not self._calendar_cache_text:
+            return
+
+        payload = {
+            "fetched_at": fetched_at.astimezone(timezone.utc).isoformat(),
+            "expires_at": expires_at.astimezone(timezone.utc).isoformat(),
+            "etag": self._calendar_etag,
+            "last_modified": self._calendar_last_modified,
+            "text": self._calendar_cache_text,
+        }
+
+        try:
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self._cache_path.with_suffix(self._cache_path.suffix + ".tmp")
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temp_path.replace(self._cache_path)
+        except Exception:
+            logger.warning("写入直播日历磁盘缓存失败", exc_info=True)
+
+    @staticmethod
+    def _parse_cache_datetime(value: object) -> datetime:
+        if not isinstance(value, str) or not value:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def _parse_calendar(self, text: str) -> List[CalendarEvent]:
         events: List[CalendarEvent] = []

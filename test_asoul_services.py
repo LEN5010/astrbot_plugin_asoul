@@ -1,24 +1,26 @@
 import asyncio
+import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
-from asoul_calendar import CalendarRepository
-from asoul_core import DISPLAY_TZ, CalendarEvent
+from asoul_calendar import CalendarRepository, _CalendarDownloadResult
+from asoul_core import CALENDAR_USER_AGENT, DISPLAY_TZ, CalendarEvent
 from asoul_schedule import ScheduleService
 
 
 class CalendarRepositoryTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.repository = CalendarRepository()
+        self.repository = CalendarRepository(cache_path=None)
 
-    def test_parse_calendar_decodes_multiline_event(self) -> None:
-        ics_text = "\n".join(
+    def _sample_ics(self, summary: str = "嘉然直播：晚间歌会") -> str:
+        return "\n".join(
             [
                 "BEGIN:VCALENDAR",
                 "BEGIN:VEVENT",
                 "DTSTART;TZID=Asia/Shanghai:20260330T200000",
                 "DTEND;TZID=Asia/Shanghai:20260330T213000",
-                "SUMMARY:嘉然直播：晚间歌会",
+                f"SUMMARY:{summary}",
                 "DESCRIPTION:嘉然 | 嘉然\\n唱歌专场",
                 "LOCATION:B站直播间",
                 "CATEGORIES:歌会",
@@ -29,6 +31,9 @@ class CalendarRepositoryTest(unittest.TestCase):
             ]
         )
 
+    def test_parse_calendar_decodes_multiline_event(self) -> None:
+        ics_text = self._sample_ics()
+
         events = self.repository._parse_calendar(ics_text)
 
         self.assertEqual(len(events), 1)
@@ -37,6 +42,109 @@ class CalendarRepositoryTest(unittest.TestCase):
         self.assertEqual(event.description, "嘉然 | 嘉然\n唱歌专场")
         self.assertEqual(event.start, datetime(2026, 3, 30, 20, 0, tzinfo=DISPLAY_TZ))
         self.assertTrue(self.repository._is_livestream_event(event))
+
+    def test_load_calendar_uses_memory_cache_with_asasfans_ua(self) -> None:
+        repository = CalendarRepository(cache_path=None)
+        calls = []
+
+        def fake_download():
+            calls.append(True)
+            return _CalendarDownloadResult(
+                text=self._sample_ics(),
+                etag='"v1"',
+                last_modified="Mon, 30 Mar 2026 12:00:00 GMT",
+            )
+
+        repository._download_calendar = fake_download
+
+        first_events = asyncio.run(repository._load_calendar_events())
+        second_events = asyncio.run(repository._load_calendar_events())
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([event.summary for event in first_events], ["嘉然直播：晚间歌会"])
+        self.assertEqual([event.summary for event in second_events], ["嘉然直播：晚间歌会"])
+        self.assertEqual(repository._user_agent, CALENDAR_USER_AGENT)
+
+    def test_expired_calendar_cache_reuses_body_on_not_modified_response(self) -> None:
+        repository = CalendarRepository(cache_path=None)
+        calls = []
+        responses = [
+            _CalendarDownloadResult(
+                text=self._sample_ics(),
+                etag='"v1"',
+                last_modified="Mon, 30 Mar 2026 12:00:00 GMT",
+            ),
+            _CalendarDownloadResult(text=None, not_modified=True),
+        ]
+
+        def fake_download():
+            calls.append((repository._calendar_etag, repository._calendar_last_modified))
+            return responses.pop(0)
+
+        repository._download_calendar = fake_download
+
+        asyncio.run(repository._load_calendar_events())
+        repository._calendar_cache_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        events = asyncio.run(repository._load_calendar_events())
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], ('"v1"', "Mon, 30 Mar 2026 12:00:00 GMT"))
+        self.assertEqual([event.summary for event in events], ["嘉然直播：晚间歌会"])
+        self.assertGreater(repository._calendar_cache_expires_at, datetime.now(timezone.utc))
+
+    def test_refresh_failure_uses_stale_cache_and_backs_off(self) -> None:
+        repository = CalendarRepository(
+            cache_ttl=timedelta(seconds=0),
+            cache_path=None,
+            failure_retry_delay=timedelta(minutes=5),
+        )
+        call_count = 0
+
+        def fake_download():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _CalendarDownloadResult(text=self._sample_ics())
+            raise RuntimeError("calendar source unavailable")
+
+        repository._download_calendar = fake_download
+
+        asyncio.run(repository._load_calendar_events())
+        stale_events = asyncio.run(repository._load_calendar_events())
+        backed_off_events = asyncio.run(repository._load_calendar_events())
+
+        self.assertEqual(call_count, 2)
+        self.assertEqual([event.summary for event in stale_events], ["嘉然直播：晚间歌会"])
+        self.assertEqual([event.summary for event in backed_off_events], ["嘉然直播：晚间歌会"])
+
+    def test_fresh_disk_cache_is_used_after_repository_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "calendar_cache.json"
+            first_repository = CalendarRepository(cache_path=cache_path)
+
+            def fake_download():
+                return _CalendarDownloadResult(
+                    text=self._sample_ics("磁盘缓存直播"),
+                    etag='"v1"',
+                    last_modified="Mon, 30 Mar 2026 12:00:00 GMT",
+                )
+
+            first_repository._download_calendar = fake_download
+            asyncio.run(first_repository._load_calendar_events())
+
+            second_repository = CalendarRepository(cache_path=cache_path)
+            download_called = False
+
+            def unexpected_download():
+                nonlocal download_called
+                download_called = True
+                raise AssertionError("fresh disk cache should avoid source request")
+
+            second_repository._download_calendar = unexpected_download
+            events = asyncio.run(second_repository._load_calendar_events())
+
+            self.assertFalse(download_called)
+            self.assertEqual([event.summary for event in events], ["磁盘缓存直播"])
 
     def test_is_same_day_handles_cross_day_event(self) -> None:
         event = CalendarEvent(
