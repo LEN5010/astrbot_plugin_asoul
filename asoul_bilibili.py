@@ -29,6 +29,7 @@ COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS = 600
 COMMENT_REQUEST_INTERVAL_SECONDS = 2.0
 CONTENT_RECENT_IDS_LIMIT = 20
 RECENT_NOTIFICATION_WINDOW_SECONDS = 5 * 60
+DYNAMIC_FORWARD_SEPARATOR = "┈" * 24
 BILIBILI_CREDENTIAL_FIELDS = (
     "sessdata",
     "bili_jct",
@@ -1195,8 +1196,8 @@ class BilibiliGateway:
         if not combined:
             return ""
         if author_name:
-            return f"转发自 {author_name}\n{combined}"
-        return f"转发内容\n{combined}"
+            return f"{DYNAMIC_FORWARD_SEPARATOR}\n转发自 {author_name}\n{combined}"
+        return f"{DYNAMIC_FORWARD_SEPARATOR}\n转发内容\n{combined}"
 
     @staticmethod
     def _append_unique_line(lines: List[str], raw_value: Any) -> None:

@@ -1106,6 +1106,7 @@ class BilibiliParsingTest(unittest.TestCase):
 
         self.assertIsNotNone(post)
         assert post is not None
+        self.assertIn("┈" * 24 + "\n转发自 A-SOUL_Official", post.text)
         self.assertIn("转发自 A-SOUL_Official", post.text)
         self.assertIn("Hello小伙伴们大家好", post.text)
         self.assertIn("https://i0.hdslb.com/forward-preview.jpg", post.image_urls)
