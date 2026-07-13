@@ -8,8 +8,14 @@
   "poll_interval_seconds": {
     "description": "轮询间隔（秒）",
     "type": "int",
-    "default": 60,
-    "hint": "建议不要过低，避免请求过快触发风控。最小按 30 秒处理。"
+    "default": 300,
+    "hint": "按 UID 错峰轮询的基础间隔。建议保持 300 秒或更高；最小按 60 秒处理。"
+  },
+  "task_gap_seconds": {
+    "description": "UID 轮询错峰间隔（秒）",
+    "type": "float",
+    "default": 20,
+    "hint": "相邻两个 UID 任务之间的最小间隔，用于平滑请求峰值。"
   },
   "request_client": {
     "description": "B 站请求客户端",
@@ -96,9 +102,9 @@
     "default": true
   },
   "push_comment": {
-    "description": "播报最近资源下的目标评论",
+    "description": "启动评论抓取",
     "type": "bool",
-    "default": true,
-    "hint": "轮询默认 UID 集合最近动态/视频下的新评论，覆盖互相串台和回复评论场景。"
+    "default": false,
+    "hint": "开启后会轮询最近动态/视频下的新评论，较容易触发风控；默认关闭。"
   }
 }
