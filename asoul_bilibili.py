@@ -1621,51 +1621,6 @@ class BilibiliMonitorService:
             final_state=uid_state,
         )
 
-    async def poll(
-        self,
-        config: BilibiliPushConfig,
-        state: Optional[Dict[str, Any]],
-    ) -> tuple[Dict[str, Any], List[BilibiliNotification]]:
-        new_state = deepcopy(state or {})
-        notifications: List[BilibiliNotification] = []
-
-        for uid in config.target_uids:
-            new_state, uid_notifications = await self.poll_uid(
-                config=config,
-                state=new_state,
-                uid=uid,
-            )
-            notifications.extend(uid_notifications)
-
-        return new_state, notifications
-
-    async def poll_uid(
-        self,
-        config: BilibiliPushConfig,
-        state: Optional[Dict[str, Any]],
-        uid: str,
-    ) -> tuple[Dict[str, Any], List[BilibiliNotification]]:
-        new_state = deepcopy(state or {})
-        uid_state_map = new_state.setdefault("uids", {})
-        previous_uid_state = uid_state_map.get(uid, {})
-        try:
-            snapshot = await self.fetch_uid_snapshot(
-                config=config,
-                uid=uid,
-                previous_state=previous_uid_state,
-            )
-            plan = self.plan_uid_deliveries(
-                config=config,
-                previous_state=previous_uid_state,
-                snapshot=snapshot,
-            )
-        except Exception:
-            logger.exception("轮询 B 站 UID %s 失败", uid)
-            return new_state, []
-
-        uid_state_map[uid] = plan.final_state
-        return new_state, [delivery.notification for delivery in plan.deliveries]
-
     def _build_comment_resources(
         self,
         owner_uid: str,

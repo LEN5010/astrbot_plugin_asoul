@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import types
 import unittest
@@ -233,9 +234,26 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             credential_data={"sessdata": "test"},
         )
 
+    async def _poll_uid(self, state):
+        new_state = copy.deepcopy(state or {})
+        uid_state_map = new_state.setdefault("uids", {})
+        previous_uid_state = uid_state_map.get("100", {})
+        snapshot = await self.service.fetch_uid_snapshot(
+            config=self.config,
+            uid="100",
+            previous_state=previous_uid_state,
+        )
+        plan = self.service.plan_uid_deliveries(
+            config=self.config,
+            previous_state=previous_uid_state,
+            snapshot=snapshot,
+        )
+        uid_state_map["100"] = plan.final_state
+        return new_state, [delivery.notification for delivery in plan.deliveries]
+
     def test_first_poll_only_initializes_state(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            state, notifications = asyncio.run(self.service.poll(self.config, {}))
+            state, notifications = asyncio.run(self._poll_uid({}))
 
         self.assertEqual(notifications, [])
         self.assertEqual(state["uids"]["100"]["last_dynamic_id"], "dyn-3")
@@ -243,7 +261,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
     def test_second_poll_sends_all_unseen_dynamic_and_video_updates(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
+            initial_state, _ = asyncio.run(self._poll_uid({}))
 
         self.gateway.dynamic_posts["100"] = [
             BilibiliDynamicPost(
@@ -270,7 +288,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             *self.gateway.dynamic_posts["100"],
         ]
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            updated_state, notifications = asyncio.run(self.service.poll(self.config, initial_state))
+            updated_state, notifications = asyncio.run(self._poll_uid(initial_state))
 
         self.assertEqual([item.kind for item in notifications], ["dynamic", "video"])
         self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-video-4")
@@ -288,7 +306,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         }
 
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            updated_state, notifications = asyncio.run(self.service.poll(self.config, stale_state))
+            updated_state, notifications = asyncio.run(self._poll_uid(stale_state))
 
         self.assertEqual(notifications, [])
         self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-3")
@@ -330,7 +348,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         }
 
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            updated_state, notifications = asyncio.run(self.service.poll(self.config, stale_state))
+            updated_state, notifications = asyncio.run(self._poll_uid(stale_state))
 
         self.assertEqual([item.kind for item in notifications], ["dynamic", "video"])
         self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-video-4")
@@ -350,7 +368,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
             updated_state, notifications = asyncio.run(
-                self.service.poll(self.config, persisted_state)
+                self._poll_uid(persisted_state)
             )
 
         self.assertEqual(notifications, [])
@@ -390,14 +408,14 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         }
 
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            updated_state, notifications = asyncio.run(self.service.poll(self.config, stale_state))
+            updated_state, notifications = asyncio.run(self._poll_uid(stale_state))
 
         self.assertEqual(notifications, [])
         self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-video-4")
 
     def test_live_notification_only_on_transition_to_live(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
+            initial_state, _ = asyncio.run(self._poll_uid({}))
 
         self.gateway.dynamic_posts["100"].insert(
             0,
@@ -418,20 +436,20 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             url="https://live.bilibili.com/123",
         )
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            updated_state, notifications = asyncio.run(self.service.poll(self.config, initial_state))
+            updated_state, notifications = asyncio.run(self._poll_uid(initial_state))
 
         self.assertEqual(len(notifications), 1)
         self.assertEqual(notifications[0].kind, "live")
         self.assertTrue(updated_state["uids"]["100"]["last_live_active"])
 
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            repeated_state, repeated_notifications = asyncio.run(self.service.poll(self.config, updated_state))
+            repeated_state, repeated_notifications = asyncio.run(self._poll_uid(updated_state))
         self.assertEqual(repeated_notifications, [])
         self.assertTrue(repeated_state["uids"]["100"]["last_live_active"])
 
     def test_comment_notification_only_for_new_target_comments(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            initial_state, notifications = asyncio.run(self.service.poll(self.config, {}))
+            initial_state, notifications = asyncio.run(self._poll_uid({}))
 
         self.assertEqual(notifications, [])
 
@@ -448,7 +466,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         )
 
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            updated_state, updated_notifications = asyncio.run(self.service.poll(self.config, initial_state))
+            updated_state, updated_notifications = asyncio.run(self._poll_uid(initial_state))
 
         self.assertEqual(len(updated_notifications), 1)
         self.assertEqual(updated_notifications[0].kind, "comment")
@@ -517,7 +535,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
     def test_second_poll_delivers_two_reserve_dynamics_in_order(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            initial_state, _ = asyncio.run(self.service.poll(self.config, {}))
+            initial_state, _ = asyncio.run(self._poll_uid({}))
 
         self.gateway.dynamic_posts["100"] = [
             BilibiliDynamicPost(
@@ -542,7 +560,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         ]
 
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
-            updated_state, notifications = asyncio.run(self.service.poll(self.config, initial_state))
+            updated_state, notifications = asyncio.run(self._poll_uid(initial_state))
 
         self.assertEqual(
             [notification.url for notification in notifications if notification.kind == "dynamic"],

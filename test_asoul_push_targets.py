@@ -5,6 +5,8 @@ import types
 import unittest
 from pathlib import Path
 
+from asoul_bilibili import BilibiliNotification, KV_BILIBILI_GROUP_ORIGINS
+
 
 def _install_astrbot_stubs() -> None:
     if "astrbot.api.star" in sys.modules:
@@ -156,7 +158,7 @@ class ASoulPushTargetTest(unittest.TestCase):
             )
         )
 
-        targets = plugin._get_active_push_targets()
+        targets = plugin._bilibili_runtime.get_active_push_targets()
 
         self.assertEqual(
             sorted(target.group_id for target in targets),
@@ -181,12 +183,12 @@ class ASoulPushTargetTest(unittest.TestCase):
             )
         )
 
-        targets = plugin._get_active_push_targets()
+        targets = plugin._bilibili_runtime.get_active_push_targets()
 
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0].group_id, "100")
         self.assertEqual(targets[0].unified_msg_origin, "aiocqhttp:GroupMessage:100_new")
-        self.assertNotIn("aiocqhttp:GroupMessage:100_old", plugin._bilibili_push_targets)
+        self.assertNotIn("aiocqhttp:GroupMessage:100_old", plugin._bilibili_runtime.push_targets)
 
     def test_runtime_config_refresh_accepts_new_whitelist_group_without_restart(self) -> None:
         plugin = self._new_plugin(["100"])
@@ -204,7 +206,7 @@ class ASoulPushTargetTest(unittest.TestCase):
             )
         )
 
-        targets = plugin._get_active_push_targets()
+        targets = plugin._bilibili_runtime.get_active_push_targets()
 
         self.assertEqual(
             sorted(target.group_id for target in targets),
@@ -213,25 +215,25 @@ class ASoulPushTargetTest(unittest.TestCase):
 
     def test_load_runtime_state_normalizes_legacy_group_origin_mapping(self) -> None:
         plugin = self._new_plugin(["100", "200"])
-        plugin._kv_store[self.main.KV_BILIBILI_GROUP_ORIGINS] = {
+        plugin._kv_store[KV_BILIBILI_GROUP_ORIGINS] = {
             "100": "aiocqhttp:GroupMessage:100",
             "200": "aiocqhttp:GroupMessage:200",
         }
 
-        asyncio.run(plugin._load_bilibili_runtime_state())
+        asyncio.run(plugin._bilibili_runtime.load_state())
 
-        targets = plugin._get_active_push_targets()
+        targets = plugin._bilibili_runtime.get_active_push_targets()
 
         self.assertEqual(
             sorted(target.group_id for target in targets),
             ["100", "200"],
         )
-        self.assertIn("aiocqhttp:GroupMessage:100", plugin._bilibili_push_targets)
-        self.assertIn("aiocqhttp:GroupMessage:200", plugin._bilibili_push_targets)
+        self.assertIn("aiocqhttp:GroupMessage:100", plugin._bilibili_runtime.push_targets)
+        self.assertIn("aiocqhttp:GroupMessage:200", plugin._bilibili_runtime.push_targets)
 
     def test_comment_notification_parts_render_new_format_with_images(self) -> None:
         plugin = self._new_plugin(["100"])
-        notification = self.main.BilibiliNotification(
+        notification = BilibiliNotification(
             kind="comment",
             uid="672328094",
             author_name="乃琳Queen",
@@ -246,7 +248,7 @@ class ASoulPushTargetTest(unittest.TestCase):
             comment_action_text="发表了评论",
         )
 
-        parts = plugin._build_notification_parts(notification)
+        parts = plugin._bilibili_runtime.build_notification_parts(notification)
 
         self.assertEqual(parts[0][0], "plain")
         self.assertIn("【B站评论】乃琳Queen", parts[0][1])

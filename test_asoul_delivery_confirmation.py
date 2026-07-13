@@ -3,6 +3,8 @@ import copy
 import unittest
 
 from asoul_bilibili import (
+    KV_BILIBILI_MONITOR_STATE,
+    BilibiliNotification,
     BilibiliPlannedNotification,
     BilibiliUidDeliveryPlan,
     BilibiliUidSnapshot,
@@ -61,7 +63,7 @@ class FakeMonitor:
         }
         deliveries = [
             BilibiliPlannedNotification(
-                notification=self.main.BilibiliNotification(
+                notification=BilibiliNotification(
                     kind="dynamic",
                     uid=snapshot.uid,
                     author_name=snapshot.author_name,
@@ -72,7 +74,7 @@ class FakeMonitor:
                 uid_state=state_1,
             ),
             BilibiliPlannedNotification(
-                notification=self.main.BilibiliNotification(
+                notification=BilibiliNotification(
                     kind="dynamic",
                     uid=snapshot.uid,
                     author_name=snapshot.author_name,
@@ -102,7 +104,7 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
                 "target_uids": ["100"],
             },
         )
-        plugin._bilibili_monitor = FakeMonitor(self.main)
+        plugin._bilibili_runtime.monitor = FakeMonitor(self.main)
         return plugin
 
     def test_single_target_confirms_only_after_each_successful_send(self) -> None:
@@ -110,7 +112,7 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         origin = "aiocqhttp:GroupMessage:100"
         context.fail_rules[(origin, 2)] = RuntimeError("second send failed")
         plugin = self._new_plugin(context, ["100"])
-        plugin._bilibili_push_targets = {
+        plugin._bilibili_runtime.push_targets = {
             origin: {
                 "group_id": "100",
                 "platform_name": "aiocqhttp",
@@ -118,9 +120,9 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
             }
         }
 
-        asyncio.run(plugin._poll_bilibili_updates_for_uid("100"))
+        asyncio.run(plugin._bilibili_runtime.poll_bilibili_updates_for_uid("100"))
 
-        target_state = plugin._bilibili_monitor_state["targets"][origin]["uids"]["100"]
+        target_state = plugin._bilibili_runtime.monitor_state["targets"][origin]["uids"]["100"]
         self.assertEqual(target_state["last_dynamic_id"], "dyn-1")
         self.assertEqual(target_state["recent_dynamic_ids"], ["dyn-1"])
 
@@ -130,7 +132,7 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         origin_fail = "aiocqhttp:GroupMessage:200"
         context.fail_rules[(origin_fail, 1)] = RuntimeError("group send failed")
         plugin = self._new_plugin(context, ["100", "200"])
-        plugin._bilibili_push_targets = {
+        plugin._bilibili_runtime.push_targets = {
             origin_ok: {
                 "group_id": "100",
                 "platform_name": "aiocqhttp",
@@ -143,10 +145,10 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
             },
         }
 
-        asyncio.run(plugin._poll_bilibili_updates_for_uid("100"))
+        asyncio.run(plugin._bilibili_runtime.poll_bilibili_updates_for_uid("100"))
 
-        ok_state = plugin._bilibili_monitor_state["targets"][origin_ok]["uids"]["100"]
-        fail_state = plugin._bilibili_monitor_state["targets"][origin_fail]["uids"].get("100", {})
+        ok_state = plugin._bilibili_runtime.monitor_state["targets"][origin_ok]["uids"]["100"]
+        fail_state = plugin._bilibili_runtime.monitor_state["targets"][origin_fail]["uids"].get("100", {})
         self.assertEqual(ok_state["last_dynamic_id"], "dyn-2")
         self.assertEqual(fail_state, {})
 
@@ -154,17 +156,17 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         context = RecordingContext()
         plugin = self._new_plugin(context, ["999"])
 
-        asyncio.run(plugin._poll_bilibili_updates_for_uid("100"))
+        asyncio.run(plugin._bilibili_runtime.poll_bilibili_updates_for_uid("100"))
 
-        self.assertEqual(plugin._bilibili_monitor.fetch_calls, [])
-        self.assertEqual(plugin._bilibili_monitor_state, {})
+        self.assertEqual(plugin._bilibili_runtime.monitor.fetch_calls, [])
+        self.assertEqual(plugin._bilibili_runtime.monitor_state, {})
 
     def test_persist_failure_does_not_block_other_targets_or_memory_state(self) -> None:
         context = RecordingContext()
         origin_a = "aiocqhttp:GroupMessage:100"
         origin_b = "aiocqhttp:GroupMessage:200"
         plugin = self._new_plugin(context, ["100", "200"])
-        plugin._bilibili_push_targets = {
+        plugin._bilibili_runtime.push_targets = {
             origin_a: {
                 "group_id": "100",
                 "platform_name": "aiocqhttp",
@@ -181,7 +183,7 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         persist_calls = {"count": 0}
 
         async def flaky_put_kv_data(key, value):
-            if key == self.main.KV_BILIBILI_MONITOR_STATE:
+            if key == KV_BILIBILI_MONITOR_STATE:
                 persist_calls["count"] += 1
                 if persist_calls["count"] == 1:
                     raise RuntimeError("kv store unavailable")
@@ -189,12 +191,12 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
 
         plugin.put_kv_data = flaky_put_kv_data
 
-        asyncio.run(plugin._poll_bilibili_updates_for_uid("100"))
+        asyncio.run(plugin._bilibili_runtime.poll_bilibili_updates_for_uid("100"))
 
         self.assertEqual(context.origin_counts[origin_a], 2)
         self.assertEqual(context.origin_counts[origin_b], 2)
-        state_a = plugin._bilibili_monitor_state["targets"][origin_a]["uids"]["100"]
-        state_b = plugin._bilibili_monitor_state["targets"][origin_b]["uids"]["100"]
+        state_a = plugin._bilibili_runtime.monitor_state["targets"][origin_a]["uids"]["100"]
+        state_b = plugin._bilibili_runtime.monitor_state["targets"][origin_b]["uids"]["100"]
         self.assertEqual(state_a["last_dynamic_id"], "dyn-2")
         self.assertEqual(state_b["last_dynamic_id"], "dyn-2")
 
