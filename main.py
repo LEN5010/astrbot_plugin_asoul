@@ -315,6 +315,13 @@ class ASoulPlugin(Star):
             yield event.chain_result(self._bilibili_runtime.build_notification_parts(notification))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("bili_status")
+    async def bili_status(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            await self._bilibili_runtime.build_bilibili_status_text()
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_login")
     async def bili_login(self, event: AstrMessageEvent):
         if event.message_obj.group_id:

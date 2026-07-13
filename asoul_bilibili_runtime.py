@@ -23,6 +23,7 @@ from asoul_bilibili import (
 from asoul_core import DISPLAY_TZ
 
 MIN_AT_ALL_REMAINING = 1
+COMMENT_POLL_STATE_KEY = "comment_poll_runtime"
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,13 @@ class BilibiliPushTarget:
     group_id: str
     platform_name: str
     unified_msg_origin: str
+
+
+@dataclass(frozen=True)
+class BilibiliPollError:
+    category: str
+    code: str
+    message: str
 
 
 class BilibiliRuntime:
@@ -50,6 +58,8 @@ class BilibiliRuntime:
         self.credential_data: dict[str, str] = {}
         self._missing_login_logged = False
         self._runtime_initialized = False
+        self._monitor_state_lock = asyncio.Lock()
+        self._uid_poll_locks: dict[str, asyncio.Lock] = {}
 
     async def ensure_ready(self) -> None:
         self.refresh_config()
@@ -110,6 +120,7 @@ class BilibiliRuntime:
         return {
             "targets": {},
             "bootstrap_uids": {},
+            COMMENT_POLL_STATE_KEY: {},
         }
 
     @staticmethod
@@ -125,12 +136,33 @@ class BilibiliRuntime:
             normalized[uid] = deepcopy(raw_state)
         return normalized
 
+    @staticmethod
+    def _safe_non_negative_int(raw_value: Any) -> int:
+        try:
+            return max(0, int(raw_value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def normalize_comment_poll_runtime(raw_value: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw_value, dict):
+            return {}
+        return {
+            str(uid).strip(): deepcopy(entry)
+            for uid, entry in raw_value.items()
+            if str(uid or "").strip() and isinstance(entry, dict)
+        }
+
     def normalize_monitor_state(self, raw_value: Any) -> dict[str, Any]:
         empty_state = self.build_empty_monitor_state()
         if not isinstance(raw_value, dict):
             return empty_state
 
-        if "targets" in raw_value or "bootstrap_uids" in raw_value:
+        if (
+            "targets" in raw_value
+            or "bootstrap_uids" in raw_value
+            or COMMENT_POLL_STATE_KEY in raw_value
+        ):
             raw_targets = raw_value.get("targets", {})
             normalized_targets: dict[str, dict[str, Any]] = {}
             if isinstance(raw_targets, dict):
@@ -149,6 +181,9 @@ class BilibiliRuntime:
                 "bootstrap_uids": self.normalize_uid_state_map(
                     raw_value.get("bootstrap_uids", {})
                 ),
+                COMMENT_POLL_STATE_KEY: self.normalize_comment_poll_runtime(
+                    raw_value.get(COMMENT_POLL_STATE_KEY, {})
+                ),
             }
 
         legacy_uids = self.normalize_uid_state_map(raw_value.get("uids", {}))
@@ -159,6 +194,9 @@ class BilibiliRuntime:
             return {
                 "targets": {},
                 "bootstrap_uids": legacy_uids,
+                COMMENT_POLL_STATE_KEY: self.normalize_comment_poll_runtime(
+                    raw_value.get(COMMENT_POLL_STATE_KEY, {})
+                ),
             }
 
         return {
@@ -167,6 +205,9 @@ class BilibiliRuntime:
                 for origin in self.push_targets
             },
             "bootstrap_uids": {},
+            COMMENT_POLL_STATE_KEY: self.normalize_comment_poll_runtime(
+                raw_value.get(COMMENT_POLL_STATE_KEY, {})
+            ),
         }
 
     def ensure_target_monitor_bucket(
@@ -207,6 +248,132 @@ class BilibiliRuntime:
             logger.exception("持久化 B 站监控状态失败，将继续使用内存态运行")
             return False
 
+    def get_comment_poll_entry(self, uid: str) -> dict[str, Any]:
+        state = self.normalize_monitor_state(self.monitor_state)
+        poll_runtime = state.setdefault(COMMENT_POLL_STATE_KEY, {})
+        entry = poll_runtime.setdefault(
+            str(uid),
+            {
+                "last_attempt_at": 0,
+                "last_success_at": 0,
+                "last_result": "",
+            },
+        )
+        self.monitor_state = state
+        return entry
+
+    def initial_comment_poll_due_at(
+        self,
+        uid: str,
+        *,
+        monotonic_now: float,
+        wall_now: int,
+    ) -> float:
+        entry = self.get_comment_poll_entry(uid)
+        last_attempt_at = self._safe_non_negative_int(entry.get("last_attempt_at"))
+        elapsed = (
+            max(0, wall_now - last_attempt_at)
+            if last_attempt_at
+            else COMMENT_POLL_INTERVAL_SECONDS
+        )
+        remaining = max(0, COMMENT_POLL_INTERVAL_SECONDS - elapsed)
+        return monotonic_now + remaining
+
+    async def begin_comment_poll_attempt(self, uid: str, attempted_at: int) -> None:
+        async with self._monitor_state_lock:
+            entry = self.get_comment_poll_entry(uid)
+            entry["last_attempt_at"] = max(0, int(attempted_at))
+            await self.persist_monitor_state()
+
+    async def finish_comment_poll_attempt(
+        self,
+        uid: str,
+        *,
+        finished_at: int,
+        error: Optional[BilibiliPollError] = None,
+    ) -> None:
+        async with self._monitor_state_lock:
+            entry = self.get_comment_poll_entry(uid)
+            if error is None:
+                entry["last_success_at"] = max(0, int(finished_at))
+                entry["last_result"] = "success"
+            else:
+                entry["last_result"] = "error"
+                entry["last_error"] = {
+                    "at": max(0, int(finished_at)),
+                    "category": error.category,
+                    "code": error.code,
+                    "message": error.message,
+                }
+            await self.persist_monitor_state_safely()
+
+    @staticmethod
+    def classify_poll_error(exc: Exception) -> BilibiliPollError:
+        code_value = getattr(exc, "code", None)
+        status_value = getattr(exc, "status", None)
+        try:
+            code = int(code_value) if code_value is not None else None
+        except (TypeError, ValueError):
+            code = None
+        try:
+            status = int(status_value) if status_value is not None else None
+        except (TypeError, ValueError):
+            status = None
+
+        if status == 412 or code in {-352, -412}:
+            return BilibiliPollError(
+                category="risk_control",
+                code=str(status if status == 412 else code),
+                message="请求被 B 站风控拒绝",
+            )
+        if status in {401, 403} or code in {-101, -102}:
+            return BilibiliPollError(
+                category="credential",
+                code=str(status if status in {401, 403} else code),
+                message="B 站登录状态无效",
+            )
+
+        exception_name = exc.__class__.__name__
+        if status is not None or exception_name in {
+            "NetworkException",
+            "TimeoutError",
+            "ClientError",
+        }:
+            return BilibiliPollError(
+                category="network",
+                code=str(status or ""),
+                message="B 站网络请求失败",
+            )
+        if code is not None or exception_name in {
+            "ResponseCodeException",
+            "ApiException",
+        }:
+            message = str(getattr(exc, "msg", "") or "B 站接口返回错误")
+            message = " ".join(message.split())[:160]
+            return BilibiliPollError(
+                category="api",
+                code=str(code or ""),
+                message=message,
+            )
+
+        message = " ".join(str(exc or exception_name).split())[:160]
+        return BilibiliPollError(
+            category="internal",
+            code=exception_name,
+            message=message or exception_name,
+        )
+
+    @staticmethod
+    def log_comment_poll_error(uid: str, error: BilibiliPollError) -> None:
+        log_method = logger.exception if error.category == "internal" else logger.warning
+        log_method(
+            "B 站评论轮询失败，状态未推进: uid=%s category=%s code=%s message=%s",
+            uid,
+            error.category,
+            error.code or "-",
+            error.message,
+        )
+
     async def remember_group_origin(self, event: AstrMessageEvent) -> None:
         await self.ensure_ready()
         group_id = str(getattr(event.message_obj, "group_id", "") or "").strip()
@@ -238,9 +405,10 @@ class BilibiliRuntime:
         }
         self.push_targets = next_targets
         await self._owner.put_kv_data(KV_BILIBILI_GROUP_ORIGINS, self.push_targets)
-        _, state_changed = self.ensure_target_monitor_bucket(unified_msg_origin)
-        if state_changed:
-            await self.persist_monitor_state_safely()
+        async with self._monitor_state_lock:
+            _, state_changed = self.ensure_target_monitor_bucket(unified_msg_origin)
+            if state_changed:
+                await self.persist_monitor_state_safely()
 
     async def _run_monitor_loop(self) -> None:
         logger.info("启动 B 站自动播报任务，轮询间隔 %s 秒", self.push_config.poll_interval_seconds)
@@ -331,13 +499,19 @@ class BilibiliRuntime:
                 self._missing_login_logged = False
                 current_uids = list(self.push_config.target_uids)
                 now = time.monotonic()
+                wall_now = int(time.time())
 
                 for uid in list(uid_states):
                     if uid not in current_uids:
                         uid_states.pop(uid, None)
 
                 for uid in current_uids:
-                    uid_states.setdefault(uid, now)
+                    if uid not in uid_states:
+                        uid_states[uid] = self.initial_comment_poll_due_at(
+                            uid,
+                            monotonic_now=now,
+                            wall_now=wall_now,
+                        )
 
                 due_uids = [uid for uid in current_uids if uid_states[uid] <= now]
                 if not due_uids:
@@ -351,13 +525,25 @@ class BilibiliRuntime:
 
                 run_uid = min(due_uids, key=lambda uid: (uid_states[uid], uid))
                 try:
+                    await self.begin_comment_poll_attempt(
+                        run_uid,
+                        int(time.time()),
+                    )
                     await self.poll_bilibili_comments_for_uid(run_uid)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    logger.exception(
-                        "B 站评论自动播报 UID 轮询失败，本轮状态未推进: uid=%s",
+                except Exception as exc:
+                    error = self.classify_poll_error(exc)
+                    await self.finish_comment_poll_attempt(
                         run_uid,
+                        finished_at=int(time.time()),
+                        error=error,
+                    )
+                    self.log_comment_poll_error(run_uid, error)
+                else:
+                    await self.finish_comment_poll_attempt(
+                        run_uid,
+                        finished_at=int(time.time()),
                     )
                 finally:
                     finished_at = time.monotonic()
@@ -372,7 +558,19 @@ class BilibiliRuntime:
                 logger.exception("B 站评论自动播报任务执行异常，本轮跳过并等待下次轮询")
                 await asyncio.sleep(1)
 
+    def get_uid_poll_lock(self, uid: str) -> asyncio.Lock:
+        normalized_uid = str(uid)
+        lock = self._uid_poll_locks.get(normalized_uid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._uid_poll_locks[normalized_uid] = lock
+        return lock
+
     async def poll_bilibili_updates_for_uid(self, uid: str) -> None:
+        async with self.get_uid_poll_lock(uid):
+            await self._poll_bilibili_updates_for_uid(uid)
+
+    async def _poll_bilibili_updates_for_uid(self, uid: str) -> None:
         target_entries = self.get_active_push_targets()
         if not target_entries:
             logger.info("存在 B 站新通知，但当前没有已登记的白名单群")
@@ -412,6 +610,10 @@ class BilibiliRuntime:
             )
 
     async def poll_bilibili_comments_for_uid(self, uid: str) -> None:
+        async with self.get_uid_poll_lock(uid):
+            await self._poll_bilibili_comments_for_uid(uid)
+
+    async def _poll_bilibili_comments_for_uid(self, uid: str) -> None:
         target_entries = self.get_active_push_targets()
         if not target_entries:
             logger.info("存在 B 站新评论通知，但当前没有已登记的白名单群")
@@ -457,12 +659,6 @@ class BilibiliRuntime:
         plan: Any,
         snapshot: Any,
     ) -> None:
-        target_state, _ = self.ensure_target_monitor_bucket(
-            target.unified_msg_origin
-        )
-        uid_state_map = target_state.setdefault("uids", {})
-        current_uid_state = deepcopy(uid_state_map.get(uid, {}))
-
         for delivery in plan.deliveries:
             try:
                 result = await self.build_notification_result(
@@ -478,15 +674,35 @@ class BilibiliRuntime:
                 )
                 return
 
-            current_uid_state = deepcopy(delivery.uid_state)
-            uid_state_map[uid] = deepcopy(current_uid_state)
+            await self.commit_target_uid_state(
+                target.unified_msg_origin,
+                uid,
+                delivery.uid_state,
+            )
+
+        await self.commit_target_uid_state(
+            target.unified_msg_origin,
+            uid,
+            plan.final_state,
+            only_if_changed=True,
+        )
+
+    async def commit_target_uid_state(
+        self,
+        unified_msg_origin: str,
+        uid: str,
+        uid_state: dict[str, Any],
+        *,
+        only_if_changed: bool = False,
+    ) -> None:
+        async with self._monitor_state_lock:
+            target_state, _ = self.ensure_target_monitor_bucket(unified_msg_origin)
+            uid_state_map = target_state.setdefault("uids", {})
+            next_state = deepcopy(uid_state)
+            if only_if_changed and uid_state_map.get(uid, {}) == next_state:
+                return
+            uid_state_map[uid] = next_state
             await self.persist_monitor_state_safely()
-
-        if current_uid_state == plan.final_state:
-            return
-
-        uid_state_map[uid] = deepcopy(plan.final_state)
-        await self.persist_monitor_state_safely()
 
     def get_active_push_targets(self) -> list[BilibiliPushTarget]:
         targets: list[BilibiliPushTarget] = []
@@ -664,6 +880,50 @@ class BilibiliRuntime:
         if not self.gateway.has_credential():
             return "当前未登录 B 站，请先使用 /bili_login。"
         return None
+
+    async def build_bilibili_status_text(self) -> str:
+        await self.ensure_ready()
+        state = self.normalize_monitor_state(self.monitor_state)
+        comment_runtime = state[COMMENT_POLL_STATE_KEY]
+        active_targets = self.get_active_push_targets()
+        lines = [
+            "【B站评论推送状态】",
+            f"自动播报：{'已启用' if self.push_config.enabled else '未启用'}",
+            f"评论推送：{'已启用' if self.push_config.push_comment else '未启用'}",
+            f"登录状态：{'已登录' if self.gateway.has_credential() else '未登录'}",
+            f"请求客户端：{self.push_config.request_client}",
+            f"评论任务：{'运行中' if self.comment_task and not self.comment_task.done() else '未运行'}",
+            f"已登记目标群：{len(active_targets)}",
+            f"评论轮询间隔：{COMMENT_POLL_INTERVAL_SECONDS} 秒",
+        ]
+        for uid in self.push_config.target_uids:
+            entry = comment_runtime.get(uid, {})
+            last_attempt_at = self._safe_non_negative_int(entry.get("last_attempt_at"))
+            if not last_attempt_at:
+                lines.append(f"UID {uid}：尚未轮询")
+                continue
+            last_result = str(entry.get("last_result", "") or "")
+            next_poll_at = last_attempt_at + COMMENT_POLL_INTERVAL_SECONDS
+            detail = (
+                f"UID {uid}：最近轮询 {self.format_status_time(last_attempt_at)}；"
+                f"结果 {last_result or '未知'}；"
+                f"下次最早 {self.format_status_time(next_poll_at)}"
+            )
+            if last_result == "error":
+                error = entry.get("last_error", {})
+                if isinstance(error, dict):
+                    category = str(error.get("category", "") or "unknown")
+                    code = str(error.get("code", "") or "-")
+                    message = str(error.get("message", "") or "")
+                    detail += f"；错误 {category}/{code} {message}".rstrip()
+            lines.append(detail)
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_status_time(timestamp: int) -> str:
+        return datetime.fromtimestamp(int(timestamp), DISPLAY_TZ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
     async def send_atall_test(self, event: AstrMessageEvent) -> Optional[str]:
         group_id = str(getattr(event.message_obj, "group_id", "") or "").strip()
