@@ -63,10 +63,24 @@ asoul推送请使用【今日直播】或【明日直播】
 - Python 可用
 - `Pillow` 已安装
 - 若启用 B 站自动播报，还需要：
-- `bilibili-api-python` 或 `bilibili-api-dev`
+- `bilibili-api-python`
 - 异步请求库，推荐 `aiohttp`
 
 如果 `Pillow` 不可用，直播图片无法正常生成。
+
+其中，B 站相关能力明显依赖：
+
+- [Nemo2011/bilibili-api](https://github.com/Nemo2011/bilibili-api)
+
+当前以下功能直接建立在该库之上：
+
+- B 站二维码登录
+- UID 动态抓取
+- UID 视频抓取
+- 直播状态查询
+- 最近资源评论抓取
+
+如果没有正确安装 `bilibili-api-python`，上述 B 站功能将无法正常工作。
 
 ## 素材文件
 
@@ -117,6 +131,10 @@ AstrBot 相关文档：
 
 - [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
 - [AstrBot 插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
+
+B 站 API 依赖项目：
+
+- [Nemo2011/bilibili-api](https://github.com/Nemo2011/bilibili-api)
 
 鸣谢:
 
