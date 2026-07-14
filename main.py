@@ -47,7 +47,7 @@ def _build_calendar_cache_ttl(config: Any) -> timedelta:
     return timedelta(minutes=max(MIN_CALENDAR_CACHE_MINUTES, minutes))
 
 
-@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.0.2")
+@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.1.0")
 class ASoulPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -176,7 +176,9 @@ class ASoulPlugin(Star):
             yield event.plain_result(f"UID {uid} 当前没有抓到可用动态。")
             return
 
-        yield event.chain_result(self._bilibili_runtime.build_notification_parts(notification))
+        yield event.chain_result(
+            await self._bilibili_runtime.build_card_or_fallback_parts(notification)
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_dump_dynamic")
@@ -212,7 +214,9 @@ class ASoulPlugin(Star):
             yield event.plain_result(f"UID {uid} 当前没有抓到可用视频。")
             return
 
-        yield event.chain_result(self._bilibili_runtime.build_notification_parts(notification))
+        yield event.chain_result(
+            await self._bilibili_runtime.build_card_or_fallback_parts(notification)
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_live")
@@ -232,7 +236,9 @@ class ASoulPlugin(Star):
             yield event.plain_result(plain_text)
             return
 
-        yield event.chain_result(self._bilibili_runtime.build_notification_parts(notification))
+        yield event.chain_result(
+            await self._bilibili_runtime.build_card_or_fallback_parts(notification)
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_dump_live")
@@ -276,19 +282,31 @@ class ASoulPlugin(Star):
         if dynamic_notification is None:
             yield event.plain_result(f"UID {uid} 当前没有抓到可用动态。")
         else:
-            yield event.chain_result(self._bilibili_runtime.build_notification_parts(dynamic_notification))
+            yield event.chain_result(
+                await self._bilibili_runtime.build_card_or_fallback_parts(
+                    dynamic_notification
+                )
+            )
 
         video_notification = await self._bilibili_commands.build_video_test_notification(uid)
         if video_notification is None:
             yield event.plain_result(f"UID {uid} 当前没有抓到可用视频。")
         else:
-            yield event.chain_result(self._bilibili_runtime.build_notification_parts(video_notification))
+            yield event.chain_result(
+                await self._bilibili_runtime.build_card_or_fallback_parts(
+                    video_notification
+                )
+            )
 
         live_text, live_notification = await self._bilibili_commands.build_live_test_notification(uid)
         if live_notification is None:
             yield event.plain_result(live_text)
         else:
-            yield event.chain_result(self._bilibili_runtime.build_notification_parts(live_notification))
+            yield event.chain_result(
+                await self._bilibili_runtime.build_card_or_fallback_parts(
+                    live_notification
+                )
+            )
 
         comment_notifications = await self._bilibili_commands.build_comment_test_notifications(uid)
         if not comment_notifications:

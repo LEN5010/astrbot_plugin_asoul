@@ -1,3 +1,4 @@
 aiohttp
 bilibili-api-python
 Pillow
+qrcode>=8.2

@@ -1,7 +1,7 @@
 import asyncio
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Optional
 
@@ -15,6 +15,8 @@ from asoul_bilibili import (
     KV_BILIBILI_CREDENTIAL,
     KV_BILIBILI_GROUP_ORIGINS,
     KV_BILIBILI_MONITOR_STATE,
+    KV_BILIBILI_PROFILE_CACHE,
+    BilibiliAuthorCardProfile,
     BilibiliGateway,
     BilibiliCommentResource,
     BilibiliMonitorService,
@@ -22,11 +24,29 @@ from asoul_bilibili import (
     build_bilibili_push_config,
     normalize_bilibili_credential_data,
 )
+from asoul_bilibili_card import BilibiliCardRenderer
 from asoul_core import DISPLAY_TZ
 
 MIN_AT_ALL_REMAINING = 1
+CONTENT_POLL_TIMEOUT_SECONDS = 90
+CARD_RENDER_TIMEOUT_SECONDS = 30
+MESSAGE_SEND_TIMEOUT_SECONDS = 30
+PROFILE_CACHE_TTL_SECONDS = 6 * 60 * 60
+PROFILE_FETCH_TIMEOUT_SECONDS = 20
+CONTENT_POLL_STATE_KEY = "content_poll_runtime"
 COMMENT_POLL_STATE_KEY = "comment_poll_runtime"
 COMMENT_RESOURCE_CATALOGS_KEY = "comment_resource_catalogs"
+CONTENT_UID_STATE_KEYS = frozenset(
+    {
+        "author_name",
+        "last_dynamic_id",
+        "last_dynamic_created_at",
+        "recent_dynamic_ids",
+        "last_live_active",
+        "last_live_room_id",
+    }
+)
+COMMENT_UID_STATE_KEYS = frozenset({"author_name", "comment_resources"})
 
 
 @dataclass(frozen=True)
@@ -54,15 +74,22 @@ class BilibiliRuntime:
             credential_data=self.push_config.credential_data,
         )
         self.monitor = BilibiliMonitorService(self.gateway)
+        self.card_renderer = BilibiliCardRenderer(owner)
         self.task: asyncio.Task | None = None
         self.comment_task: asyncio.Task | None = None
         self.push_targets: dict[str, dict[str, str]] = {}
         self.monitor_state: dict[str, Any] = {}
         self.credential_data: dict[str, str] = {}
+        self.profile_cache: dict[str, BilibiliAuthorCardProfile] = {}
         self._missing_login_logged = False
         self._runtime_initialized = False
         self._monitor_state_lock = asyncio.Lock()
-        self._uid_poll_locks: dict[str, asyncio.Lock] = {}
+        self._content_uid_poll_locks: dict[str, asyncio.Lock] = {}
+        self._comment_uid_poll_locks: dict[str, asyncio.Lock] = {}
+        self._content_poll_tasks: dict[str, asyncio.Task] = {}
+        self._content_next_due: dict[str, float] = {}
+        self._profile_refresh_tasks: dict[str, asyncio.Task] = {}
+        self._profile_cache_lock = asyncio.Lock()
 
     async def ensure_ready(self) -> None:
         self.refresh_config()
@@ -98,6 +125,9 @@ class BilibiliRuntime:
                 await self.comment_task
             except asyncio.CancelledError:
                 pass
+        await self._cancel_content_poll_tasks()
+        await self._cancel_profile_refresh_tasks()
+        await self.card_renderer.cleanup()
         self._runtime_initialized = False
 
     def refresh_config(self) -> None:
@@ -113,16 +143,180 @@ class BilibiliRuntime:
         push_targets = await self._owner.get_kv_data(KV_BILIBILI_GROUP_ORIGINS, {})
         monitor_state = await self._owner.get_kv_data(KV_BILIBILI_MONITOR_STATE, {})
         credential_data = await self._owner.get_kv_data(KV_BILIBILI_CREDENTIAL, {})
+        profile_cache = await self._owner.get_kv_data(KV_BILIBILI_PROFILE_CACHE, {})
         self.push_targets = self.normalize_push_targets(push_targets)
         self.monitor_state = self.normalize_monitor_state(monitor_state)
         self.credential_data = self._resolve_credential_data(credential_data)
+        self.profile_cache = self.normalize_profile_cache(profile_cache)
         self.gateway.set_credential_data(self.credential_data)
+
+    @classmethod
+    def normalize_profile_cache(
+        cls,
+        raw_value: Any,
+    ) -> dict[str, BilibiliAuthorCardProfile]:
+        if not isinstance(raw_value, dict):
+            return {}
+        normalized: dict[str, BilibiliAuthorCardProfile] = {}
+        for raw_uid, raw_profile in raw_value.items():
+            uid = str(raw_uid or "").strip()
+            if not uid:
+                continue
+            if isinstance(raw_profile, BilibiliAuthorCardProfile):
+                normalized[uid] = raw_profile
+                continue
+            if not isinstance(raw_profile, dict):
+                continue
+            normalized[uid] = BilibiliAuthorCardProfile(
+                uid=str(raw_profile.get("uid") or uid),
+                name=str(raw_profile.get("name") or ""),
+                avatar_url=str(raw_profile.get("avatar_url") or ""),
+                pendant_url=str(raw_profile.get("pendant_url") or ""),
+                total_likes=cls._optional_non_negative_int(
+                    raw_profile.get("total_likes")
+                ),
+                following=cls._optional_non_negative_int(raw_profile.get("following")),
+                follower=cls._optional_non_negative_int(raw_profile.get("follower")),
+                fetched_at=cls._safe_non_negative_int(raw_profile.get("fetched_at")),
+            )
+        return normalized
+
+    @staticmethod
+    def _optional_non_negative_int(raw_value: Any) -> Optional[int]:
+        if raw_value is None or raw_value == "":
+            return None
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return None
+
+    async def get_author_card_profile(
+        self,
+        uid: str,
+        *,
+        fallback: Optional[BilibiliAuthorCardProfile] = None,
+    ) -> BilibiliAuthorCardProfile:
+        normalized_uid = str(uid or "").strip()
+        cached = self.profile_cache.get(normalized_uid)
+        now = int(time.time())
+        if cached is not None and now - cached.fetched_at < PROFILE_CACHE_TTL_SECONDS:
+            return cached
+        if cached is not None:
+            self._schedule_profile_refresh(normalized_uid)
+            return cached
+        try:
+            return await asyncio.wait_for(
+                self._refresh_author_card_profile(
+                    normalized_uid,
+                    fallback=fallback,
+                ),
+                timeout=PROFILE_FETCH_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "B 站用户资料获取失败，卡片将使用已有字段: uid=%s",
+                normalized_uid,
+            )
+            return fallback or BilibiliAuthorCardProfile(uid=normalized_uid)
+
+    def _schedule_profile_refresh(self, uid: str) -> None:
+        existing = self._profile_refresh_tasks.get(uid)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._refresh_author_card_profile(uid))
+        self._profile_refresh_tasks[uid] = task
+        task.add_done_callback(
+            lambda completed, refresh_uid=uid: self._finish_profile_refresh_task(
+                refresh_uid,
+                completed,
+            )
+        )
+
+    def _finish_profile_refresh_task(self, uid: str, task: asyncio.Task) -> None:
+        if self._profile_refresh_tasks.get(uid) is task:
+            self._profile_refresh_tasks.pop(uid, None)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.warning(
+                "B 站用户资料后台刷新失败，继续使用旧缓存: uid=%s",
+                uid,
+            )
+
+    async def _refresh_author_card_profile(
+        self,
+        uid: str,
+        *,
+        fallback: Optional[BilibiliAuthorCardProfile] = None,
+    ) -> BilibiliAuthorCardProfile:
+        profile = await self.gateway.get_user_card_profile(uid)
+        previous = self.profile_cache.get(uid) or fallback
+        if previous is not None:
+            profile = BilibiliAuthorCardProfile(
+                uid=profile.uid or previous.uid or uid,
+                name=(
+                    previous.name
+                    if profile.name in {"", uid} and previous.name
+                    else profile.name
+                ),
+                avatar_url=profile.avatar_url or previous.avatar_url,
+                pendant_url=profile.pendant_url or previous.pendant_url,
+                total_likes=(
+                    previous.total_likes
+                    if profile.total_likes is None
+                    else profile.total_likes
+                ),
+                following=(
+                    previous.following
+                    if profile.following is None
+                    else profile.following
+                ),
+                follower=(
+                    previous.follower
+                    if profile.follower is None
+                    else profile.follower
+                ),
+                fetched_at=profile.fetched_at,
+            )
+        if profile.fetched_at <= 0:
+            profile = replace(profile, fetched_at=int(time.time()))
+        async with self._profile_cache_lock:
+            self.profile_cache[uid] = profile
+            await self.persist_profile_cache_safely()
+        return profile
+
+    async def persist_profile_cache_safely(self) -> None:
+        payload = {
+            uid: asdict(profile)
+            for uid, profile in self.profile_cache.items()
+        }
+        try:
+            await self._owner.put_kv_data(KV_BILIBILI_PROFILE_CACHE, payload)
+        except Exception:
+            logger.exception("持久化 B 站用户资料缓存失败，将保留内存缓存")
+
+    async def _cancel_profile_refresh_tasks(self) -> None:
+        tasks = [
+            task
+            for task in self._profile_refresh_tasks.values()
+            if not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._profile_refresh_tasks.clear()
 
     @staticmethod
     def build_empty_monitor_state() -> dict[str, Any]:
         return {
             "targets": {},
             "bootstrap_uids": {},
+            CONTENT_POLL_STATE_KEY: {},
             COMMENT_POLL_STATE_KEY: {},
             COMMENT_RESOURCE_CATALOGS_KEY: {},
         }
@@ -195,6 +389,7 @@ class BilibiliRuntime:
         if (
             "targets" in raw_value
             or "bootstrap_uids" in raw_value
+            or CONTENT_POLL_STATE_KEY in raw_value
             or COMMENT_POLL_STATE_KEY in raw_value
             or COMMENT_RESOURCE_CATALOGS_KEY in raw_value
         ):
@@ -216,6 +411,9 @@ class BilibiliRuntime:
                 "bootstrap_uids": self.normalize_uid_state_map(
                     raw_value.get("bootstrap_uids", {})
                 ),
+                CONTENT_POLL_STATE_KEY: self.normalize_comment_poll_runtime(
+                    raw_value.get(CONTENT_POLL_STATE_KEY, {})
+                ),
                 COMMENT_POLL_STATE_KEY: self.normalize_comment_poll_runtime(
                     raw_value.get(COMMENT_POLL_STATE_KEY, {})
                 ),
@@ -232,6 +430,7 @@ class BilibiliRuntime:
             return {
                 "targets": {},
                 "bootstrap_uids": legacy_uids,
+                CONTENT_POLL_STATE_KEY: {},
                 COMMENT_POLL_STATE_KEY: self.normalize_comment_poll_runtime(
                     raw_value.get(COMMENT_POLL_STATE_KEY, {})
                 ),
@@ -244,6 +443,7 @@ class BilibiliRuntime:
                 for origin in self.push_targets
             },
             "bootstrap_uids": {},
+            CONTENT_POLL_STATE_KEY: {},
             COMMENT_POLL_STATE_KEY: self.normalize_comment_poll_runtime(
                 raw_value.get(COMMENT_POLL_STATE_KEY, {})
             ),
@@ -287,6 +487,53 @@ class BilibiliRuntime:
         except Exception:
             logger.exception("持久化 B 站监控状态失败，将继续使用内存态运行")
             return False
+
+    def get_content_poll_entry(self, uid: str) -> dict[str, Any]:
+        state = self.normalize_monitor_state(self.monitor_state)
+        poll_runtime = state.setdefault(CONTENT_POLL_STATE_KEY, {})
+        entry = poll_runtime.setdefault(
+            str(uid),
+            {
+                "last_attempt_at": 0,
+                "last_success_at": 0,
+                "last_result": "",
+                "last_duration_ms": 0,
+            },
+        )
+        self.monitor_state = state
+        return entry
+
+    async def begin_content_poll_attempt(self, uid: str, attempted_at: int) -> None:
+        async with self._monitor_state_lock:
+            entry = self.get_content_poll_entry(uid)
+            entry["last_attempt_at"] = max(0, int(attempted_at))
+            entry["last_result"] = "running"
+            await self.persist_monitor_state_safely()
+
+    async def finish_content_poll_attempt(
+        self,
+        uid: str,
+        *,
+        finished_at: int,
+        duration_ms: int,
+        result: str,
+        error: Optional[BilibiliPollError] = None,
+    ) -> None:
+        async with self._monitor_state_lock:
+            entry = self.get_content_poll_entry(uid)
+            entry["last_result"] = str(result)
+            entry["last_duration_ms"] = max(0, int(duration_ms))
+            if result == "success":
+                entry["last_success_at"] = max(0, int(finished_at))
+                entry.pop("last_error", None)
+            elif error is not None:
+                entry["last_error"] = {
+                    "at": max(0, int(finished_at)),
+                    "category": error.category,
+                    "code": error.code,
+                    "message": error.message,
+                }
+            await self.persist_monitor_state_safely()
 
     def get_comment_poll_entry(self, uid: str) -> dict[str, Any]:
         state = self.normalize_monitor_state(self.monitor_state)
@@ -575,7 +822,6 @@ class BilibiliRuntime:
 
     async def _run_monitor_loop(self) -> None:
         logger.info("启动 B 站自动播报任务，轮询间隔 %s 秒", self.push_config.poll_interval_seconds)
-        uid_states: dict[str, float] = {}
         next_dispatch_at = 0.0
 
         while True:
@@ -592,20 +838,37 @@ class BilibiliRuntime:
                 current_uids = list(self.push_config.target_uids)
                 now = time.monotonic()
 
-                for uid in list(uid_states):
+                for uid in list(self._content_next_due):
                     if uid not in current_uids:
-                        uid_states.pop(uid, None)
+                        self._content_next_due.pop(uid, None)
 
                 for uid in current_uids:
-                    uid_states.setdefault(uid, now)
+                    self._content_next_due.setdefault(uid, now)
+
+                for uid, task in list(self._content_poll_tasks.items()):
+                    if task.done():
+                        self._content_poll_tasks.pop(uid, None)
 
                 if not current_uids:
                     await asyncio.sleep(2)
                     continue
 
-                due_uids = [uid for uid in current_uids if uid_states[uid] <= now]
+                due_uids = [
+                    uid
+                    for uid in current_uids
+                    if uid not in self._content_poll_tasks
+                    and self._content_next_due[uid] <= now
+                ]
                 if not due_uids:
-                    next_due_at = min(uid_states[uid] for uid in current_uids)
+                    pending_due_times = [
+                        self._content_next_due[uid]
+                        for uid in current_uids
+                        if uid not in self._content_poll_tasks
+                    ]
+                    if not pending_due_times:
+                        await asyncio.sleep(0.2)
+                        continue
+                    next_due_at = min(pending_due_times)
                     await asyncio.sleep(min(max(next_due_at - now, 0.2), 2.0))
                     continue
 
@@ -613,28 +876,73 @@ class BilibiliRuntime:
                     await asyncio.sleep(min(max(next_dispatch_at - now, 0.2), 2.0))
                     continue
 
-                run_uid = min(due_uids, key=lambda uid: (uid_states[uid], uid))
-                try:
-                    await self.poll_bilibili_updates_for_uid(run_uid)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception(
-                        "B 站自动播报 UID 轮询失败，本轮状态未推进: uid=%s",
-                        run_uid,
-                    )
-                finally:
-                    finished_at = time.monotonic()
-                    uid_states[run_uid] = (
-                        finished_at + self.push_config.poll_interval_seconds
-                    )
-                    next_dispatch_at = finished_at + self.push_config.task_gap_seconds
+                run_uid = min(
+                    due_uids,
+                    key=lambda uid: (self._content_next_due[uid], uid),
+                )
+                task = asyncio.create_task(self._run_content_poll_attempt(run_uid))
+                self._content_poll_tasks[run_uid] = task
+                next_dispatch_at = now + self.push_config.task_gap_seconds
             except asyncio.CancelledError:
                 logger.info("B 站自动播报任务已停止")
+                await self._cancel_content_poll_tasks()
                 raise
             except Exception:
                 logger.exception("B 站自动播报任务执行异常，本轮跳过并等待下次轮询")
                 await asyncio.sleep(1)
+
+    async def _run_content_poll_attempt(self, uid: str) -> None:
+        started_at = time.monotonic()
+        await self.begin_content_poll_attempt(uid, int(time.time()))
+        result = "success"
+        error: Optional[BilibiliPollError] = None
+        try:
+            await asyncio.wait_for(
+                self.poll_bilibili_updates_for_uid(uid),
+                timeout=CONTENT_POLL_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            result = "cancelled"
+            raise
+        except TimeoutError:
+            result = "timeout"
+            error = BilibiliPollError(
+                category="timeout",
+                code=str(CONTENT_POLL_TIMEOUT_SECONDS),
+                message="内容轮询超过时间预算",
+            )
+            logger.warning(
+                "B 站自动播报 UID 轮询超时，本轮状态未推进: uid=%s timeout=%ss",
+                uid,
+                CONTENT_POLL_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            result = "error"
+            error = self.classify_poll_error(exc)
+            logger.exception(
+                "B 站自动播报 UID 轮询失败，本轮状态未推进: uid=%s",
+                uid,
+            )
+        finally:
+            duration_ms = int(max(0.0, time.monotonic() - started_at) * 1000)
+            await self.finish_content_poll_attempt(
+                uid,
+                finished_at=int(time.time()),
+                duration_ms=duration_ms,
+                result=result,
+                error=error,
+            )
+            self._content_next_due[uid] = (
+                time.monotonic() + self.push_config.poll_interval_seconds
+            )
+
+    async def _cancel_content_poll_tasks(self) -> None:
+        tasks = [task for task in self._content_poll_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._content_poll_tasks.clear()
 
     async def _run_comment_monitor_loop(self) -> None:
         logger.info("启动 B 站评论自动播报任务，轮询间隔 %s 秒", COMMENT_POLL_INTERVAL_SECONDS)
@@ -715,16 +1023,20 @@ class BilibiliRuntime:
                 logger.exception("B 站评论自动播报任务执行异常，本轮跳过并等待下次轮询")
                 await asyncio.sleep(1)
 
-    def get_uid_poll_lock(self, uid: str) -> asyncio.Lock:
+    @staticmethod
+    def _get_or_create_uid_lock(
+        locks: dict[str, asyncio.Lock], uid: str
+    ) -> asyncio.Lock:
         normalized_uid = str(uid)
-        lock = self._uid_poll_locks.get(normalized_uid)
+        lock = locks.get(normalized_uid)
         if lock is None:
             lock = asyncio.Lock()
-            self._uid_poll_locks[normalized_uid] = lock
+            locks[normalized_uid] = lock
         return lock
 
     async def poll_bilibili_updates_for_uid(self, uid: str) -> None:
-        async with self.get_uid_poll_lock(uid):
+        lock = self._get_or_create_uid_lock(self._content_uid_poll_locks, uid)
+        async with lock:
             await self._poll_bilibili_updates_for_uid(uid)
 
     async def _poll_bilibili_updates_for_uid(self, uid: str) -> None:
@@ -748,6 +1060,19 @@ class BilibiliRuntime:
             uid=uid,
             previous_state=snapshot_seed_state,
         )
+        fallback_profile = next(
+            (
+                post.author
+                for post in snapshot.dynamics
+                if post.author.name or post.author.avatar_url
+            ),
+            BilibiliAuthorCardProfile(uid=uid, name=snapshot.author_name),
+        )
+        author_profile = await self.get_author_card_profile(
+            uid,
+            fallback=fallback_profile,
+        )
+        snapshot = replace(snapshot, author_profile=author_profile)
 
         for target in target_entries:
             target_state, _ = self.ensure_target_monitor_bucket(
@@ -764,10 +1089,12 @@ class BilibiliRuntime:
                 uid=uid,
                 plan=plan,
                 snapshot=snapshot,
+                state_domain="content",
             )
 
     async def poll_bilibili_comments_for_uid(self, uid: str) -> None:
-        async with self.get_uid_poll_lock(uid):
+        lock = self._get_or_create_uid_lock(self._comment_uid_poll_locks, uid)
+        async with lock:
             await self._poll_bilibili_comments_for_uid(uid)
 
     async def _poll_bilibili_comments_for_uid(self, uid: str) -> None:
@@ -833,6 +1160,7 @@ class BilibiliRuntime:
                 uid=uid,
                 plan=plan,
                 snapshot=snapshot,
+                state_domain="comment",
             )
 
     async def apply_delivery_plan_to_target(
@@ -841,13 +1169,17 @@ class BilibiliRuntime:
         uid: str,
         plan: Any,
         snapshot: Any,
+        state_domain: str,
     ) -> None:
         for delivery in plan.deliveries:
             try:
                 result = await self.build_notification_result(
                     delivery.notification, target
                 )
-                await self.context.send_message(target.unified_msg_origin, result)
+                await asyncio.wait_for(
+                    self.context.send_message(target.unified_msg_origin, result),
+                    timeout=MESSAGE_SEND_TIMEOUT_SECONDS,
+                )
             except Exception:
                 logger.exception(
                     "发送 B 站播报失败: target=%s uid=%s kind=%s",
@@ -860,15 +1192,32 @@ class BilibiliRuntime:
             await self.commit_target_uid_state(
                 target.unified_msg_origin,
                 uid,
-                delivery.uid_state,
+                self.extract_uid_state_domain(delivery.uid_state, state_domain),
             )
 
         await self.commit_target_uid_state(
             target.unified_msg_origin,
             uid,
-            plan.final_state,
+            self.extract_uid_state_domain(plan.final_state, state_domain),
             only_if_changed=True,
         )
+
+    @staticmethod
+    def extract_uid_state_domain(
+        uid_state: Any,
+        state_domain: str,
+    ) -> dict[str, Any]:
+        source = uid_state if isinstance(uid_state, dict) else {}
+        allowed_keys = (
+            COMMENT_UID_STATE_KEYS
+            if state_domain == "comment"
+            else CONTENT_UID_STATE_KEYS
+        )
+        return {
+            key: deepcopy(source[key])
+            for key in allowed_keys
+            if key in source
+        }
 
     async def commit_target_uid_state(
         self,
@@ -881,8 +1230,10 @@ class BilibiliRuntime:
         async with self._monitor_state_lock:
             target_state, _ = self.ensure_target_monitor_bucket(unified_msg_origin)
             uid_state_map = target_state.setdefault("uids", {})
-            next_state = deepcopy(uid_state)
-            if only_if_changed and uid_state_map.get(uid, {}) == next_state:
+            current_state = deepcopy(uid_state_map.get(uid, {}))
+            next_state = deepcopy(current_state)
+            next_state.update(deepcopy(uid_state))
+            if only_if_changed and current_state == next_state:
                 return
             uid_state_map[uid] = next_state
             await self.persist_monitor_state_safely()
@@ -914,10 +1265,34 @@ class BilibiliRuntime:
         notification: Any,
         target: BilibiliPushTarget,
     ) -> MessageEventResult:
-        chain_parts = self.build_notification_parts(notification)
+        chain_parts = await self.build_card_or_fallback_parts(notification)
         if notification.kind == "live" and await self.should_send_live_atall(target):
-            chain_parts = [Comp.AtAll(), Comp.Plain(" ")] + chain_parts
+            chain_parts = [Comp.AtAll(), Comp.Plain(self.safe_plain_newline())] + chain_parts
         return MessageEventResult(chain=chain_parts).use_t2i(False)
+
+    async def build_card_or_fallback_parts(self, notification: Any) -> list[Any]:
+        if (
+            notification.kind in {"dynamic", "video", "live"}
+            and self.push_config.render_bilibili_cards
+        ):
+            try:
+                card_path = await asyncio.wait_for(
+                    self.card_renderer.render(notification),
+                    timeout=CARD_RENDER_TIMEOUT_SECONDS,
+                )
+                return [
+                    Comp.Image.fromFileSystem(card_path),
+                    Comp.Plain(str(notification.url or "")),
+                ]
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "B 站卡片渲染失败，回退旧消息格式: uid=%s kind=%s",
+                    getattr(notification, "uid", ""),
+                    getattr(notification, "kind", ""),
+                )
+        return self.build_notification_parts(notification)
 
     @staticmethod
     def safe_plain_newline() -> str:
@@ -1067,29 +1442,60 @@ class BilibiliRuntime:
     async def build_bilibili_status_text(self) -> str:
         await self.ensure_ready()
         state = self.normalize_monitor_state(self.monitor_state)
+        content_runtime = state[CONTENT_POLL_STATE_KEY]
         comment_runtime = state[COMMENT_POLL_STATE_KEY]
         active_targets = self.get_active_push_targets()
         lines = [
-            "【B站评论推送状态】",
+            "【B站推送状态】",
             f"自动播报：{'已启用' if self.push_config.enabled else '未启用'}",
             f"评论推送：{'已启用' if self.push_config.push_comment else '未启用'}",
             f"登录状态：{'已登录' if self.gateway.has_credential() else '未登录'}",
             f"请求客户端：{self.push_config.request_client}",
+            f"内容任务：{'运行中' if self.task and not self.task.done() else '未运行'}；在途 {len(self._content_poll_tasks)}",
             f"评论任务：{'运行中' if self.comment_task and not self.comment_task.done() else '未运行'}",
             f"已登记目标群：{len(active_targets)}",
             f"评论轮询间隔：{COMMENT_POLL_INTERVAL_SECONDS} 秒",
             f"评论资源发现间隔：{COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS} 秒",
         ]
         for uid in self.push_config.target_uids:
+            content_entry = content_runtime.get(uid, {})
+            content_attempt_at = self._safe_non_negative_int(
+                content_entry.get("last_attempt_at")
+            )
+            if content_attempt_at:
+                content_result = str(content_entry.get("last_result", "") or "未知")
+                duration_ms = self._safe_non_negative_int(
+                    content_entry.get("last_duration_ms")
+                )
+                inflight_text = (
+                    "；当前在途"
+                    if uid in self._content_poll_tasks
+                    and not self._content_poll_tasks[uid].done()
+                    else ""
+                )
+                lines.append(
+                    f"UID {uid} 内容：最近 {self.format_status_time(content_attempt_at)}；"
+                    f"结果 {content_result}；耗时 {duration_ms / 1000:.2f} 秒"
+                    f"{inflight_text}"
+                )
+            else:
+                inflight_text = (
+                    "；当前在途"
+                    if uid in self._content_poll_tasks
+                    and not self._content_poll_tasks[uid].done()
+                    else ""
+                )
+                lines.append(f"UID {uid} 内容：尚未轮询{inflight_text}")
+
             entry = comment_runtime.get(uid, {})
             last_attempt_at = self._safe_non_negative_int(entry.get("last_attempt_at"))
             if not last_attempt_at:
-                lines.append(f"UID {uid}：尚未轮询")
+                lines.append(f"UID {uid} 评论：尚未轮询")
                 continue
             last_result = str(entry.get("last_result", "") or "")
             next_poll_at = last_attempt_at + COMMENT_POLL_INTERVAL_SECONDS
             detail = (
-                f"UID {uid}：最近轮询 {self.format_status_time(last_attempt_at)}；"
+                f"UID {uid} 评论：最近轮询 {self.format_status_time(last_attempt_at)}；"
                 f"结果 {last_result or '未知'}；"
                 f"下次最早 {self.format_status_time(next_poll_at)}"
             )

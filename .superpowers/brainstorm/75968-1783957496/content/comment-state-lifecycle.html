@@ -1,0 +1,70 @@
+<h2>状态模型与失败恢复</h2>
+<p class="subtitle">所有可恢复状态落在独立的评论日志中。抓取状态和群投递状态分离，避免一个群发送失败影响其他群或下一轮扫描。</p>
+
+<div class="section" style="display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:12px;margin-top:26px">
+  <div style="border:1px solid #5d8eea;border-radius:10px;padding:15px;background:#f5f8ff">
+    <div class="label">Resource state</div>
+    <h3 style="margin:7px 0">进入窗口</h3>
+    <p>保存进入时间和资源身份。评论早于该时间只写入基线，不生成通知。</p>
+  </div>
+  <div style="border:1px solid #3c9a7c;border-radius:10px;padding:15px;background:#f2fbf7">
+    <div class="label">Scan state</div>
+    <h3 style="margin:7px 0">可恢复任务</h3>
+    <p>一级游标、根楼 rpid、楼中楼页码和下一次执行时间均可在重启后恢复。</p>
+  </div>
+  <div style="border:1px solid #d79532;border-radius:10px;padding:15px;background:#fff9ee">
+    <div class="label">Event state</div>
+    <h3 style="margin:7px 0">已观察事件</h3>
+    <p>以资源键 + rpid 去重。扫描成功持久化后才结束该分页任务。</p>
+  </div>
+  <div style="border:1px solid #a66cc8;border-radius:10px;padding:15px;background:#fbf5ff">
+    <div class="label">Delivery state</div>
+    <h3 style="margin:7px 0">群级确认</h3>
+    <p>每个群独立记录待发、已发或重试时间；发送成功后才确认。</p>
+  </div>
+</div>
+
+<div class="section" style="display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin:22px 0;color:#526070;font-weight:600">
+  <span style="padding:8px 12px;border-radius:18px;background:#e9f0ff">BOOTSTRAPPING</span>
+  <span style="color:#5d8eea">-&gt;</span>
+  <span style="padding:8px 12px;border-radius:18px;background:#e7f8f0">ACTIVE</span>
+  <span style="color:#5d8eea">-&gt;</span>
+  <span style="padding:8px 12px;border-radius:18px;background:#fff3dc">RETIRED</span>
+  <span style="color:#5d8eea">-&gt;</span>
+  <span style="padding:8px 12px;border-radius:18px;background:#f2eef9">PURGED</span>
+</div>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">生命周期语义</div>
+    <div class="mockup-body">
+      <ul>
+        <li><strong>BOOTSTRAPPING:</strong> 记录进入时间；扫描旧评论时仅建立已见 ID 基线。</li>
+        <li><strong>ACTIVE:</strong> 持续完成一级楼与楼中楼任务；新目标评论写入 outbox。</li>
+        <li><strong>RETIRED:</strong> 资源离开 3+3 窗口，停止新增抓取任务；此前已捕获但未送达的事件继续重试。</li>
+        <li><strong>PURGED:</strong> 所有已捕获事件均被群确认后，才清理资源的去重与抓取记录。</li>
+      </ul>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">失败与边界规则</div>
+    <div class="mockup-body">
+      <ul>
+        <li>412、429、网络和解析异常都保留当前检查点，指数退避并限制在 12 小时内。</li>
+        <li>不根据单个“已知 rpid”提前停止；分页完成由持久化任务边界判定。</li>
+        <li>同一秒的评论按“新”处理，优先保证至少一次，最多可能多报进入窗口前的一秒内容。</li>
+        <li>发送后持久化失败视为结果不确定，下次允许重发，绝不把它标成已确认。</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="options" style="margin-top:24px">
+  <div class="option" data-choice="state-model-approved" onclick="toggleSelect(this)">
+    <div class="letter">OK</div>
+    <div class="content">
+      <h3>状态与恢复语义正确</h3>
+      <p>点击后在终端回复“确认”，我会继续展示验证与真实 Cookie 集成测试的边界。</p>
+    </div>
+  </div>
+</div>

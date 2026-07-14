@@ -7,7 +7,12 @@ from typing import Any, Optional
 
 from bilibili_api import login_v2
 
-from asoul_bilibili import BilibiliNotification
+from asoul_bilibili import (
+    BilibiliAdditionalCard,
+    BilibiliAuthorCardProfile,
+    BilibiliNotification,
+    merge_bilibili_author_profiles,
+)
 from asoul_bilibili_runtime import BilibiliRuntime
 from asoul_core import DISPLAY_TZ
 
@@ -40,15 +45,34 @@ class BilibiliCommandService:
             return None
 
         post = posts[0]
+        author_name = post.author.name or await self._runtime.gateway.get_user_name(uid)
+        profile = await self._runtime.get_author_card_profile(
+            uid,
+            fallback=post.author
+            if post.author.name or post.author.avatar_url
+            else BilibiliAuthorCardProfile(uid=uid, name=author_name),
+        )
         return BilibiliNotification(
             kind="dynamic",
             uid=uid,
-            author_name=await self._runtime.gateway.get_user_name(uid),
+            author_name=author_name,
             title="",
             url=post.url,
             text=post.text,
             rich_nodes=post.rich_nodes,
             image_urls=post.image_urls,
+            cover_url=post.cover_url,
+            content_id=post.id,
+            published_at=post.created_at,
+            author_profile=merge_bilibili_author_profiles(
+                profile,
+                post.author,
+                uid=uid,
+                name=author_name,
+            ),
+            stats=post.stats,
+            additional_card=post.additional_card,
+            forwarded=post.forwarded,
         )
 
     async def build_video_test_notification(self, uid: str) -> Optional[BilibiliNotification]:
@@ -57,13 +81,29 @@ class BilibiliCommandService:
             return None
 
         post = posts[0]
+        author_name = await self._runtime.gateway.get_user_name(uid)
+        profile = await self._runtime.get_author_card_profile(
+            uid,
+            fallback=BilibiliAuthorCardProfile(uid=uid, name=author_name),
+        )
         return BilibiliNotification(
             kind="video",
             uid=uid,
-            author_name=await self._runtime.gateway.get_user_name(uid),
+            author_name=author_name,
             title=post.title,
             url=post.url,
             cover_url=post.cover_url,
+            content_id=post.id,
+            published_at=post.created_at,
+            author_profile=profile,
+            additional_card=BilibiliAdditionalCard(
+                kind="video",
+                title=post.title,
+                status="已发布",
+                badge="新视频",
+                cover_url=post.cover_url,
+                url=post.url,
+            ),
         )
 
     async def build_live_test_notification(self, uid: str) -> tuple[str, Optional[BilibiliNotification]]:
@@ -75,6 +115,10 @@ class BilibiliCommandService:
         if not live_status.is_live:
             return f"【B站直播状态】{author_name}\n当前未开播\n{live_status.url}", None
 
+        profile = await self._runtime.get_author_card_profile(
+            uid,
+            fallback=BilibiliAuthorCardProfile(uid=uid, name=author_name),
+        )
         return "", BilibiliNotification(
             kind="live",
             uid=uid,
@@ -82,6 +126,18 @@ class BilibiliCommandService:
             title=live_status.title,
             url=live_status.url,
             cover_url=live_status.cover_url,
+            content_id=live_status.room_id,
+            published_at=live_status.started_at,
+            author_profile=profile,
+            stats=live_status.stats,
+            additional_card=BilibiliAdditionalCard(
+                kind="live",
+                title=live_status.title,
+                status="直播中",
+                badge="直播中",
+                cover_url=live_status.cover_url,
+                url=live_status.url,
+            ),
         )
 
     async def build_comment_test_notifications(self, uid: str) -> list[BilibiliNotification]:

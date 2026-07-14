@@ -35,6 +35,12 @@ class RecordingContext:
         return None
 
 
+class HangingSendContext(RecordingContext):
+    async def send_message(self, origin, result):
+        self.sent.append(origin)
+        await asyncio.Event().wait()
+
+
 class FakeMonitor:
     def __init__(self, main_module) -> None:
         self.main = main_module
@@ -371,6 +377,26 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         state_b = plugin._bilibili_runtime.monitor_state["targets"][origin_b]["uids"]["100"]
         self.assertEqual(state_a["last_dynamic_id"], "dyn-2")
         self.assertEqual(state_b["last_dynamic_id"], "dyn-2")
+
+    def test_send_timeout_does_not_advance_content_cursor(self) -> None:
+        context = HangingSendContext()
+        origin = "aiocqhttp:GroupMessage:100"
+        plugin = self._new_plugin(context, ["100"])
+        runtime = plugin._bilibili_runtime
+        runtime.push_targets = {
+            origin: {
+                "group_id": "100",
+                "platform_name": "aiocqhttp",
+                "unified_msg_origin": origin,
+            }
+        }
+
+        with patch("asoul_bilibili_runtime.MESSAGE_SEND_TIMEOUT_SECONDS", 0.01):
+            asyncio.run(runtime.poll_bilibili_updates_for_uid("100"))
+
+        target_state = runtime.monitor_state["targets"][origin]["uids"].get("100", {})
+        self.assertEqual(target_state, {})
+        self.assertEqual(context.sent, [origin])
 
 
 if __name__ == "__main__":

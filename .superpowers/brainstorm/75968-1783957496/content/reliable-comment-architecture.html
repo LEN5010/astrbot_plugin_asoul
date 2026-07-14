@@ -1,0 +1,67 @@
+<h2>方案 1: 评论抓取架构</h2>
+<p class="subtitle">范围固定为每位受监控账号最近 3 条动态和 3 个视频。启用后新增的目标 UID 评论最终至少通知一次；历史评论只建立基线，资源离开窗口即停止追踪。</p>
+
+<div class="section" style="display:grid;grid-template-columns:repeat(4,minmax(145px,1fr));gap:14px;align-items:stretch;margin-top:28px">
+  <div style="border:1px solid #5d8eea;border-radius:10px;padding:16px;background:#f5f8ff">
+    <div class="label">01 Scope</div>
+    <h3 style="margin:7px 0">资源目录</h3>
+    <p>每 600 秒发现最新 3 条动态和 3 个视频，并记录资源进入或离开窗口的时刻。</p>
+  </div>
+  <div style="border:1px solid #3c9a7c;border-radius:10px;padding:16px;background:#f2fbf7">
+    <div class="label">02 Capture</div>
+    <h3 style="margin:7px 0">可恢复抓取队列</h3>
+    <p>按一级评论游标和楼中楼页码分批扫描。限流时延后任务，不以固定 20 楼或 3 页截断。</p>
+  </div>
+  <div style="border:1px solid #d79532;border-radius:10px;padding:16px;background:#fff9ee">
+    <div class="label">03 Store</div>
+    <h3 style="margin:7px 0">事件 Outbox</h3>
+    <p>用资源键加评论 rpid 记录已观察事件；只将目标 UID 的新事件放入待投递队列。</p>
+  </div>
+  <div style="border:1px solid #a66cc8;border-radius:10px;padding:16px;background:#fbf5ff">
+    <div class="label">04 Deliver</div>
+    <h3 style="margin:7px 0">群确认</h3>
+    <p>每个群分别确认。发送成功后才确认；失败事件保留并按退避策略重试。</p>
+  </div>
+</div>
+
+<div class="section" style="display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;margin:20px 0 26px;color:#526070;font-weight:600">
+  <span>资源进入窗口</span><span style="color:#5d8eea">-&gt;</span>
+  <span>建立时间基线</span><span style="color:#5d8eea">-&gt;</span>
+  <span>抓取与去重</span><span style="color:#5d8eea">-&gt;</span>
+  <span>投递与群级确认</span>
+</div>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">可靠性规则</div>
+    <div class="mockup-body">
+      <ul>
+        <li>首次看到资源时，按进入窗口时间过滤历史评论，不生成通知。</li>
+        <li>不因遇到单个已知评论提前停止；仅在持久化边界已经被完整跨越时结束本轮。</li>
+        <li>定期做低优先级全量核对，补偿接口乱序、页漂移和暂时失败。</li>
+        <li>限流、网络失败或持久化失败均不推进抓取或投递确认点。</li>
+      </ul>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">明确不做的事</div>
+    <div class="mockup-body">
+      <ul>
+        <li>不回放资源进入窗口前的历史评论。</li>
+        <li>不追踪已退出最近 3 动态或 3 视频范围的资源。</li>
+        <li>不承诺端到端严格仅一次；发送结果不确定时允许重复，优先不漏。</li>
+        <li>不在插件代码、配置文件或日志中保存真实 Cookie。</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="options" style="margin-top:24px">
+  <div class="option" data-choice="architecture-approved" onclick="toggleSelect(this)">
+    <div class="letter">OK</div>
+    <div class="content">
+      <h3>数据流与边界正确</h3>
+      <p>点击后再在终端回复“确认”，我会继续展开状态模型与错误处理。</p>
+    </div>
+  </div>
+</div>

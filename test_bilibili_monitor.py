@@ -7,10 +7,14 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from asoul_bilibili import (
+    BilibiliAdditionalCard,
+    BilibiliAuthorCardProfile,
     BilibiliCommentPost,
     BilibiliCommentResource,
     BilibiliCommentSnapshot,
     BilibiliDynamicPost,
+    BilibiliEngagementStats,
+    BilibiliForwardedContent,
     BilibiliGateway,
     BilibiliLiveStatus,
     BilibiliMonitorService,
@@ -327,6 +331,64 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
         self.assertEqual(notifications, [])
         self.assertEqual(state["uids"]["100"]["last_dynamic_id"], "dyn-3")
         self.assertFalse(state["uids"]["100"]["last_live_active"])
+
+    def test_dynamic_notification_carries_all_card_fields(self) -> None:
+        profile = BilibiliAuthorCardProfile(
+            uid="100",
+            name="资料昵称",
+            avatar_url="https://i.example/avatar.png",
+            follower=726000,
+            fetched_at=NOW_TS,
+        )
+        stats = BilibiliEngagementStats(
+            like_count=77,
+            comment_count=6,
+            forward_count=2,
+        )
+        additional = BilibiliAdditionalCard(
+            kind="reserve",
+            title="直播预约",
+            subtitle="07-16 12:00 直播",
+            url="https://www.bilibili.com/blackboard/live/activity",
+        )
+        forwarded = BilibiliForwardedContent(
+            author_name="原作者",
+            text="原动态正文",
+        )
+        post = BilibiliDynamicPost(
+            id="dyn-card",
+            text="新动态",
+            url="https://t.bilibili.com/dyn-card",
+            created_at=NOW_TS,
+            stats=stats,
+            additional_card=additional,
+            forwarded=forwarded,
+        )
+        snapshot = BilibiliUidSnapshot(
+            uid="100",
+            author_name="测试账号",
+            author_profile=profile,
+            dynamics=[post],
+        )
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            plan = self.service.plan_uid_deliveries(
+                self.config,
+                {
+                    "last_dynamic_id": "old",
+                    "last_dynamic_created_at": NOW_TS - 1,
+                    "recent_dynamic_ids": ["old"],
+                },
+                snapshot,
+            )
+
+        notification = plan.deliveries[0].notification
+        self.assertEqual(notification.content_id, "dyn-card")
+        self.assertEqual(notification.published_at, NOW_TS)
+        self.assertEqual(notification.author_profile, profile)
+        self.assertEqual(notification.stats, stats)
+        self.assertEqual(notification.additional_card, additional)
+        self.assertEqual(notification.forwarded, forwarded)
 
     def test_second_poll_sends_all_unseen_dynamic_and_video_updates(self) -> None:
         with patch("asoul_bilibili.time.time", return_value=NOW_TS):
@@ -1004,6 +1066,14 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
 
 class BilibiliConfigParsingTest(unittest.TestCase):
+    def test_card_rendering_defaults_on_and_can_be_disabled(self) -> None:
+        self.assertTrue(build_bilibili_push_config({}).render_bilibili_cards)
+        self.assertFalse(
+            build_bilibili_push_config(
+                {"render_bilibili_cards": False}
+            ).render_bilibili_cards
+        )
+
     def test_build_config_falls_back_when_poll_interval_is_invalid(self) -> None:
         config = build_bilibili_push_config(
             {
@@ -1026,6 +1096,41 @@ class BilibiliConfigParsingTest(unittest.TestCase):
 
 
 class BilibiliParsingTest(unittest.TestCase):
+    def test_get_user_card_profile_combines_three_user_apis(self) -> None:
+        class FakeUser:
+            async def get_user_info(self):
+                return {
+                    "name": "测试账号",
+                    "face": "//i.example/avatar.png",
+                    "pendant": {"image": "https://i.example/pendant.png"},
+                }
+
+            async def get_relation_info(self):
+                return {"following": 23, "follower": 726000}
+
+            async def get_up_stat(self):
+                return {"likes": 18807000}
+
+        gateway = BilibiliGateway()
+        gateway._new_user = lambda _uid: FakeUser()
+
+        with patch("asoul_bilibili.time.time", return_value=NOW_TS):
+            profile = asyncio.run(gateway.get_user_card_profile("100"))
+
+        self.assertEqual(
+            profile,
+            BilibiliAuthorCardProfile(
+                uid="100",
+                name="测试账号",
+                avatar_url="https://i.example/avatar.png",
+                pendant_url="https://i.example/pendant.png",
+                total_likes=18807000,
+                following=23,
+                follower=726000,
+                fetched_at=NOW_TS,
+            ),
+        )
+
     def setUp(self) -> None:
         self.gateway = ParsingGateway()
 
@@ -1138,7 +1243,146 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertIn("明晚电台", post.text)
         self.assertIn("直播预约：【突击/电台】一起聊聊天~", post.text)
         self.assertIn("明天 20:00 直播", post.text)
-        self.assertEqual(post.url, "https://live.bilibili.com/blackboard/reserve")
+        self.assertEqual(post.url, "https://t.bilibili.com/dyn-reserve")
+        self.assertEqual(
+            post.additional_card.url,
+            "https://live.bilibili.com/blackboard/reserve",
+        )
+
+    def test_parse_dynamic_extracts_structured_card_metadata(self) -> None:
+        item = {
+            "id_str": "dyn-card",
+            "basic": {"jump_url": "javascript:alert(1)"},
+            "modules": {
+                "module_author": {
+                    "name": "贝拉kira",
+                    "face": "//i0.hdslb.com/avatar.jpg",
+                    "pendant": {"image": "https://i0.hdslb.com/pendant.png"},
+                    "pub_ts": NOW_TS,
+                },
+                "module_stat": {
+                    "like": {"count": 77},
+                    "comment": {"count": 6},
+                    "forward": {"count": 2},
+                },
+                "module_dynamic": {
+                    "desc": {"text": "巨龙腾飞！"},
+                    "major": {
+                        "opus": {
+                            "pics": [
+                                {"url": f"https://i0.hdslb.com/{index}.jpg"}
+                                for index in range(10)
+                            ]
+                        }
+                    },
+                    "additional": {
+                        "reserve": {
+                            "title": "直播预约：【突击】过终末地1.4主线！",
+                            "desc1": {"text": "07-16 12:00 直播"},
+                            "desc2": {"text": "60人预约"},
+                            "jump_url": "https://live.bilibili.com/blackboard/reserve",
+                        }
+                    },
+                },
+            },
+        }
+
+        post = self.gateway._parse_dynamic_post(item)
+
+        self.assertIsNotNone(post)
+        assert post is not None
+        self.assertEqual(post.url, "https://t.bilibili.com/dyn-card")
+        self.assertEqual(post.author.name, "贝拉kira")
+        self.assertEqual(post.author.avatar_url, "https://i0.hdslb.com/avatar.jpg")
+        self.assertEqual(post.author.pendant_url, "https://i0.hdslb.com/pendant.png")
+        self.assertEqual(post.stats.like_count, 77)
+        self.assertEqual(post.stats.comment_count, 6)
+        self.assertEqual(post.stats.forward_count, 2)
+        self.assertEqual(len(post.image_urls), 9)
+        self.assertEqual(post.additional_card.kind, "reserve")
+        self.assertIn("终末地1.4主线", post.additional_card.title)
+        self.assertEqual(post.additional_card.subtitle, "07-16 12:00 直播 · 60人预约")
+
+    def test_parse_dynamic_rich_text_preserves_safe_links_and_emotes(self) -> None:
+        item = {
+            "id_str": "dyn-rich",
+            "modules": {
+                "module_dynamic": {
+                    "desc": {
+                        "rich_text_nodes": [
+                            {
+                                "type": "RICH_TEXT_NODE_TYPE_TOPIC",
+                                "text": "#测试话题#",
+                                "jump_url": "https://search.bilibili.com/all?keyword=test",
+                            },
+                            {
+                                "type": "RICH_TEXT_NODE_TYPE_EMOJI",
+                                "text": "[星星眼]",
+                                "emoji": {"icon_url": "//i.example/emoji.png"},
+                            },
+                            {
+                                "type": "RICH_TEXT_NODE_TYPE_WEB",
+                                "text": "危险",
+                                "jump_url": "javascript:alert(1)",
+                            },
+                        ]
+                    }
+                }
+            },
+        }
+
+        post = self.gateway._parse_dynamic_post(item)
+
+        self.assertIsNotNone(post)
+        assert post is not None
+        self.assertEqual(post.rich_nodes[0].kind, "link")
+        self.assertEqual(
+            post.rich_nodes[0].url,
+            "https://search.bilibili.com/all?keyword=test",
+        )
+        self.assertEqual(post.rich_nodes[1].kind, "emoji")
+        self.assertEqual(post.rich_nodes[1].image_url, "https://i.example/emoji.png")
+        self.assertEqual(post.rich_nodes[2].kind, "text")
+        self.assertEqual(post.rich_nodes[2].url, "")
+
+    def test_parse_forward_dynamic_preserves_structured_original(self) -> None:
+        item = {
+            "id_str": "dyn-forward-card",
+            "modules": {
+                "module_dynamic": {"desc": {"text": "转发一下"}},
+            },
+            "orig": {
+                "modules": {
+                    "module_author": {
+                        "name": "A-SOUL_Official",
+                        "face": "https://i0.hdslb.com/original-avatar.jpg",
+                    },
+                    "module_dynamic": {
+                        "desc": {"text": "原动态正文"},
+                        "major": {
+                            "draw": {
+                                "items": [
+                                    {"src": "https://i0.hdslb.com/original.jpg"}
+                                ]
+                            }
+                        },
+                    },
+                }
+            },
+        }
+
+        post = self.gateway._parse_dynamic_post(item)
+
+        self.assertIsNotNone(post)
+        assert post is not None
+        self.assertIsNotNone(post.forwarded)
+        assert post.forwarded is not None
+        self.assertEqual(post.forwarded.author_name, "A-SOUL_Official")
+        self.assertEqual(post.forwarded.text, "原动态正文")
+        self.assertEqual(
+            post.forwarded.image_urls,
+            ["https://i0.hdslb.com/original.jpg"],
+        )
 
     def test_pinned_dynamic_newer_than_cursor_is_delivered_even_after_five_minutes(self) -> None:
         snapshot = BilibiliUidSnapshot(

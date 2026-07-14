@@ -107,6 +107,12 @@
     "type": "bool",
     "default": true
   },
+  "render_bilibili_cards": {
+    "description": "使用统一 B 站图片卡片",
+    "type": "bool",
+    "default": true,
+    "hint": "动态、新视频和开播通知默认渲染为图片卡片；关闭后立即回退旧消息格式。评论通知不受影响。"
+  },
   "push_comment": {
     "description": "启动评论抓取",
     "type": "bool",

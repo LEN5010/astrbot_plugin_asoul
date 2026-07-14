@@ -42,6 +42,7 @@ BILIBILI_CREDENTIAL_FIELDS = (
 KV_BILIBILI_MONITOR_STATE = "bilibili_monitor_state"
 KV_BILIBILI_GROUP_ORIGINS = "bilibili_group_origins"
 KV_BILIBILI_CREDENTIAL = "bilibili_credential"
+KV_BILIBILI_PROFILE_CACHE = "bilibili_profile_cache"
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class BilibiliPushConfig:
     push_comment: bool
     request_client: str
     credential_data: Dict[str, str]
+    render_bilibili_cards: bool = True
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,47 @@ class BilibiliRichTextNode:
     kind: str
     text: str = ""
     image_url: str = ""
+    url: str = ""
+
+
+@dataclass(frozen=True)
+class BilibiliAuthorCardProfile:
+    uid: str = ""
+    name: str = ""
+    avatar_url: str = ""
+    pendant_url: str = ""
+    total_likes: Optional[int] = None
+    following: Optional[int] = None
+    follower: Optional[int] = None
+    fetched_at: int = 0
+
+
+@dataclass(frozen=True)
+class BilibiliEngagementStats:
+    like_count: int = 0
+    comment_count: int = 0
+    forward_count: int = 0
+
+
+@dataclass(frozen=True)
+class BilibiliAdditionalCard:
+    kind: str = ""
+    title: str = ""
+    subtitle: str = ""
+    status: str = ""
+    badge: str = ""
+    cover_url: str = ""
+    url: str = ""
+
+
+@dataclass(frozen=True)
+class BilibiliForwardedContent:
+    author_name: str = ""
+    avatar_url: str = ""
+    text: str = ""
+    rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
+    image_urls: List[str] = field(default_factory=list)
+    title: str = ""
 
 
 @dataclass(frozen=True)
@@ -80,6 +123,10 @@ class BilibiliDynamicPost:
     created_at: int = 0
     comment_oid: int = 0
     comment_type: int = 0
+    author: BilibiliAuthorCardProfile = field(default_factory=BilibiliAuthorCardProfile)
+    stats: BilibiliEngagementStats = field(default_factory=BilibiliEngagementStats)
+    additional_card: BilibiliAdditionalCard = field(default_factory=BilibiliAdditionalCard)
+    forwarded: Optional[BilibiliForwardedContent] = None
     is_pinned_dynamic: bool = False
     is_live_room_dynamic: bool = False
     is_video_dynamic: bool = False
@@ -102,6 +149,8 @@ class BilibiliLiveStatus:
     room_id: str
     url: str
     cover_url: str = ""
+    started_at: int = 0
+    stats: BilibiliEngagementStats = field(default_factory=BilibiliEngagementStats)
 
 
 @dataclass(frozen=True)
@@ -120,6 +169,14 @@ class BilibiliNotification:
     comment_resource_kind: str = ""
     comment_resource_title: str = ""
     comment_action_text: str = ""
+    content_id: str = ""
+    published_at: int = 0
+    author_profile: BilibiliAuthorCardProfile = field(
+        default_factory=BilibiliAuthorCardProfile
+    )
+    stats: BilibiliEngagementStats = field(default_factory=BilibiliEngagementStats)
+    additional_card: BilibiliAdditionalCard = field(default_factory=BilibiliAdditionalCard)
+    forwarded: Optional[BilibiliForwardedContent] = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +209,9 @@ class BilibiliCommentPost:
 class BilibiliUidSnapshot:
     uid: str
     author_name: str
+    author_profile: BilibiliAuthorCardProfile = field(
+        default_factory=BilibiliAuthorCardProfile
+    )
     dynamics: List[BilibiliDynamicPost] = field(default_factory=list)
     live_status: Optional[BilibiliLiveStatus] = None
 
@@ -175,6 +235,25 @@ class BilibiliPlannedNotification:
 class BilibiliUidDeliveryPlan:
     deliveries: List[BilibiliPlannedNotification] = field(default_factory=list)
     final_state: Dict[str, Any] = field(default_factory=dict)
+
+
+def merge_bilibili_author_profiles(
+    cached: BilibiliAuthorCardProfile,
+    content_author: BilibiliAuthorCardProfile,
+    *,
+    uid: str,
+    name: str,
+) -> BilibiliAuthorCardProfile:
+    return BilibiliAuthorCardProfile(
+        uid=content_author.uid or cached.uid or uid,
+        name=content_author.name or cached.name or name,
+        avatar_url=content_author.avatar_url or cached.avatar_url,
+        pendant_url=content_author.pendant_url or cached.pendant_url,
+        total_likes=cached.total_likes,
+        following=cached.following,
+        follower=cached.follower,
+        fetched_at=cached.fetched_at,
+    )
 
 
 def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> BilibiliPushConfig:
@@ -203,6 +282,7 @@ def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> Bilibili
         push_comment=bool(source.get("push_comment", False)),
         request_client=request_client,
         credential_data=_normalize_credential_data(source),
+        render_bilibili_cards=bool(source.get("render_bilibili_cards", True)),
     )
 
 
@@ -352,6 +432,48 @@ class BilibiliGateway:
                 return value.strip()
 
         return uid
+
+    async def get_user_card_profile(self, uid: str) -> BilibiliAuthorCardProfile:
+        normalized_uid = normalize_bilibili_uid(uid)
+        user_obj = self._new_user(normalized_uid)
+        responses = await asyncio.gather(
+            user_obj.get_user_info(),
+            user_obj.get_relation_info(),
+            user_obj.get_up_stat(),
+            return_exceptions=True,
+        )
+        errors = [item for item in responses if isinstance(item, Exception)]
+        if len(errors) == len(responses):
+            raise errors[0]
+
+        info = responses[0] if isinstance(responses[0], dict) else {}
+        relation = responses[1] if isinstance(responses[1], dict) else {}
+        up_stat = responses[2] if isinstance(responses[2], dict) else {}
+        pendant = info.get("pendant") if isinstance(info.get("pendant"), dict) else {}
+        name = next(
+            (
+                str(info.get(key) or "").strip()
+                for key in ("name", "uname", "nickname")
+                if str(info.get(key) or "").strip()
+            ),
+            normalized_uid,
+        )
+        return BilibiliAuthorCardProfile(
+            uid=normalized_uid,
+            name=name,
+            avatar_url=_normalize_url(info.get("face", "")),
+            pendant_url=_normalize_url(
+                pendant.get("image") or pendant.get("image_enhance") or ""
+            ),
+            total_likes=_optional_non_negative_int(
+                up_stat.get("likes", up_stat.get("archive", {}).get("view"))
+                if isinstance(up_stat.get("archive"), dict)
+                else up_stat.get("likes")
+            ),
+            following=_optional_non_negative_int(relation.get("following")),
+            follower=_optional_non_negative_int(relation.get("follower")),
+            fetched_at=int(time.time()),
+        )
 
     async def get_recent_dynamics(
         self,
@@ -916,6 +1038,9 @@ class BilibiliGateway:
         is_video_dynamic = bool(archive) and any(
             archive.get(key) for key in ("bvid", "aid", "jump_url")
         )
+        is_live_room_dynamic = self._is_live_room_dynamic(item)
+        if not is_video_dynamic and not is_live_room_dynamic:
+            url = f"https://t.bilibili.com/{dynamic_id}"
         title = str(archive.get("title", "") or "").strip()
         cover_url = _normalize_url(str(archive.get("cover", "") or "").strip())
 
@@ -930,8 +1055,147 @@ class BilibiliGateway:
             created_at=created_at,
             comment_oid=comment_oid,
             comment_type=comment_type,
-            is_live_room_dynamic=self._is_live_room_dynamic(item),
+            author=self._parse_dynamic_author(item),
+            stats=self._parse_dynamic_stats(item),
+            additional_card=self._parse_dynamic_additional_card(item),
+            forwarded=self._parse_forwarded_content(item),
+            is_live_room_dynamic=is_live_room_dynamic,
             is_video_dynamic=is_video_dynamic,
+        )
+
+    def _parse_dynamic_author(self, item: Dict[str, Any]) -> BilibiliAuthorCardProfile:
+        modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
+        author = modules.get("module_author", {})
+        author = author if isinstance(author, dict) else {}
+        pendant = author.get("pendant", {})
+        pendant = pendant if isinstance(pendant, dict) else {}
+        return BilibiliAuthorCardProfile(
+            uid=str(author.get("mid", "") or author.get("uid", "") or "").strip(),
+            name=str(author.get("name", "") or "").strip(),
+            avatar_url=_normalize_url(str(author.get("face", "") or "")),
+            pendant_url=_normalize_url(str(pendant.get("image", "") or "")),
+        )
+
+    def _parse_dynamic_stats(self, item: Dict[str, Any]) -> BilibiliEngagementStats:
+        modules = item.get("modules", {}) if isinstance(item.get("modules"), dict) else {}
+        stats = modules.get("module_stat", {})
+        stats = stats if isinstance(stats, dict) else {}
+
+        def count(name: str) -> int:
+            value = stats.get(name, {})
+            if isinstance(value, dict):
+                value = value.get("count", value.get("num", 0))
+            return max(0, _safe_int(value))
+
+        return BilibiliEngagementStats(
+            like_count=count("like"),
+            comment_count=count("comment"),
+            forward_count=count("forward"),
+        )
+
+    def _parse_dynamic_additional_card(
+        self, item: Dict[str, Any]
+    ) -> BilibiliAdditionalCard:
+        module_dynamic = self._get_module_dynamic(item)
+        major = module_dynamic.get("major", {})
+        major = major if isinstance(major, dict) else {}
+        additional = self._get_dynamic_additional(item)
+
+        reserve = additional.get("reserve", {})
+        if isinstance(reserve, dict) and reserve:
+            subtitle_parts = [
+                self._extract_nested_text(reserve.get("desc1", {})),
+                self._extract_nested_text(reserve.get("desc2", {})),
+            ]
+            return BilibiliAdditionalCard(
+                kind="reserve",
+                title=str(reserve.get("title", "") or "").strip(),
+                subtitle=" · ".join(part for part in subtitle_parts if part),
+                status=self._extract_nested_text(reserve.get("button", {})),
+                badge="预约",
+                cover_url=_normalize_url(
+                    str(
+                        self._find_value_by_paths(
+                            reserve,
+                            (("cover",), ("cover_url",), ("head_text", "pic")),
+                        )
+                        or ""
+                    )
+                ),
+                url=_normalize_url(str(reserve.get("jump_url", "") or "")),
+            )
+
+        archive = major.get("archive", {})
+        if isinstance(archive, dict) and archive:
+            return BilibiliAdditionalCard(
+                kind="video",
+                title=str(archive.get("title", "") or "").strip(),
+                subtitle=str(archive.get("desc", "") or "").strip(),
+                status=str(archive.get("badge", "") or "").strip(),
+                badge="视频",
+                cover_url=_normalize_url(str(archive.get("cover", "") or "")),
+                url=_normalize_url(str(archive.get("jump_url", "") or "")),
+            )
+
+        live_payload = self._extract_live_rcmd_payload(major.get("live_rcmd"))
+        if live_payload:
+            return BilibiliAdditionalCard(
+                kind="live",
+                title=str(
+                    self._find_value_by_paths(
+                        live_payload,
+                        (("title",), ("live_play_info", "title")),
+                    )
+                    or ""
+                ).strip(),
+                status="直播中",
+                badge="直播",
+                cover_url=_normalize_url(
+                    str(
+                        self._find_value_by_paths(
+                            live_payload,
+                            (("cover",), ("live_play_info", "cover")),
+                        )
+                        or ""
+                    )
+                ),
+                url=_normalize_url(
+                    str(
+                        self._find_value_by_paths(
+                            live_payload,
+                            (("link",), ("live_play_info", "link")),
+                        )
+                        or ""
+                    )
+                ),
+            )
+        return BilibiliAdditionalCard()
+
+    def _parse_forwarded_content(
+        self, item: Dict[str, Any]
+    ) -> Optional[BilibiliForwardedContent]:
+        original = item.get("orig")
+        if not isinstance(original, dict):
+            return None
+        author = self._parse_dynamic_author(original)
+        rich_nodes, plain_text = self._extract_primary_dynamic_rich_nodes(original)
+        module_dynamic = self._get_module_dynamic(original)
+        major = module_dynamic.get("major", {})
+        major = major if isinstance(major, dict) else {}
+        title = str(
+            self._find_value_by_paths(
+                major,
+                (("opus", "title"), ("archive", "title"), ("article", "title")),
+            )
+            or ""
+        ).strip()
+        return BilibiliForwardedContent(
+            author_name=author.name,
+            avatar_url=author.avatar_url,
+            text=plain_text,
+            rich_nodes=rich_nodes,
+            image_urls=self._extract_dynamic_image_urls(original, include_orig=False)[:9],
+            title=title,
         )
 
     def _is_live_room_dynamic(self, item: Dict[str, Any]) -> bool:
@@ -997,7 +1261,19 @@ class BilibiliGateway:
                     plain_parts.append(node_text)
                 continue
             if node_text:
-                nodes.append(BilibiliRichTextNode(kind="text", text=node_text))
+                node_url = _normalize_url(raw_node.get("jump_url", ""))
+                node_type = str(raw_node.get("type", "") or "").upper()
+                if not node_url and node_type.endswith("_AT"):
+                    mention_uid = str(raw_node.get("rid", "") or "").strip()
+                    if mention_uid.isdigit():
+                        node_url = f"https://space.bilibili.com/{mention_uid}"
+                nodes.append(
+                    BilibiliRichTextNode(
+                        kind="link" if node_url else "text",
+                        text=node_text,
+                        url=node_url,
+                    )
+                )
                 plain_parts.append(node_text)
 
         summary_text = str(summary.get("text", "") or desc.get("text", "") or "").strip()
@@ -1067,7 +1343,7 @@ class BilibiliGateway:
                 for image_url in self._extract_dynamic_image_urls(orig, include_orig=False):
                     append_candidate(image_url)
 
-        return image_urls
+        return image_urls[:9]
 
     def _extract_dynamic_url(self, item: Dict[str, Any]) -> str:
         url_value = (
@@ -1901,6 +2177,12 @@ class BilibiliMonitorService:
                 key=lambda item: (item.created_at, _safe_int(item.id)),
             ):
                 self._record_dynamic_id(progress_state, post.id, post.created_at)
+                author_profile = merge_bilibili_author_profiles(
+                    snapshot.author_profile,
+                    post.author,
+                    uid=snapshot.uid,
+                    name=snapshot.author_name,
+                )
                 if post.is_live_room_dynamic:
                     continue
                 if post.is_video_dynamic:
@@ -1913,8 +2195,17 @@ class BilibiliMonitorService:
                                     author_name=snapshot.author_name,
                                     title=post.title or "发布了新视频",
                                     url=post.url,
+                                    text=post.text,
+                                    rich_nodes=post.rich_nodes,
+                                    image_urls=post.image_urls,
                                     cover_url=post.cover_url
                                     or (post.image_urls[0] if post.image_urls else ""),
+                                    content_id=post.id,
+                                    published_at=post.created_at,
+                                    author_profile=author_profile,
+                                    stats=post.stats,
+                                    additional_card=post.additional_card,
+                                    forwarded=post.forwarded,
                                 ),
                                 uid_state=deepcopy(progress_state),
                             )
@@ -1932,6 +2223,13 @@ class BilibiliMonitorService:
                                 text=post.text,
                                 rich_nodes=post.rich_nodes,
                                 image_urls=post.image_urls,
+                                cover_url=post.cover_url,
+                                content_id=post.id,
+                                published_at=post.created_at,
+                                author_profile=author_profile,
+                                stats=post.stats,
+                                additional_card=post.additional_card,
+                                forwarded=post.forwarded,
                             ),
                             uid_state=deepcopy(progress_state),
                         )
@@ -1968,6 +2266,23 @@ class BilibiliMonitorService:
                                 title=snapshot.live_status.title or "直播已开始",
                                 url=snapshot.live_status.url,
                                 cover_url=snapshot.live_status.cover_url,
+                                content_id=snapshot.live_status.room_id,
+                                published_at=snapshot.live_status.started_at,
+                                author_profile=merge_bilibili_author_profiles(
+                                    snapshot.author_profile,
+                                    BilibiliAuthorCardProfile(),
+                                    uid=snapshot.uid,
+                                    name=snapshot.author_name,
+                                ),
+                                stats=snapshot.live_status.stats,
+                                additional_card=BilibiliAdditionalCard(
+                                    kind="live",
+                                    title=snapshot.live_status.title or "直播已开始",
+                                    status="直播中",
+                                    badge="直播中",
+                                    cover_url=snapshot.live_status.cover_url,
+                                    url=snapshot.live_status.url,
+                                ),
                             ),
                             uid_state=deepcopy(live_state),
                         )
@@ -2180,7 +2495,9 @@ def _normalize_url(url: str) -> str:
     if not text:
         return ""
     if text.startswith("//"):
-        return f"https:{text}"
+        text = f"https:{text}"
+    if not text.startswith(("http://", "https://")):
+        return ""
     return text
 
 
@@ -2196,3 +2513,12 @@ def _safe_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _optional_non_negative_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None

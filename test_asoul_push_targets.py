@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from asoul_bilibili import BilibiliNotification, KV_BILIBILI_GROUP_ORIGINS
@@ -258,6 +259,148 @@ class ASoulPushTargetTest(unittest.TestCase):
         self.assertIn(("image_url", "https://i0.hdslb.com/comment-image.png"), parts)
         self.assertEqual(parts[-1][0], "plain")
         self.assertIn("https://www.bilibili.com/video/BV1xx411c7mD", parts[-1][1])
+
+    def test_card_result_is_image_plus_clickable_url_and_only_live_uses_atall(self) -> None:
+        from asoul_bilibili_runtime import BilibiliPushTarget
+
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        rendered_kinds = []
+
+        class FakeRenderer:
+            async def render(self, notification):
+                rendered_kinds.append(notification.kind)
+                return "/tmp/bilibili-card.png"
+
+        async def allow_atall(_target):
+            return True
+
+        runtime.card_renderer = FakeRenderer()
+        runtime.should_send_live_atall = allow_atall
+        target = BilibiliPushTarget(
+            group_id="100",
+            platform_name="aiocqhttp",
+            unified_msg_origin="aiocqhttp:GroupMessage:100",
+        )
+        dynamic = BilibiliNotification(
+            kind="dynamic",
+            uid="100",
+            author_name="测试账号",
+            title="",
+            url="https://t.bilibili.com/1",
+        )
+        live = BilibiliNotification(
+            kind="live",
+            uid="100",
+            author_name="测试账号",
+            title="开播了",
+            url="https://live.bilibili.com/1",
+        )
+
+        dynamic_result = asyncio.run(runtime.build_notification_result(dynamic, target))
+        live_result = asyncio.run(runtime.build_notification_result(live, target))
+
+        self.assertEqual(dynamic_result.chain[0], ("image", "/tmp/bilibili-card.png"))
+        self.assertEqual(dynamic_result.chain[1], ("plain", "https://t.bilibili.com/1"))
+        self.assertFalse(any(isinstance(part, self.main.Comp.AtAll) for part in dynamic_result.chain))
+        self.assertIsInstance(live_result.chain[0], self.main.Comp.AtAll)
+        self.assertEqual(live_result.chain[-2], ("image", "/tmp/bilibili-card.png"))
+        self.assertEqual(live_result.chain[-1], ("plain", "https://live.bilibili.com/1"))
+        self.assertEqual(rendered_kinds, ["dynamic", "live"])
+
+    def test_card_render_failure_falls_back_to_legacy_notification(self) -> None:
+        from asoul_bilibili_runtime import BilibiliPushTarget
+
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+
+        class FailingRenderer:
+            async def render(self, _notification):
+                raise RuntimeError("render failed")
+
+        runtime.card_renderer = FailingRenderer()
+        target = BilibiliPushTarget(
+            group_id="100",
+            platform_name="aiocqhttp",
+            unified_msg_origin="aiocqhttp:GroupMessage:100",
+        )
+        notification = BilibiliNotification(
+            kind="video",
+            uid="100",
+            author_name="测试账号",
+            title="新视频",
+            url="https://www.bilibili.com/video/BV1",
+        )
+
+        result = asyncio.run(runtime.build_notification_result(notification, target))
+
+        self.assertIn("【B站新视频】", result.chain[0][1])
+        self.assertIn("https://www.bilibili.com/video/BV1", result.chain[-1][1])
+
+    def test_card_config_switch_bypasses_renderer(self) -> None:
+        from asoul_bilibili_runtime import BilibiliPushTarget
+
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        runtime.push_config = replace(
+            runtime.push_config,
+            render_bilibili_cards=False,
+        )
+
+        class UnexpectedRenderer:
+            async def render(self, _notification):
+                raise AssertionError("renderer should be bypassed")
+
+        runtime.card_renderer = UnexpectedRenderer()
+        target = BilibiliPushTarget(
+            group_id="100",
+            platform_name="aiocqhttp",
+            unified_msg_origin="aiocqhttp:GroupMessage:100",
+        )
+        notification = BilibiliNotification(
+            kind="dynamic",
+            uid="100",
+            author_name="测试账号",
+            title="",
+            text="旧格式正文",
+            url="https://t.bilibili.com/1",
+        )
+
+        result = asyncio.run(runtime.build_notification_result(notification, target))
+
+        self.assertIn("【B站动态】", result.chain[0][1])
+        self.assertIn(("plain", "旧格式正文"), result.chain)
+
+    def test_card_render_timeout_falls_back_to_legacy_notification(self) -> None:
+        from unittest.mock import patch
+
+        from asoul_bilibili_runtime import BilibiliPushTarget
+
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+
+        class HangingRenderer:
+            async def render(self, _notification):
+                await asyncio.Event().wait()
+
+        runtime.card_renderer = HangingRenderer()
+        target = BilibiliPushTarget(
+            group_id="100",
+            platform_name="aiocqhttp",
+            unified_msg_origin="aiocqhttp:GroupMessage:100",
+        )
+        notification = BilibiliNotification(
+            kind="video",
+            uid="100",
+            author_name="测试账号",
+            title="新视频",
+            url="https://www.bilibili.com/video/BV1",
+        )
+
+        with patch("asoul_bilibili_runtime.CARD_RENDER_TIMEOUT_SECONDS", 0.01):
+            result = asyncio.run(runtime.build_notification_result(notification, target))
+
+        self.assertIn("【B站新视频】", result.chain[0][1])
 
 
 if __name__ == "__main__":

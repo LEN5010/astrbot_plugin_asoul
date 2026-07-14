@@ -10,6 +10,7 @@ _install_astrbot_stubs()
 
 from asoul_bilibili import BilibiliGateway
 from asoul_bilibili_runtime import (
+    CONTENT_POLL_STATE_KEY,
     COMMENT_POLL_STATE_KEY,
     COMMENT_RESOURCE_CATALOGS_KEY,
     BilibiliRuntime,
@@ -178,30 +179,238 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
         self.assertEqual(entry["last_success_at"], NOW_TS - 700)
         self.assertEqual(entry["resources"][0]["key"], "video:2003")
 
-    def test_update_and_comment_poll_for_same_uid_do_not_overlap(self) -> None:
+    def test_comment_poll_does_not_block_content_poll_for_same_uid(self) -> None:
         _, runtime = self._new_runtime()
-        active = 0
-        max_active = 0
+        comment_started = asyncio.Event()
+        release_comment = asyncio.Event()
+        content_started = asyncio.Event()
 
-        async def record_concurrency(_uid: str) -> None:
-            nonlocal active, max_active
-            active += 1
-            max_active = max(max_active, active)
-            await asyncio.sleep(0)
-            active -= 1
+        async def block_comment(_uid: str) -> None:
+            comment_started.set()
+            await release_comment.wait()
 
-        runtime._poll_bilibili_updates_for_uid = record_concurrency
-        runtime._poll_bilibili_comments_for_uid = record_concurrency
+        async def record_content(_uid: str) -> None:
+            content_started.set()
 
-        async def run_both() -> None:
+        runtime._poll_bilibili_updates_for_uid = record_content
+        runtime._poll_bilibili_comments_for_uid = block_comment
+
+        async def run_both() -> bool:
+            comment_task = asyncio.create_task(
+                runtime.poll_bilibili_comments_for_uid("100")
+            )
+            await comment_started.wait()
+            content_task = asyncio.create_task(
+                runtime.poll_bilibili_updates_for_uid("100")
+            )
+            try:
+                try:
+                    await asyncio.wait_for(content_started.wait(), timeout=0.05)
+                except TimeoutError:
+                    pass
+                return content_started.is_set()
+            finally:
+                release_comment.set()
+                await asyncio.gather(comment_task, content_task)
+
+        content_started_before_release = asyncio.run(run_both())
+
+        self.assertTrue(content_started_before_release)
+
+    def test_slow_content_uid_does_not_block_next_uid(self) -> None:
+        _, runtime = self._new_runtime()
+        runtime.push_config = replace(
+            runtime.push_config,
+            enabled=True,
+            target_uids=["100", "200"],
+            task_gap_seconds=0.0,
+        )
+        runtime.refresh_config = lambda: None
+        runtime.gateway.has_credential = lambda: True
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
+
+        async def poll(uid: str) -> None:
+            if uid == "100":
+                first_started.set()
+                await release_first.wait()
+                return
+            second_started.set()
+
+        runtime.poll_bilibili_updates_for_uid = poll
+
+        async def run_loop() -> None:
+            loop_task = asyncio.create_task(runtime._run_monitor_loop())
+            await first_started.wait()
+            try:
+                try:
+                    await asyncio.wait_for(second_started.wait(), timeout=0.05)
+                except TimeoutError:
+                    pass
+            finally:
+                release_first.set()
+                loop_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await loop_task
+
+        asyncio.run(run_loop())
+
+        self.assertTrue(second_started.is_set())
+
+    def test_domain_commits_preserve_other_uid_state_fields(self) -> None:
+        _, runtime = self._new_runtime()
+        origin = "aiocqhttp:GroupMessage:100"
+        runtime.monitor_state = {
+            "targets": {
+                origin: {
+                    "uids": {
+                        "100": {
+                            "author_name": "旧昵称",
+                            "last_dynamic_id": "dyn-1",
+                            "comment_resources": {"video:1": {"initialized": True}},
+                        }
+                    }
+                }
+            },
+            "bootstrap_uids": {},
+        }
+
+        async def commit_both_domains() -> None:
             await asyncio.gather(
-                runtime.poll_bilibili_updates_for_uid("100"),
-                runtime.poll_bilibili_comments_for_uid("100"),
+                runtime.commit_target_uid_state(
+                    origin,
+                    "100",
+                    {"author_name": "新昵称", "last_dynamic_id": "dyn-2"},
+                ),
+                runtime.commit_target_uid_state(
+                    origin,
+                    "100",
+                    {
+                        "author_name": "新昵称",
+                        "comment_resources": {
+                            "video:1": {
+                                "initialized": True,
+                                "last_comment_id": "9001",
+                            }
+                        },
+                    },
+                ),
             )
 
-        asyncio.run(run_both())
+        asyncio.run(commit_both_domains())
 
-        self.assertEqual(max_active, 1)
+        state = runtime.monitor_state["targets"][origin]["uids"]["100"]
+        self.assertEqual(state.get("last_dynamic_id"), "dyn-2")
+        self.assertEqual(
+            state["comment_resources"]["video:1"]["last_comment_id"],
+            "9001",
+        )
+
+    def test_content_poll_attempt_records_success_and_duration(self) -> None:
+        _, runtime = self._new_runtime()
+
+        async def succeed(_uid: str) -> None:
+            await asyncio.sleep(0.01)
+
+        runtime.poll_bilibili_updates_for_uid = succeed
+        with patch(
+            "asoul_bilibili_runtime.time.time",
+            side_effect=[NOW_TS, NOW_TS + 3],
+        ):
+            asyncio.run(runtime._run_content_poll_attempt("100"))
+
+        entry = runtime.monitor_state.get(CONTENT_POLL_STATE_KEY, {}).get("100", {})
+        self.assertEqual(entry.get("last_attempt_at"), NOW_TS)
+        self.assertEqual(entry.get("last_success_at"), NOW_TS + 3)
+        self.assertEqual(entry.get("last_result"), "success")
+        self.assertGreaterEqual(entry.get("last_duration_ms", 0), 5)
+
+    def test_cancelled_content_poll_is_not_recorded_as_success(self) -> None:
+        _, runtime = self._new_runtime()
+        poll_started = asyncio.Event()
+
+        async def wait_forever(_uid: str) -> None:
+            poll_started.set()
+            await asyncio.Event().wait()
+
+        runtime.poll_bilibili_updates_for_uid = wait_forever
+
+        async def run_and_cancel() -> None:
+            task = asyncio.create_task(runtime._run_content_poll_attempt("100"))
+            await poll_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run_and_cancel())
+
+        entry = runtime.monitor_state.get(CONTENT_POLL_STATE_KEY, {}).get("100", {})
+        self.assertEqual(entry.get("last_result"), "cancelled")
+        self.assertEqual(entry.get("last_success_at", 0), 0)
+
+    def test_content_poll_timeout_is_recorded_without_success(self) -> None:
+        _, runtime = self._new_runtime()
+
+        async def wait_forever(_uid: str) -> None:
+            await asyncio.Event().wait()
+
+        runtime.poll_bilibili_updates_for_uid = wait_forever
+        with patch("asoul_bilibili_runtime.CONTENT_POLL_TIMEOUT_SECONDS", 0.01):
+            asyncio.run(runtime._run_content_poll_attempt("100"))
+
+        entry = runtime.monitor_state.get(CONTENT_POLL_STATE_KEY, {}).get("100", {})
+        self.assertEqual(entry.get("last_result"), "timeout")
+        self.assertEqual(entry.get("last_success_at", 0), 0)
+        self.assertEqual(entry.get("last_error", {}).get("category"), "timeout")
+
+    def test_status_reports_content_poll_runtime(self) -> None:
+        _, runtime = self._new_runtime()
+        runtime.monitor_state = {
+            "targets": {},
+            "bootstrap_uids": {},
+            CONTENT_POLL_STATE_KEY: {
+                "100": {
+                    "last_attempt_at": NOW_TS,
+                    "last_success_at": NOW_TS + 2,
+                    "last_result": "success",
+                    "last_duration_ms": 2100,
+                }
+            },
+        }
+        runtime._runtime_initialized = True
+
+        status = asyncio.run(runtime.build_bilibili_status_text())
+
+        self.assertIn("内容任务", status)
+        self.assertIn("耗时 2.10 秒", status)
+
+    def test_terminate_cancels_inflight_content_and_profile_tasks(self) -> None:
+        _, runtime = self._new_runtime()
+        cleanup_called = False
+
+        class FakeRenderer:
+            async def cleanup(self) -> None:
+                nonlocal cleanup_called
+                cleanup_called = True
+
+        runtime.card_renderer = FakeRenderer()
+
+        async def exercise() -> tuple[asyncio.Task, asyncio.Task]:
+            content_task = asyncio.create_task(asyncio.Event().wait())
+            profile_task = asyncio.create_task(asyncio.Event().wait())
+            runtime._content_poll_tasks["100"] = content_task
+            runtime._profile_refresh_tasks["100"] = profile_task
+            await runtime.terminate()
+            return content_task, profile_task
+
+        content_task, profile_task = asyncio.run(exercise())
+
+        self.assertTrue(content_task.cancelled())
+        self.assertTrue(profile_task.cancelled())
+        self.assertEqual(runtime._content_poll_tasks, {})
+        self.assertEqual(runtime._profile_refresh_tasks, {})
+        self.assertTrue(cleanup_called)
 
     def test_comment_gateway_spaces_all_monitor_requests(self) -> None:
         gateway = BilibiliGateway(comment_request_interval_seconds=2.0)
