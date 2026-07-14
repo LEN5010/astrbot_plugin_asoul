@@ -130,6 +130,7 @@ class BilibiliDynamicPost:
     is_pinned_dynamic: bool = False
     is_live_room_dynamic: bool = False
     is_video_dynamic: bool = False
+    video_bvid: str = ""
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,8 @@ class BilibiliNotification:
     stats: BilibiliEngagementStats = field(default_factory=BilibiliEngagementStats)
     additional_card: BilibiliAdditionalCard = field(default_factory=BilibiliAdditionalCard)
     forwarded: Optional[BilibiliForwardedContent] = None
+    video_bvid: str = ""
+    stats_are_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -385,6 +388,14 @@ class BilibiliGateway:
             self._client_selected = True
         return user, Credential, comment
 
+    def _load_video_module(self):
+        from bilibili_api import select_client, video
+
+        if not self._client_selected:
+            select_client(self._request_client)
+            self._client_selected = True
+        return video
+
     def _build_credential(self, credential_data: Dict[str, str]):
         if not credential_data.get("sessdata"):
             return None
@@ -473,6 +484,29 @@ class BilibiliGateway:
             following=_optional_non_negative_int(relation.get("following")),
             follower=_optional_non_negative_int(relation.get("follower")),
             fetched_at=int(time.time()),
+        )
+
+    async def get_video_engagement_stats(
+        self, bvid: str
+    ) -> BilibiliEngagementStats:
+        normalized_bvid = str(bvid or "").strip()
+        if not normalized_bvid:
+            raise ValueError("BVID 不能为空")
+
+        video_module = self._load_video_module()
+        kwargs: Dict[str, Any] = {"bvid": normalized_bvid}
+        if self._credential is not None:
+            kwargs["credential"] = self._credential
+        info = await video_module.Video(**kwargs).get_info()
+        stat = info.get("stat") if isinstance(info, dict) else None
+        if not isinstance(stat, dict) or not any(
+            key in stat for key in ("like", "reply", "share")
+        ):
+            raise RuntimeError("B 站视频详情缺少 stat 字段")
+        return BilibiliEngagementStats(
+            like_count=max(0, _safe_int(stat.get("like"))),
+            comment_count=max(0, _safe_int(stat.get("reply"))),
+            forward_count=max(0, _safe_int(stat.get("share"))),
         )
 
     async def get_recent_dynamics(
@@ -1043,6 +1077,7 @@ class BilibiliGateway:
             url = f"https://t.bilibili.com/{dynamic_id}"
         title = str(archive.get("title", "") or "").strip()
         cover_url = _normalize_url(str(archive.get("cover", "") or "").strip())
+        video_bvid = str(archive.get("bvid", "") or "").strip()
 
         return BilibiliDynamicPost(
             id=str(dynamic_id),
@@ -1052,6 +1087,7 @@ class BilibiliGateway:
             image_urls=image_urls,
             title=title,
             cover_url=cover_url,
+            video_bvid=video_bvid,
             created_at=created_at,
             comment_oid=comment_oid,
             comment_type=comment_type,
@@ -2201,6 +2237,7 @@ class BilibiliMonitorService:
                                     cover_url=post.cover_url
                                     or (post.image_urls[0] if post.image_urls else ""),
                                     content_id=post.id,
+                                    video_bvid=post.video_bvid,
                                     published_at=post.created_at,
                                     author_profile=author_profile,
                                     stats=post.stats,

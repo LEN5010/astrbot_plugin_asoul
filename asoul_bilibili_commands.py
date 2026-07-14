@@ -94,6 +94,7 @@ class BilibiliCommandService:
             url=post.url,
             cover_url=post.cover_url,
             content_id=post.id,
+            video_bvid=post.id if str(post.id).upper().startswith("BV") else "",
             published_at=post.created_at,
             author_profile=profile,
             additional_card=BilibiliAdditionalCard(

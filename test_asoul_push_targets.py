@@ -5,8 +5,16 @@ import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
-from asoul_bilibili import BilibiliNotification, KV_BILIBILI_GROUP_ORIGINS
+from asoul_bilibili import (
+    BilibiliAuthorCardProfile,
+    BilibiliEngagementStats,
+    BilibiliNotification,
+    BilibiliUidDeliveryPlan,
+    BilibiliVideoPost,
+    KV_BILIBILI_GROUP_ORIGINS,
+)
 
 
 def _install_astrbot_stubs() -> None:
@@ -370,6 +378,203 @@ class ASoulPushTargetTest(unittest.TestCase):
 
         self.assertIn("【B站动态】", result.chain[0][1])
         self.assertIn(("plain", "旧格式正文"), result.chain)
+
+    def test_video_card_uses_authoritative_stats_and_runtime_cache(self) -> None:
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        fetch_calls = []
+        rendered_notifications = []
+
+        async def fetch_stats(bvid):
+            fetch_calls.append(bvid)
+            return BilibiliEngagementStats(70696, 5468, 6081)
+
+        class RecordingRenderer:
+            async def render(self, notification):
+                rendered_notifications.append(notification)
+                return "/tmp/bilibili-card.png"
+
+        runtime.gateway.get_video_engagement_stats = fetch_stats
+        runtime.card_renderer = RecordingRenderer()
+        notification = BilibiliNotification(
+            kind="video",
+            uid="100",
+            author_name="测试账号",
+            title="新视频",
+            url="https://www.bilibili.com/video/BV1SdXWB2Enp",
+            content_id="dyn-video",
+            video_bvid="BV1SdXWB2Enp",
+            stats=BilibiliEngagementStats(1, 2, 3),
+        )
+
+        async def exercise():
+            await runtime.build_card_or_fallback_parts(notification)
+            await runtime.build_card_or_fallback_parts(
+                replace(
+                    notification,
+                    stats=BilibiliEngagementStats(999, 888, 777),
+                )
+            )
+
+        asyncio.run(exercise())
+
+        self.assertEqual(fetch_calls, ["BV1SdXWB2Enp"])
+        self.assertEqual(len(rendered_notifications), 2)
+        self.assertTrue(
+            all(
+                item.stats == BilibiliEngagementStats(70696, 5468, 6081)
+                for item in rendered_notifications
+            )
+        )
+        self.assertTrue(all(not item.stats_are_fallback for item in rendered_notifications))
+
+    def test_video_detail_timeout_keeps_fallback_stats_and_marks_card(self) -> None:
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        rendered_notifications = []
+
+        async def hang(_bvid):
+            await asyncio.Event().wait()
+
+        class RecordingRenderer:
+            async def render(self, notification):
+                rendered_notifications.append(notification)
+                return "/tmp/bilibili-card.png"
+
+        runtime.gateway.get_video_engagement_stats = hang
+        runtime.card_renderer = RecordingRenderer()
+        fallback = BilibiliEngagementStats(10, 20, 30)
+        notification = BilibiliNotification(
+            kind="video",
+            uid="100",
+            author_name="测试账号",
+            title="新视频",
+            url="https://www.bilibili.com/video/BV1SdXWB2Enp",
+            video_bvid="BV1SdXWB2Enp",
+            stats=fallback,
+        )
+
+        with patch("asoul_bilibili_runtime.VIDEO_STATS_TIMEOUT_SECONDS", 0.001):
+            asyncio.run(runtime.build_card_or_fallback_parts(notification))
+
+        self.assertEqual(rendered_notifications[0].stats, fallback)
+        self.assertTrue(rendered_notifications[0].stats_are_fallback)
+
+    def test_disabled_cards_do_not_fetch_video_stats(self) -> None:
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        runtime.push_config = replace(runtime.push_config, render_bilibili_cards=False)
+
+        async def unexpected_fetch(_bvid):
+            raise AssertionError("video stats should not be fetched")
+
+        runtime.gateway.get_video_engagement_stats = unexpected_fetch
+        notification = BilibiliNotification(
+            kind="video",
+            uid="100",
+            author_name="测试账号",
+            title="新视频",
+            url="https://www.bilibili.com/video/BV1SdXWB2Enp",
+            video_bvid="BV1SdXWB2Enp",
+        )
+
+        parts = asyncio.run(runtime.build_card_or_fallback_parts(notification))
+
+        self.assertIn("【B站新视频】", parts[0][1])
+
+    def test_video_without_bvid_marks_existing_stats_as_fallback(self) -> None:
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        rendered_notifications = []
+
+        class RecordingRenderer:
+            async def render(self, notification):
+                rendered_notifications.append(notification)
+                return "/tmp/bilibili-card.png"
+
+        runtime.card_renderer = RecordingRenderer()
+        notification = BilibiliNotification(
+            kind="video",
+            uid="100",
+            author_name="测试账号",
+            title="旧视频",
+            url="https://www.bilibili.com/video/av123",
+            stats=BilibiliEngagementStats(10, 20, 30),
+        )
+
+        asyncio.run(runtime.build_card_or_fallback_parts(notification))
+
+        self.assertEqual(rendered_notifications[0].stats, notification.stats)
+        self.assertTrue(rendered_notifications[0].stats_are_fallback)
+
+    def test_video_test_notification_carries_bvid_for_production_enrichment(self) -> None:
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+
+        async def recent_videos(_uid, stop_at_id=None):
+            return [
+                BilibiliVideoPost(
+                    id="BV1SdXWB2Enp",
+                    title="测试视频",
+                    url="https://www.bilibili.com/video/BV1SdXWB2Enp",
+                    cover_url="https://i0.hdslb.com/video.jpg",
+                    created_at=1_700_000_000,
+                )
+            ]
+
+        async def user_name(_uid):
+            return "测试账号"
+
+        async def profile(uid, fallback):
+            return BilibiliAuthorCardProfile(uid=uid, name=fallback.name)
+
+        runtime.gateway.get_recent_videos = recent_videos
+        runtime.gateway.get_user_name = user_name
+        runtime.get_author_card_profile = profile
+
+        notification = asyncio.run(
+            plugin._bilibili_commands.build_video_test_notification("100")
+        )
+
+        self.assertIsNotNone(notification)
+        assert notification is not None
+        self.assertEqual(notification.video_bvid, "BV1SdXWB2Enp")
+
+    def test_empty_delivery_plan_does_not_fetch_video_stats(self) -> None:
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        origin = "aiocqhttp:GroupMessage:100"
+        runtime.push_targets = {
+            origin: {
+                "group_id": "100",
+                "platform_name": "aiocqhttp",
+                "unified_msg_origin": origin,
+            }
+        }
+
+        class BaselineMonitor:
+            async def fetch_uid_snapshot(self, config, uid, previous_state=None):
+                from asoul_bilibili import BilibiliUidSnapshot
+
+                return BilibiliUidSnapshot(uid=uid, author_name="测试账号")
+
+            def plan_uid_deliveries(self, config, previous_state, snapshot):
+                return BilibiliUidDeliveryPlan(
+                    deliveries=[],
+                    final_state={"author_name": snapshot.author_name},
+                )
+
+        async def unexpected_fetch(_bvid):
+            raise AssertionError("baseline poll must not fetch video detail")
+
+        async def profile(_uid, fallback):
+            return fallback
+
+        runtime.monitor = BaselineMonitor()
+        runtime.gateway.get_video_engagement_stats = unexpected_fetch
+        runtime.get_author_card_profile = profile
+
+        asyncio.run(runtime.poll_bilibili_updates_for_uid("100"))
 
     def test_card_render_timeout_falls_back_to_legacy_notification(self) -> None:
         from unittest.mock import patch

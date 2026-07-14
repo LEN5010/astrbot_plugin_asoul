@@ -5,6 +5,7 @@ import io
 import time
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -16,6 +17,8 @@ CARD_RENDER_CACHE_TTL_SECONDS = 30 * 60
 CARD_RENDER_MIN_BYTES = 1024
 DISPLAY_TZ = timezone(timedelta(hours=8))
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "bilibili_card.html"
+BRAND_LOGO_PATH = Path(__file__).resolve().parent / "logo.png"
+BRAND_NAME = "爱驼推送"
 
 
 def safe_http_url(raw_value: Any) -> str:
@@ -104,6 +107,19 @@ def build_qr_data_uri(url: str) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+@lru_cache(maxsize=1)
+def build_brand_logo_data_uri() -> str:
+    try:
+        payload = BRAND_LOGO_PATH.read_bytes()
+    except OSError:
+        return ""
+    if not payload:
+        return ""
+    mime_type = "image/jpeg" if payload.startswith(b"\xff\xd8") else "image/png"
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
 def _format_timestamp(timestamp: int, *, include_seconds: bool = False) -> str:
     if int(timestamp or 0) <= 0:
         return "--"
@@ -168,6 +184,8 @@ def build_card_context(
         body_fallback = "发布了新动态"
     return {
         "card_width": CARD_WIDTH_PX,
+        "brand_name": BRAND_NAME,
+        "brand_logo_data_uri": build_brand_logo_data_uri(),
         "kind": notification.kind,
         "kind_label": kind_labels.get(notification.kind, "B站通知"),
         "title": html.escape(notification.title or "", quote=True),
@@ -192,6 +210,7 @@ def build_card_context(
             "comment": format_card_number(notification.stats.comment_count),
             "forward": format_card_number(notification.stats.forward_count),
         },
+        "stats_note": "数据暂未刷新" if notification.stats_are_fallback else "",
         "additional": additional if additional.get("kind") else None,
         "forwarded": forwarded,
     }
@@ -208,7 +227,18 @@ class BilibiliCardRenderer:
     @staticmethod
     def _cache_key(notification: BilibiliNotification) -> str:
         identity = notification.content_id or notification.url
-        return f"{notification.kind}:{notification.uid}:{identity}"
+        stats = notification.stats
+        return ":".join(
+            (
+                notification.kind,
+                notification.uid,
+                identity,
+                str(stats.like_count),
+                str(stats.comment_count),
+                str(stats.forward_count),
+                "fallback" if notification.stats_are_fallback else "fresh",
+            )
+        )
 
     @staticmethod
     def _is_valid_output(path_value: str) -> bool:

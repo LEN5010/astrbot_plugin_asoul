@@ -47,7 +47,7 @@ def _build_calendar_cache_ttl(config: Any) -> timedelta:
     return timedelta(minutes=max(MIN_CALENDAR_CACHE_MINUTES, minutes))
 
 
-@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.1.0")
+@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.2.0")
 class ASoulPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)

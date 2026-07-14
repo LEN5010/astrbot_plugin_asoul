@@ -17,6 +17,7 @@ from asoul_bilibili import (
     KV_BILIBILI_MONITOR_STATE,
     KV_BILIBILI_PROFILE_CACHE,
     BilibiliAuthorCardProfile,
+    BilibiliEngagementStats,
     BilibiliGateway,
     BilibiliCommentResource,
     BilibiliMonitorService,
@@ -33,6 +34,9 @@ CARD_RENDER_TIMEOUT_SECONDS = 30
 MESSAGE_SEND_TIMEOUT_SECONDS = 30
 PROFILE_CACHE_TTL_SECONDS = 6 * 60 * 60
 PROFILE_FETCH_TIMEOUT_SECONDS = 20
+VIDEO_STATS_TIMEOUT_SECONDS = 12
+VIDEO_STATS_CACHE_TTL_SECONDS = 5 * 60
+VIDEO_STATS_FAILURE_CACHE_TTL_SECONDS = 30
 CONTENT_POLL_STATE_KEY = "content_poll_runtime"
 COMMENT_POLL_STATE_KEY = "comment_poll_runtime"
 COMMENT_RESOURCE_CATALOGS_KEY = "comment_resource_catalogs"
@@ -90,6 +94,10 @@ class BilibiliRuntime:
         self._content_next_due: dict[str, float] = {}
         self._profile_refresh_tasks: dict[str, asyncio.Task] = {}
         self._profile_cache_lock = asyncio.Lock()
+        self._video_stats_cache: dict[
+            str, tuple[float, Optional[BilibiliEngagementStats]]
+        ] = {}
+        self._video_stats_locks: dict[str, asyncio.Lock] = {}
 
     async def ensure_ready(self) -> None:
         self.refresh_config()
@@ -128,6 +136,8 @@ class BilibiliRuntime:
         await self._cancel_content_poll_tasks()
         await self._cancel_profile_refresh_tasks()
         await self.card_renderer.cleanup()
+        self._video_stats_cache.clear()
+        self._video_stats_locks.clear()
         self._runtime_initialized = False
 
     def refresh_config(self) -> None:
@@ -1276,8 +1286,9 @@ class BilibiliRuntime:
             and self.push_config.render_bilibili_cards
         ):
             try:
+                card_notification = await self.enrich_video_notification(notification)
                 card_path = await asyncio.wait_for(
-                    self.card_renderer.render(notification),
+                    self.card_renderer.render(card_notification),
                     timeout=CARD_RENDER_TIMEOUT_SECONDS,
                 )
                 return [
@@ -1293,6 +1304,74 @@ class BilibiliRuntime:
                     getattr(notification, "kind", ""),
                 )
         return self.build_notification_parts(notification)
+
+    async def enrich_video_notification(self, notification: Any) -> Any:
+        if getattr(notification, "kind", "") != "video":
+            return notification
+        bvid = str(getattr(notification, "video_bvid", "") or "").strip()
+        if not bvid:
+            return replace(notification, stats_are_fallback=True)
+
+        stats = await self.get_cached_video_engagement_stats(bvid)
+        if stats is None:
+            return replace(notification, stats_are_fallback=True)
+        return replace(
+            notification,
+            stats=stats,
+            stats_are_fallback=False,
+        )
+
+    async def get_cached_video_engagement_stats(
+        self, bvid: str
+    ) -> Optional[BilibiliEngagementStats]:
+        normalized_bvid = str(bvid or "").strip()
+        if not normalized_bvid:
+            return None
+
+        def cached_value() -> tuple[bool, Optional[BilibiliEngagementStats]]:
+            cached = self._video_stats_cache.get(normalized_bvid)
+            if cached is None:
+                return False, None
+            cached_at, value = cached
+            ttl = (
+                VIDEO_STATS_CACHE_TTL_SECONDS
+                if value is not None
+                else VIDEO_STATS_FAILURE_CACHE_TTL_SECONDS
+            )
+            if time.monotonic() - cached_at >= ttl:
+                self._video_stats_cache.pop(normalized_bvid, None)
+                return False, None
+            return True, value
+
+        found, value = cached_value()
+        if found:
+            return value
+
+        lock = self._video_stats_locks.setdefault(normalized_bvid, asyncio.Lock())
+        async with lock:
+            found, value = cached_value()
+            if found:
+                return value
+            try:
+                value = await asyncio.wait_for(
+                    self.gateway.get_video_engagement_stats(normalized_bvid),
+                    timeout=VIDEO_STATS_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "B 站视频详情统计获取失败，使用动态备用数据: bvid=%s",
+                    normalized_bvid,
+                )
+                self._video_stats_cache[normalized_bvid] = (
+                    time.monotonic(),
+                    None,
+                )
+                return None
+
+            self._video_stats_cache[normalized_bvid] = (time.monotonic(), value)
+            return value
 
     @staticmethod
     def safe_plain_newline() -> str:

@@ -44,8 +44,15 @@
     .author-name { color: #ff5f91; font-size: 46px; line-height: 1.2; font-weight: 800; }
     .publish-time { display: flex; align-items: center; gap: 10px; margin-top: 16px; color: #858590; font-size: 25px; }
     .clock { display: inline-grid; width: 29px; height: 29px; place-items: center; border-radius: 50%; color: #fff; background: #858590; font-size: 18px; }
+    .header-side { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 16px; }
+    .brand-lockup {
+      display: flex; align-items: center; gap: 11px; padding: 8px 15px 8px 9px;
+      border: 1px solid #ffe1eb; border-radius: 999px; color: #ec5f8c;
+      background: rgba(255, 247, 250, .92); font-size: 20px; font-weight: 800;
+    }
+    .brand-logo { width: 38px; height: 38px; border-radius: 50%; object-fit: cover; }
     .kind-pill {
-      margin-left: auto; align-self: flex-start; margin-top: 19px; padding: 13px 24px;
+      padding: 11px 21px;
       border-radius: 999px; color: #ff5f91; background: #fff0f5; font-size: 23px; font-weight: 700;
     }
     .content { margin-top: 56px; }
@@ -81,8 +88,14 @@
     .additional-title { font-size: 28px; line-height: 1.4; font-weight: 700; }
     .additional-subtitle { margin-top: 8px; color: #888893; font-size: 22px; }
     .additional-badge { margin-left: 20px; padding: 13px 21px; border-radius: 16px; color: #fff; background: #ff6898; font-size: 24px; font-weight: 700; }
+    .section-heading {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 50px; color: #9b7d88; font-size: 20px; font-weight: 800;
+      letter-spacing: 1px;
+    }
+    .stats-note { color: #a1a1aa; font-size: 19px; font-weight: 500; letter-spacing: 0; }
     .engagement {
-      display: flex; gap: 50px; margin-top: 54px; padding-bottom: 36px;
+      display: flex; gap: 50px; margin-top: 16px; padding-bottom: 36px;
       color: #686873; font-size: 26px; border-bottom: 1px solid #eeeef2;
     }
     .metric { display: flex; align-items: center; gap: 11px; }
@@ -96,6 +109,7 @@
     .profile { display: flex; align-items: center; min-width: 0; }
     .footer-avatar { width: 112px; height: 112px; border-radius: 50%; object-fit: cover; background: #ffe2ed; }
     .footer-profile-meta { margin-left: 22px; }
+    .profile-heading { margin-bottom: 10px; color: #9b7d88; font-size: 18px; font-weight: 800; letter-spacing: 1px; }
     .footer-name { color: #ff5f91; font-size: 34px; font-weight: 800; }
     .uid { margin-top: 9px; color: #7f7f89; font-size: 21px; }
     .profile-stats { display: flex; gap: 12px; margin-top: 20px; }
@@ -118,7 +132,13 @@
         <div class="author-name">{{ author.name | safe }}</div>
         <div class="publish-time"><span class="clock">●</span>{{ published_at }}</div>
       </div>
-      <div class="kind-pill">{{ kind_label }}</div>
+      <div class="header-side">
+        <div class="brand-lockup">
+          {% if brand_logo_data_uri %}<img class="brand-logo" src="{{ brand_logo_data_uri | e }}">{% endif %}
+          <span>{{ brand_name }}</span>
+        </div>
+        <div class="kind-pill">{{ kind_label }}</div>
+      </div>
     </header>
 
     <section class="content">
@@ -155,6 +175,10 @@
       {% endif %}
     </section>
 
+    <div class="section-heading">
+      <span>本条内容</span>
+      {% if stats_note %}<span class="stats-note">{{ stats_note }}</span>{% endif %}
+    </div>
     <div class="engagement">
       <div class="metric"><span class="metric-icon">♥</span>{{ stats.like }} 点赞</div>
       <div class="metric"><span class="metric-icon">●</span>{{ stats.comment }} 评论</div>
@@ -167,6 +191,7 @@
       <div class="profile">
         {% if author.avatar_url %}<img class="footer-avatar" src="{{ author.avatar_url | e }}">{% else %}<div class="footer-avatar"></div>{% endif %}
         <div class="footer-profile-meta">
+          <div class="profile-heading">UP资料</div>
           <div class="footer-name">{{ author.name | safe }}</div>
           <div class="uid">UID: {{ author.uid | safe }}</div>
           <div class="profile-stats">
@@ -178,7 +203,7 @@
       </div>
       {% if qr_data_uri %}<div class="qr"><img src="{{ qr_data_uri | e }}"></div>{% endif %}
     </footer>
-    <div class="brand">ASTRBOT · BILIBILI CARD</div>
+    <div class="brand">{{ brand_name }}</div>
   </main>
 </body>
 </html>

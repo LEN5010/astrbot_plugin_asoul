@@ -4,6 +4,7 @@ import json
 import types
 import unittest
 from dataclasses import replace
+from dataclasses import fields as dataclass_fields
 from unittest.mock import patch
 
 from asoul_bilibili import (
@@ -18,6 +19,7 @@ from asoul_bilibili import (
     BilibiliGateway,
     BilibiliLiveStatus,
     BilibiliMonitorService,
+    BilibiliNotification,
     BilibiliPushConfig,
     BilibiliRichTextNode,
     BilibiliUidSnapshot,
@@ -27,6 +29,20 @@ from asoul_bilibili import (
 )
 
 NOW_TS = 1_700_000_000
+
+
+class BilibiliPublicTypeCompatibilityTest(unittest.TestCase):
+    def test_new_card_fields_are_appended_to_preserve_positional_order(self) -> None:
+        dynamic_fields = [item.name for item in dataclass_fields(BilibiliDynamicPost)]
+        notification_fields = [
+            item.name for item in dataclass_fields(BilibiliNotification)
+        ]
+
+        self.assertEqual(dynamic_fields[-1:], ["video_bvid"])
+        self.assertEqual(
+            notification_fields[-2:],
+            ["video_bvid", "stats_are_fallback"],
+        )
 
 
 class FakeBilibiliGateway:
@@ -402,6 +418,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
                 title="第四个视频",
                 cover_url="https://i0.hdslb.com/bfs/archive/video-cover-4.jpg",
                 image_urls=["https://i0.hdslb.com/bfs/archive/video-cover-4.jpg"],
+                video_bvid="BV4",
                 created_at=NOW_TS - 60,
                 is_video_dynamic=True,
                 comment_oid=2004,
@@ -422,6 +439,7 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
             updated_state, notifications = asyncio.run(self._poll_uid(initial_state))
 
         self.assertEqual([item.kind for item in notifications], ["dynamic", "video"])
+        self.assertEqual(notifications[1].video_bvid, "BV4")
         self.assertEqual(updated_state["uids"]["100"]["last_dynamic_id"], "dyn-video-4")
 
     def test_stale_cursor_rebuilds_baseline_without_replaying_history(self) -> None:
@@ -1096,6 +1114,53 @@ class BilibiliConfigParsingTest(unittest.TestCase):
 
 
 class BilibiliParsingTest(unittest.TestCase):
+    def test_get_video_engagement_stats_uses_video_detail_stat_fields(self) -> None:
+        created_videos = []
+
+        class FakeVideo:
+            def __init__(self, **kwargs):
+                created_videos.append(kwargs)
+
+            async def get_info(self):
+                return {
+                    "stat": {
+                        "like": 70696,
+                        "reply": 5468,
+                        "share": 6081,
+                    }
+                }
+
+        gateway = BilibiliGateway()
+        gateway._load_video_module = lambda: types.SimpleNamespace(Video=FakeVideo)
+
+        stats = asyncio.run(gateway.get_video_engagement_stats("BV1SdXWB2Enp"))
+
+        self.assertEqual(
+            stats,
+            BilibiliEngagementStats(
+                like_count=70696,
+                comment_count=5468,
+                forward_count=6081,
+            ),
+        )
+        self.assertEqual(created_videos, [{"bvid": "BV1SdXWB2Enp"}])
+
+    def test_get_video_engagement_stats_rejects_missing_stat_payload(self) -> None:
+        class FakeVideo:
+            async def get_info(self):
+                return {"title": "缺少统计字段的视频"}
+
+        class FakeVideoModule:
+            @staticmethod
+            def Video(**_kwargs):
+                return FakeVideo()
+
+        gateway = BilibiliGateway()
+        gateway._load_video_module = lambda: FakeVideoModule
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(gateway.get_video_engagement_stats("BV1SdXWB2Enp"))
+
     def test_get_user_card_profile_combines_three_user_apis(self) -> None:
         class FakeUser:
             async def get_user_info(self):
@@ -1302,6 +1367,29 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual(post.additional_card.kind, "reserve")
         self.assertIn("终末地1.4主线", post.additional_card.title)
         self.assertEqual(post.additional_card.subtitle, "07-16 12:00 直播 · 60人预约")
+
+    def test_parse_video_dynamic_extracts_bvid(self) -> None:
+        item = {
+            "id_str": "dyn-video",
+            "modules": {
+                "module_dynamic": {
+                    "major": {
+                        "archive": {
+                            "bvid": "BV1SdXWB2Enp",
+                            "title": "测试视频",
+                            "jump_url": "https://www.bilibili.com/video/BV1SdXWB2Enp",
+                        }
+                    }
+                }
+            },
+        }
+
+        post = self.gateway._parse_dynamic_post(item)
+
+        self.assertIsNotNone(post)
+        assert post is not None
+        self.assertTrue(post.is_video_dynamic)
+        self.assertEqual(post.video_bvid, "BV1SdXWB2Enp")
 
     def test_parse_dynamic_rich_text_preserves_safe_links_and_emotes(self) -> None:
         item = {

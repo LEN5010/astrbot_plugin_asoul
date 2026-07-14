@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,6 +21,43 @@ from asoul_bilibili_card import (
 
 
 class BilibiliCardFormattingTest(unittest.TestCase):
+    def test_card_context_uses_aituo_brand(self) -> None:
+        notification = BilibiliNotification(
+            kind="dynamic",
+            uid="100",
+            author_name="测试账号",
+            title="",
+            url="https://t.bilibili.com/1",
+        )
+
+        with patch(
+            "asoul_bilibili_card.build_brand_logo_data_uri",
+            return_value="data:image/jpeg;base64,logo",
+        ):
+            with patch(
+                "asoul_bilibili_card.build_qr_data_uri",
+                return_value="data:image/png;base64,qr",
+            ):
+                context = build_card_context(notification)
+
+        self.assertEqual(context["brand_name"], "爱驼推送")
+        self.assertEqual(
+            context["brand_logo_data_uri"],
+            "data:image/jpeg;base64,logo",
+        )
+
+    def test_template_keeps_all_data_sections_with_simple_aituo_brand(self) -> None:
+        template = (
+            Path(__file__).resolve().parent / "templates" / "bilibili_card.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("{{ brand_name }}", template)
+        self.assertIn("{{ brand_logo_data_uri", template)
+        self.assertIn("本条内容", template)
+        self.assertIn("UP资料", template)
+        self.assertIn("{{ stats_note }}", template)
+        self.assertNotIn("ASTRBOT · BILIBILI CARD", template)
+
     def test_format_card_number_uses_chinese_units_and_missing_marker(self) -> None:
         self.assertEqual(format_card_number(None), "--")
         self.assertEqual(format_card_number(9999), "9999")
@@ -97,6 +135,25 @@ class BilibiliCardFormattingTest(unittest.TestCase):
         self.assertEqual(len(context["images"]), 9)
         self.assertEqual(context["qr_data_uri"], "data:image/png;base64,qr")
 
+    def test_fallback_video_stats_add_refresh_note_to_context(self) -> None:
+        notification = BilibiliNotification(
+            kind="video",
+            uid="100",
+            author_name="测试账号",
+            title="新视频",
+            url="https://www.bilibili.com/video/BV1",
+            stats=BilibiliEngagementStats(1, 2, 3),
+            stats_are_fallback=True,
+        )
+
+        with patch(
+            "asoul_bilibili_card.build_qr_data_uri",
+            return_value="data:image/png;base64,qr",
+        ):
+            context = build_card_context(notification)
+
+        self.assertEqual(context["stats_note"], "数据暂未刷新")
+
 
 class BilibiliCardRendererTest(unittest.TestCase):
     def test_same_notification_renders_once_and_cleanup_removes_created_card(self) -> None:
@@ -156,6 +213,47 @@ class BilibiliCardRendererTest(unittest.TestCase):
 
             asyncio.run(renderer.cleanup())
             self.assertFalse(Path(output_path).exists())
+
+    def test_stats_change_invalidates_render_cache(self) -> None:
+        class FakeOwner:
+            def __init__(self, output_path: str) -> None:
+                self.output_path = output_path
+                self.calls = []
+
+            async def html_render(self, template, data, *, return_url, options):
+                self.calls.append(data["stats"])
+                Path(self.output_path).write_bytes(b"x" * 2048)
+                return self.output_path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            owner = FakeOwner(str(Path(temp_dir) / "card.png"))
+            renderer = BilibiliCardRenderer(owner)
+            notification = BilibiliNotification(
+                kind="video",
+                uid="100",
+                author_name="测试账号",
+                title="新视频",
+                url="https://www.bilibili.com/video/BV1",
+                content_id="dyn-video",
+                stats=BilibiliEngagementStats(1, 2, 3),
+            )
+
+            async def exercise():
+                await renderer.render(notification)
+                await renderer.render(
+                    replace(
+                        notification,
+                        stats=BilibiliEngagementStats(4, 5, 6),
+                    )
+                )
+
+            with patch(
+                "asoul_bilibili_card.build_qr_data_uri",
+                return_value="data:image/png;base64,qr",
+            ):
+                asyncio.run(exercise())
+
+            self.assertEqual(len(owner.calls), 2)
 
 
 if __name__ == "__main__":
