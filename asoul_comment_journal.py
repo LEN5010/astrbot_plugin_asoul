@@ -41,6 +41,14 @@ class CatalogSyncResult:
     retired: tuple[CommentResourceLifecycle, ...]
 
 
+@dataclass(frozen=True)
+class PageCommitResult:
+    events_created: int
+    deliveries_created: int
+    roots_enqueued: int
+    lifecycle_activated: bool
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS owner_catalog (
@@ -381,6 +389,223 @@ class CommentJournal:
             page_index=int(row["page_index"]),
             retry_count=int(row["retry_count"]),
         )
+
+    def commit_scan_page(
+        self,
+        task: CommentScanTask,
+        posts: Sequence[BilibiliCommentPost],
+        target_uids: Sequence[str],
+        target_origins: Sequence[str],
+        now: int,
+        *,
+        next_cursor: str,
+        next_page_index: int,
+        next_sweep_at: int,
+    ) -> PageCommitResult:
+        for post in posts:
+            if not str(post.id or "").strip():
+                raise ValueError("comment must have a non-empty rpid")
+            if int(post.created_at or 0) <= 0:
+                raise ValueError("comment must have a valid ctime")
+
+        normalized_target_uids = {str(uid) for uid in target_uids}
+        normalized_origins = tuple(
+            dict.fromkeys(str(origin) for origin in target_origins if str(origin))
+        )
+        events_created = 0
+        deliveries_created = 0
+        roots_enqueued = 0
+        lifecycle_activated = False
+
+        with self._connection:
+            lifecycle = self._connection.execute(
+                "SELECT * FROM resource_lifecycle WHERE lifecycle_id = ?",
+                (str(task.lifecycle_id),),
+            ).fetchone()
+            if lifecycle is None:
+                raise ValueError("comment resource lifecycle does not exist")
+            if int(lifecycle["retired_at"]) or str(lifecycle["state"]) == "retired":
+                raise ValueError("comment resource lifecycle is retired")
+
+            lifecycle_state = str(lifecycle["state"])
+            entered_at = int(lifecycle["entered_at"])
+            for post in posts:
+                baseline = int(int(post.created_at) < entered_at)
+                inserted = self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO observed_comment(
+                        lifecycle_id, rpid, author_uid, author_name, text,
+                        created_at, is_reply, root_rpid, parent_rpid,
+                        image_urls_json, baseline, observed_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(task.lifecycle_id),
+                        str(post.id),
+                        str(post.author_uid),
+                        str(post.author_name),
+                        str(post.text),
+                        int(post.created_at),
+                        int(bool(post.is_reply)),
+                        str(post.root_id or post.id),
+                        str(post.parent_id or ""),
+                        json.dumps(list(post.image_urls), ensure_ascii=False),
+                        baseline,
+                        int(now),
+                    ),
+                )
+                if (
+                    inserted.rowcount == 1
+                    and not baseline
+                    and str(post.author_uid) in normalized_target_uids
+                ):
+                    event_cursor = self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO comment_event(
+                            lifecycle_id, rpid, captured_at
+                        ) VALUES(?, ?, ?)
+                        """,
+                        (str(task.lifecycle_id), str(post.id), int(now)),
+                    )
+                    if event_cursor.rowcount == 1:
+                        events_created += 1
+                        event_id = int(event_cursor.lastrowid)
+                        for origin in normalized_origins:
+                            delivery_cursor = self._connection.execute(
+                                """
+                                INSERT OR IGNORE INTO event_delivery(
+                                    event_id, unified_msg_origin, state,
+                                    next_attempt_at
+                                ) VALUES(?, ?, 'pending', ?)
+                                """,
+                                (event_id, origin, int(now)),
+                            )
+                            deliveries_created += max(0, delivery_cursor.rowcount)
+
+                if not post.is_reply:
+                    reply_task = self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO scan_task(
+                            lifecycle_id, kind, root_rpid, cursor, page_index,
+                            bootstrap_pending, next_attempt_at
+                        ) VALUES(?, 'reply', ?, '', 1, ?, ?)
+                        """,
+                        (
+                            str(task.lifecycle_id),
+                            str(post.id),
+                            int(lifecycle_state == "bootstrapping"),
+                            int(now),
+                        ),
+                    )
+                    roots_enqueued += max(0, reply_task.rowcount)
+
+            stream_exhausted = (
+                not str(next_cursor or "")
+                if task.kind == "primary"
+                else int(next_page_index or 0) <= 0
+            )
+            if task.kind == "primary":
+                self._connection.execute(
+                    """
+                    UPDATE scan_task SET
+                        cursor = ?, page_index = 1,
+                        bootstrap_pending = CASE WHEN ? THEN 0 ELSE bootstrap_pending END,
+                        next_attempt_at = ?, retry_count = 0,
+                        last_success_at = CASE WHEN ? THEN ? ELSE last_success_at END,
+                        last_error_category = '', last_error_message = ''
+                    WHERE task_id = ?
+                    """,
+                    (
+                        "" if stream_exhausted else str(next_cursor),
+                        int(stream_exhausted),
+                        int(next_sweep_at),
+                        int(stream_exhausted),
+                        int(now),
+                        int(task.task_id),
+                    ),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    UPDATE scan_task SET
+                        cursor = '', page_index = ?,
+                        bootstrap_pending = CASE WHEN ? THEN 0 ELSE bootstrap_pending END,
+                        next_attempt_at = ?, retry_count = 0,
+                        last_success_at = CASE WHEN ? THEN ? ELSE last_success_at END,
+                        last_error_category = '', last_error_message = ''
+                    WHERE task_id = ?
+                    """,
+                    (
+                        1 if stream_exhausted else int(next_page_index),
+                        int(stream_exhausted),
+                        int(next_sweep_at),
+                        int(stream_exhausted),
+                        int(now),
+                        int(task.task_id),
+                    ),
+                )
+
+            if lifecycle_state == "bootstrapping":
+                pending = self._connection.execute(
+                    """
+                    SELECT 1 FROM scan_task
+                    WHERE lifecycle_id = ? AND bootstrap_pending = 1
+                    LIMIT 1
+                    """,
+                    (str(task.lifecycle_id),),
+                ).fetchone()
+                if pending is None:
+                    self._connection.execute(
+                        """
+                        UPDATE resource_lifecycle SET state = 'active'
+                        WHERE lifecycle_id = ? AND state = 'bootstrapping'
+                        """,
+                        (str(task.lifecycle_id),),
+                    )
+                    lifecycle_activated = True
+
+        return PageCommitResult(
+            events_created=events_created,
+            deliveries_created=deliveries_created,
+            roots_enqueued=roots_enqueued,
+            lifecycle_activated=lifecycle_activated,
+        )
+
+    def mark_scan_failed(
+        self,
+        task_id: int,
+        category: str,
+        message: str,
+        next_attempt_at: int,
+    ) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE scan_task
+                SET retry_count = retry_count + 1,
+                    last_error_category = ?,
+                    last_error_message = ?,
+                    next_attempt_at = ?
+                WHERE task_id = ?
+                """,
+                (str(category), str(message), int(next_attempt_at), int(task_id)),
+            )
+
+    def pending_delivery_count(self) -> int:
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS count FROM event_delivery WHERE state = 'pending'"
+        ).fetchone()
+        return int(row["count"])
+
+    def observed_rpids(self, lifecycle_id: str) -> list[str]:
+        rows = self._connection.execute(
+            """
+            SELECT rpid FROM observed_comment
+            WHERE lifecycle_id = ? ORDER BY CAST(rpid AS INTEGER), rpid
+            """,
+            (str(lifecycle_id),),
+        ).fetchall()
+        return [str(row["rpid"]) for row in rows]
 
     @staticmethod
     def _resource_from_row(row: sqlite3.Row) -> BilibiliCommentResource:
