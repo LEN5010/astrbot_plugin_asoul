@@ -199,5 +199,66 @@ class CommentCaptureCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(policy.delay_seconds(20), 43_200)
 
 
+class CommentDeliveryTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        await CommentCaptureCoordinatorTest.asyncSetUp(self)
+        self.gateway.root_pages = {
+            "": BilibiliRootCommentPage(
+                posts=[comment_post("9002", 101)], next_offset=""
+            )
+        }
+        task = self.journal.next_due_scan_task(100)
+        assert task is not None
+        await self.coordinator.run_scan_task(
+            task, ["100"], ["origin-ok", "origin-retry"], 101
+        )
+
+    async def asyncTearDown(self) -> None:
+        await CommentCaptureCoordinatorTest.asyncTearDown(self)
+
+    async def test_groups_acknowledge_independently(self) -> None:
+        attempts: dict[str, int] = {}
+
+        async def sender(origin, notification) -> None:
+            attempts[origin] = attempts.get(origin, 0) + 1
+            if origin == "origin-retry" and attempts[origin] == 1:
+                raise RuntimeError("send failed")
+
+        await self.coordinator.deliver_one(sender, now=101)
+        await self.coordinator.deliver_one(sender, now=101)
+        await self.coordinator.deliver_one(sender, now=161)
+
+        self.assertEqual(attempts, {"origin-ok": 1, "origin-retry": 2})
+        self.assertEqual(self.journal.pending_delivery_count(), 0)
+
+    async def test_ack_persistence_failure_leaves_delivery_pending(self) -> None:
+        original_ack = self.journal.acknowledge_delivery
+        calls = 0
+
+        def fail_first_ack(delivery_id: int, acknowledged_at: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("database unavailable")
+            original_ack(delivery_id, acknowledged_at)
+
+        self.journal.acknowledge_delivery = fail_first_ack
+        sent = 0
+
+        async def sender(origin, notification) -> None:
+            nonlocal sent
+            sent += 1
+
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            await self.coordinator.deliver_one(sender, now=101)
+        await self.coordinator.deliver_one(sender, now=102)
+
+        self.assertEqual(sent, 2)
+
+    def test_removed_group_delivery_is_cancelled(self) -> None:
+        self.journal.cancel_ineligible_deliveries(["origin-ok"])
+        self.assertEqual(self.journal.pending_delivery_origins(), ["origin-ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

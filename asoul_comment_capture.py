@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Protocol, Sequence
+from typing import Awaitable, Callable, Protocol, Sequence
 
-from asoul_bilibili import BilibiliGateway
+from asoul_bilibili import BilibiliGateway, BilibiliNotification
 from asoul_comment_journal import CommentJournal, CommentScanTask
 
 COMMENT_PRIMARY_RESCAN_SECONDS = 180
@@ -114,3 +114,45 @@ class CommentCaptureCoordinator:
                 message=error.message,
                 next_attempt_at=now + delay,
             )
+
+    async def deliver_one(
+        self,
+        send: Callable[[str, BilibiliNotification], Awaitable[None]],
+        now: int,
+    ) -> bool:
+        delivery = self.journal.next_due_delivery(now)
+        if delivery is None:
+            return False
+        resource_text = (
+            "动态" if delivery.resource.resource_kind == "dynamic" else "视频"
+        )
+        notification = BilibiliNotification(
+            kind="comment",
+            uid=delivery.post.author_uid,
+            author_name=delivery.post.author_name,
+            title="",
+            url=delivery.resource.url,
+            text=delivery.post.text,
+            image_urls=list(delivery.post.image_urls),
+            comment_created_at=delivery.post.created_at,
+            comment_resource_owner_name=delivery.resource.owner_name,
+            comment_resource_kind=resource_text,
+            comment_resource_title=delivery.resource.title,
+            comment_action_text=(
+                "回复了评论" if delivery.post.is_reply else "发表了评论"
+            ),
+        )
+        try:
+            await send(delivery.unified_msg_origin, notification)
+        except Exception as exc:
+            error = self._classify_error(exc)
+            delay = self._retry_policy.delay_seconds(delivery.attempt_count)
+            self.journal.fail_delivery(
+                delivery.delivery_id,
+                error.category,
+                error.message,
+                now + delay,
+            )
+            return True
+        self.journal.acknowledge_delivery(delivery.delivery_id, now)
+        return True

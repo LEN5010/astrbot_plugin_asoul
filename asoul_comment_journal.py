@@ -49,6 +49,16 @@ class PageCommitResult:
     lifecycle_activated: bool
 
 
+@dataclass(frozen=True)
+class PendingCommentDelivery:
+    delivery_id: int
+    event_id: int
+    unified_msg_origin: str
+    resource: BilibiliCommentResource
+    post: BilibiliCommentPost
+    attempt_count: int
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS owner_catalog (
@@ -596,6 +606,153 @@ class CommentJournal:
             "SELECT COUNT(*) AS count FROM event_delivery WHERE state = 'pending'"
         ).fetchone()
         return int(row["count"])
+
+    def next_due_delivery(self, now: int) -> PendingCommentDelivery | None:
+        row = self._connection.execute(
+            """
+            SELECT
+                event_delivery.delivery_id,
+                event_delivery.event_id,
+                event_delivery.unified_msg_origin,
+                event_delivery.attempt_count,
+                observed_comment.rpid,
+                observed_comment.author_uid,
+                observed_comment.author_name,
+                observed_comment.text,
+                observed_comment.created_at,
+                observed_comment.is_reply,
+                observed_comment.root_rpid,
+                observed_comment.parent_rpid,
+                observed_comment.image_urls_json,
+                resource_lifecycle.owner_uid,
+                resource_lifecycle.owner_name,
+                resource_lifecycle.resource_key,
+                resource_lifecycle.resource_kind,
+                resource_lifecycle.oid,
+                resource_lifecycle.type_value,
+                resource_lifecycle.title,
+                resource_lifecycle.url
+            FROM event_delivery
+            JOIN comment_event USING(event_id)
+            JOIN observed_comment
+              ON observed_comment.lifecycle_id = comment_event.lifecycle_id
+             AND observed_comment.rpid = comment_event.rpid
+            JOIN resource_lifecycle
+              ON resource_lifecycle.lifecycle_id = comment_event.lifecycle_id
+            WHERE event_delivery.state = 'pending'
+              AND event_delivery.next_attempt_at <= ?
+            ORDER BY event_delivery.next_attempt_at, event_delivery.delivery_id
+            LIMIT 1
+            """,
+            (int(now),),
+        ).fetchone()
+        if row is None:
+            return None
+        raw_images = json.loads(str(row["image_urls_json"] or "[]"))
+        image_urls = (
+            [str(value) for value in raw_images]
+            if isinstance(raw_images, list)
+            else []
+        )
+        return PendingCommentDelivery(
+            delivery_id=int(row["delivery_id"]),
+            event_id=int(row["event_id"]),
+            unified_msg_origin=str(row["unified_msg_origin"]),
+            resource=self._resource_from_row(row),
+            post=BilibiliCommentPost(
+                id=str(row["rpid"]),
+                author_uid=str(row["author_uid"]),
+                author_name=str(row["author_name"]),
+                text=str(row["text"]),
+                created_at=int(row["created_at"]),
+                is_reply=bool(row["is_reply"]),
+                root_id=str(row["root_rpid"]),
+                parent_id=str(row["parent_rpid"]),
+                image_urls=image_urls,
+            ),
+            attempt_count=int(row["attempt_count"]),
+        )
+
+    def acknowledge_delivery(self, delivery_id: int, acknowledged_at: int) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE event_delivery
+                SET state = 'acknowledged', acknowledged_at = ?,
+                    last_error_category = '', last_error_message = ''
+                WHERE delivery_id = ? AND state = 'pending'
+                """,
+                (int(acknowledged_at), int(delivery_id)),
+            )
+
+    def fail_delivery(
+        self,
+        delivery_id: int,
+        category: str,
+        message: str,
+        next_attempt_at: int,
+    ) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE event_delivery
+                SET attempt_count = attempt_count + 1,
+                    last_error_category = ?, last_error_message = ?,
+                    next_attempt_at = ?
+                WHERE delivery_id = ? AND state = 'pending'
+                """,
+                (str(category), str(message), int(next_attempt_at), int(delivery_id)),
+            )
+
+    def cancel_ineligible_deliveries(
+        self, active_origins: Sequence[str]
+    ) -> None:
+        origins = tuple(dict.fromkeys(str(origin) for origin in active_origins))
+        with self._connection:
+            if not origins:
+                self._connection.execute(
+                    """
+                    UPDATE event_delivery SET state = 'cancelled'
+                    WHERE state = 'pending'
+                    """
+                )
+                return
+            placeholders = ",".join("?" for _ in origins)
+            self._connection.execute(
+                f"""
+                UPDATE event_delivery SET state = 'cancelled'
+                WHERE state = 'pending'
+                  AND unified_msg_origin NOT IN ({placeholders})
+                """,
+                origins,
+            )
+
+    def pending_delivery_origins(self) -> list[str]:
+        rows = self._connection.execute(
+            """
+            SELECT unified_msg_origin FROM event_delivery
+            WHERE state = 'pending'
+            ORDER BY delivery_id
+            """
+        ).fetchall()
+        return [str(row["unified_msg_origin"]) for row in rows]
+
+    def purge_retired_lifecycles(self) -> int:
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM resource_lifecycle
+                WHERE state = 'retired'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM comment_event
+                    JOIN event_delivery USING(event_id)
+                    WHERE comment_event.lifecycle_id = resource_lifecycle.lifecycle_id
+                      AND event_delivery.state = 'pending'
+                  )
+                """
+            )
+        return max(0, cursor.rowcount)
 
     def observed_rpids(self, lifecycle_id: str) -> list[str]:
         rows = self._connection.execute(
