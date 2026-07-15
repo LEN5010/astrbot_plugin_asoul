@@ -208,6 +208,22 @@ class BilibiliCommentPost:
     reply_count: int = 0
 
 
+class BilibiliCommentPayloadError(ValueError):
+    """The comments endpoint returned data that cannot advance safely."""
+
+
+@dataclass(frozen=True)
+class BilibiliRootCommentPage:
+    posts: List[BilibiliCommentPost] = field(default_factory=list)
+    next_offset: str = ""
+
+
+@dataclass(frozen=True)
+class BilibiliReplyCommentPage:
+    posts: List[BilibiliCommentPost] = field(default_factory=list)
+    next_page_index: int = 0
+
+
 @dataclass(frozen=True)
 class BilibiliUidSnapshot:
     uid: str
@@ -763,6 +779,104 @@ class BilibiliGateway:
                 ),
             )
         return result
+
+    async def get_root_comment_page(
+        self,
+        resource: BilibiliCommentResource,
+        offset: str = "",
+    ) -> BilibiliRootCommentPage:
+        _, _, comment_module = self._load_modules()
+        comment_type = comment_module.CommentResourceType(resource.type_value)
+        payload = await self._execute_comment_request(
+            lambda: comment_module.get_comments_lazy(
+                oid=resource.oid,
+                type_=comment_type,
+                offset=str(offset or ""),
+                order=comment_module.OrderType.TIME,
+                credential=self._credential,
+            )
+        )
+        if not isinstance(payload, dict):
+            raise BilibiliCommentPayloadError("root comment payload must be a dict")
+
+        posts: List[BilibiliCommentPost] = []
+        seen_ids: set[str] = set()
+
+        def append_reply(raw_reply: Dict[str, Any], root_id: str = "") -> None:
+            post = self._parse_comment_post(raw_reply, root_id=root_id)
+            if post is None:
+                raise BilibiliCommentPayloadError("comment reply is missing rpid")
+            if post.id in seen_ids:
+                return
+            seen_ids.add(post.id)
+            posts.append(post)
+            nested = raw_reply.get("replies")
+            if not isinstance(nested, list):
+                return
+            nested_root_id = post.root_id or post.id
+            for raw_nested in nested:
+                if isinstance(raw_nested, dict):
+                    append_reply(raw_nested, nested_root_id)
+
+        replies = payload.get("replies")
+        if replies is not None and not isinstance(replies, list):
+            raise BilibiliCommentPayloadError("root replies must be a list or null")
+        for raw_reply in replies or []:
+            if not isinstance(raw_reply, dict):
+                raise BilibiliCommentPayloadError("root reply must be a dict")
+            append_reply(raw_reply)
+        return BilibiliRootCommentPage(
+            posts=posts,
+            next_offset=self._extract_comment_next_offset(payload),
+        )
+
+    async def get_reply_comment_page(
+        self,
+        resource: BilibiliCommentResource,
+        root_id: str,
+        page_index: int,
+    ) -> BilibiliReplyCommentPage:
+        _, _, comment_module = self._load_modules()
+        root_rpid = _safe_int(root_id)
+        normalized_page_index = max(1, int(page_index))
+        if root_rpid <= 0:
+            raise BilibiliCommentPayloadError("root rpid must be positive")
+        comment_obj = comment_module.Comment(
+            oid=resource.oid,
+            type_=comment_module.CommentResourceType(resource.type_value),
+            rpid=root_rpid,
+            credential=self._credential,
+        )
+        payload = await self._execute_comment_request(
+            lambda: comment_obj.get_sub_comments(
+                page_index=normalized_page_index,
+                page_size=COMMENT_SUB_COMMENT_PAGE_SIZE,
+            )
+        )
+        if not isinstance(payload, dict):
+            raise BilibiliCommentPayloadError("reply payload must be a dict")
+        replies = payload.get("replies")
+        if replies is not None and not isinstance(replies, list):
+            raise BilibiliCommentPayloadError("nested replies must be a list or null")
+        if not replies:
+            return BilibiliReplyCommentPage()
+        posts: List[BilibiliCommentPost] = []
+        for raw_reply in replies:
+            if not isinstance(raw_reply, dict):
+                raise BilibiliCommentPayloadError("nested reply must be a dict")
+            post = self._parse_comment_post(raw_reply, root_id=str(root_rpid))
+            if post is None:
+                raise BilibiliCommentPayloadError("nested reply is missing rpid")
+            posts.append(post)
+        next_page_index = (
+            normalized_page_index + 1
+            if len(replies) >= COMMENT_SUB_COMMENT_PAGE_SIZE
+            else 0
+        )
+        return BilibiliReplyCommentPage(
+            posts=posts,
+            next_page_index=next_page_index,
+        )
 
     async def get_recent_comments(
         self,

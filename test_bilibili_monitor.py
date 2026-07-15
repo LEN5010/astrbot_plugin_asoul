@@ -10,6 +10,7 @@ from unittest.mock import patch
 from asoul_bilibili import (
     BilibiliAdditionalCard,
     BilibiliAuthorCardProfile,
+    BilibiliCommentPayloadError,
     BilibiliCommentPost,
     BilibiliCommentResource,
     BilibiliCommentSnapshot,
@@ -1199,6 +1200,18 @@ class BilibiliParsingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.gateway = ParsingGateway()
 
+    def _comment_resource(self) -> BilibiliCommentResource:
+        return BilibiliCommentResource(
+            key="video:2003",
+            owner_uid="100",
+            owner_name="测试账号",
+            resource_kind="video",
+            oid=2003,
+            type_value=1,
+            title="第三个视频",
+            url="https://www.bilibili.com/video/BV3",
+        )
+
     def _dynamic_push_config(self) -> BilibiliPushConfig:
         return BilibiliPushConfig(
             enabled=True,
@@ -1680,6 +1693,87 @@ class BilibiliParsingTest(unittest.TestCase):
             ],
         )
         self.assertFalse(post.is_reply)
+
+    def test_root_comment_page_returns_cursor_without_truncating_roots(self) -> None:
+        replies = [
+            {
+                "rpid_str": str(20_000 - index),
+                "ctime": 20_000 - index,
+                "parent": 0,
+                "member": {"mid": "100", "uname": "测试账号"},
+                "content": {"message": f"第 {index} 条"},
+            }
+            for index in range(25)
+        ]
+        self.gateway.comment_module = FakeCommentModule(
+            {
+                "": {
+                    "replies": replies,
+                    "cursor": {"pagination_reply": {"next_offset": "page-2"}},
+                }
+            }
+        )
+
+        page = asyncio.run(
+            self.gateway.get_root_comment_page(self._comment_resource(), offset="")
+        )
+
+        self.assertEqual(len([post for post in page.posts if not post.is_reply]), 25)
+        self.assertEqual(page.next_offset, "page-2")
+        self.assertEqual(self.gateway.comment_module.calls, [""])
+
+    def test_reply_comment_page_does_not_assume_newest_first(self) -> None:
+        self.gateway.comment_module = FakeCommentModule({})
+        self.gateway.comment_module.sub_comment_pages = {
+            ("9001", 1): {
+                "replies": [
+                    {
+                        "rpid_str": "9002",
+                        "ctime": 102,
+                        "parent": 9001,
+                        "root": 9001,
+                        "member": {"mid": "100", "uname": "测试账号"},
+                        "content": {"message": "较早回复"},
+                    },
+                    {
+                        "rpid_str": "9004",
+                        "ctime": 104,
+                        "parent": 9001,
+                        "root": 9001,
+                        "member": {"mid": "100", "uname": "测试账号"},
+                        "content": {"message": "较晚回复"},
+                    },
+                ]
+            }
+        }
+
+        page = asyncio.run(
+            self.gateway.get_reply_comment_page(
+                self._comment_resource(), root_id="9001", page_index=1
+            )
+        )
+
+        self.assertEqual([post.id for post in page.posts], ["9002", "9004"])
+        self.assertEqual(page.next_page_index, 0)
+
+    def test_root_comment_page_rejects_reply_without_rpid(self) -> None:
+        self.gateway.comment_module = FakeCommentModule(
+            {
+                "": {
+                    "replies": [
+                        {
+                            "ctime": 104,
+                            "parent": 0,
+                            "member": {"mid": "100", "uname": "测试账号"},
+                            "content": {"message": "缺少 rpid"},
+                        }
+                    ]
+                }
+            }
+        )
+
+        with self.assertRaisesRegex(BilibiliCommentPayloadError, "rpid"):
+            asyncio.run(self.gateway.get_root_comment_page(self._comment_resource()))
 
     def test_get_recent_comments_pages_until_known_comment(self) -> None:
         self.gateway.comment_module = FakeCommentModule(
