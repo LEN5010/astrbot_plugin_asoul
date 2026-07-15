@@ -364,7 +364,7 @@ class CommentJournal:
               AND scan_task.next_attempt_at <= ?
             ORDER BY
               CASE
-                WHEN scan_task.kind = 'primary' AND scan_task.cursor = '' THEN 0
+                WHEN scan_task.kind = 'primary' THEN 0
                 WHEN scan_task.kind = 'reply' THEN 1
                 ELSE 2
               END,
