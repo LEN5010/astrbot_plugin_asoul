@@ -22,6 +22,7 @@ class BilibiliProfileCacheTest(unittest.TestCase):
             main.Context(),
             config={"enabled": False, "target_uids": ["100"]},
         )
+        self.addCleanup(lambda: asyncio.run(self.plugin.terminate()))
         self.runtime = self.plugin._bilibili_runtime
 
     def test_missing_profile_is_fetched_and_persisted(self) -> None:

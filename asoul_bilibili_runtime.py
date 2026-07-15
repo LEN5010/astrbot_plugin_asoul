@@ -1,8 +1,10 @@
 import asyncio
+import random
 import time
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import astrbot.api.message_components as Comp
@@ -26,6 +28,12 @@ from asoul_bilibili import (
     normalize_bilibili_credential_data,
 )
 from asoul_bilibili_card import BilibiliCardRenderer
+from asoul_comment_capture import (
+    CommentCaptureCoordinator,
+    CommentCaptureError,
+    CommentRetryPolicy,
+)
+from asoul_comment_journal import CommentJournal
 from asoul_core import DISPLAY_TZ
 
 MIN_AT_ALL_REMAINING = 1
@@ -68,7 +76,14 @@ class BilibiliPollError:
 
 
 class BilibiliRuntime:
-    def __init__(self, owner: Any, context: Any, config: Any) -> None:
+    def __init__(
+        self,
+        owner: Any,
+        context: Any,
+        config: Any,
+        *,
+        comment_db_path: Path,
+    ) -> None:
         self._owner = owner
         self.context = context
         self.config = config or {}
@@ -78,6 +93,15 @@ class BilibiliRuntime:
             credential_data=self.push_config.credential_data,
         )
         self.monitor = BilibiliMonitorService(self.gateway)
+        self.comment_journal = CommentJournal(comment_db_path)
+        self.comment_capture = CommentCaptureCoordinator(
+            gateway=self.gateway,
+            journal=self.comment_journal,
+            classify_error=lambda exc: CommentCaptureError(
+                **self.classify_poll_error(exc).__dict__
+            ),
+            retry_policy=CommentRetryPolicy(random_value=random.random),
+        )
         self.card_renderer = BilibiliCardRenderer(owner)
         self.task: asyncio.Task | None = None
         self.comment_task: asyncio.Task | None = None
@@ -135,10 +159,15 @@ class BilibiliRuntime:
                 pass
         await self._cancel_content_poll_tasks()
         await self._cancel_profile_refresh_tasks()
-        await self.card_renderer.cleanup()
-        self._video_stats_cache.clear()
-        self._video_stats_locks.clear()
-        self._runtime_initialized = False
+        try:
+            cleanup_renderer = getattr(self.card_renderer, "cleanup", None)
+            if callable(cleanup_renderer):
+                await cleanup_renderer()
+        finally:
+            self._video_stats_cache.clear()
+            self._video_stats_locks.clear()
+            self.comment_journal.close()
+            self._runtime_initialized = False
 
     def refresh_config(self) -> None:
         previous_request_client = self.push_config.request_client
@@ -955,8 +984,10 @@ class BilibiliRuntime:
         self._content_poll_tasks.clear()
 
     async def _run_comment_monitor_loop(self) -> None:
-        logger.info("启动 B 站评论自动播报任务，轮询间隔 %s 秒", COMMENT_POLL_INTERVAL_SECONDS)
-        uid_states: dict[str, float] = {}
+        logger.info(
+            "启动 B 站评论完整抓取任务，主评论复扫间隔 %s 秒",
+            COMMENT_POLL_INTERVAL_SECONDS,
+        )
 
         while True:
             try:
@@ -977,55 +1008,8 @@ class BilibiliRuntime:
                     continue
 
                 self._missing_login_logged = False
-                current_uids = list(self.push_config.target_uids)
-                now = time.monotonic()
-                wall_now = int(time.time())
-
-                for uid in list(uid_states):
-                    if uid not in current_uids:
-                        uid_states.pop(uid, None)
-
-                for uid in current_uids:
-                    if uid not in uid_states:
-                        uid_states[uid] = self.initial_comment_poll_due_at(
-                            uid,
-                            monotonic_now=now,
-                            wall_now=wall_now,
-                        )
-
-                due_uids = [uid for uid in current_uids if uid_states[uid] <= now]
-                if not due_uids:
-                    next_due_at = min(uid_states[uid] for uid in current_uids)
-                    await asyncio.sleep(min(max(next_due_at - now, 0.2), 2.0))
-                    continue
-
-                run_uid = min(due_uids, key=lambda uid: (uid_states[uid], uid))
-                try:
-                    await self.begin_comment_poll_attempt(
-                        run_uid,
-                        int(time.time()),
-                    )
-                    await self.poll_bilibili_comments_for_uid(run_uid)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    error = self.classify_poll_error(exc)
-                    await self.finish_comment_poll_attempt(
-                        run_uid,
-                        finished_at=int(time.time()),
-                        error=error,
-                    )
-                    self.log_comment_poll_error(run_uid, error)
-                else:
-                    await self.finish_comment_poll_attempt(
-                        run_uid,
-                        finished_at=int(time.time()),
-                    )
-                finally:
-                    finished_at = time.monotonic()
-                    uid_states[run_uid] = (
-                        finished_at + COMMENT_POLL_INTERVAL_SECONDS
-                    )
+                worked = await self.run_one_comment_work_item(int(time.time()))
+                await asyncio.sleep(0 if worked else 1)
             except asyncio.CancelledError:
                 logger.info("B 站评论自动播报任务已停止")
                 raise
@@ -1043,6 +1027,78 @@ class BilibiliRuntime:
             lock = asyncio.Lock()
             locks[normalized_uid] = lock
         return lock
+
+    def get_uid_poll_lock(self, uid: str) -> asyncio.Lock:
+        return self._get_or_create_uid_lock(self._comment_uid_poll_locks, uid)
+
+    async def refresh_one_due_comment_catalog(self, now: int) -> bool:
+        self.comment_journal.retire_unconfigured_owners(
+            self.push_config.target_uids, now
+        )
+        for uid in self.push_config.target_uids:
+            if not self.comment_journal.catalog_refresh_due(
+                uid, now, COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS
+            ):
+                continue
+            self.comment_journal.begin_catalog_refresh(uid, now)
+            try:
+                author_name = await self.gateway.get_comment_resource_owner_name(uid)
+                resources = await self.monitor.discover_comment_resources(
+                    uid, author_name
+                )
+            except Exception as exc:
+                error = self.classify_poll_error(exc)
+                self.comment_journal.fail_catalog_refresh(
+                    uid, error.category, error.message
+                )
+                return True
+            self.comment_journal.sync_resource_catalog(
+                uid, author_name, resources, now
+            )
+            return True
+        return False
+
+    async def send_captured_comment(
+        self, unified_msg_origin: str, notification: Any
+    ) -> None:
+        target = next(
+            (
+                item
+                for item in self.get_active_push_targets()
+                if item.unified_msg_origin == unified_msg_origin
+            ),
+            None,
+        )
+        if target is None:
+            raise RuntimeError("comment delivery target is no longer active")
+        result = await self.build_notification_result(notification, target)
+        await asyncio.wait_for(
+            self.context.send_message(unified_msg_origin, result),
+            timeout=MESSAGE_SEND_TIMEOUT_SECONDS,
+        )
+
+    async def run_one_comment_work_item(self, now: int) -> bool:
+        targets = self.get_active_push_targets()
+        target_origins = [target.unified_msg_origin for target in targets]
+        self.comment_journal.cancel_ineligible_deliveries(target_origins)
+        if await self.comment_capture.deliver_one(
+            self.send_captured_comment, now
+        ):
+            return True
+        if await self.refresh_one_due_comment_catalog(now):
+            return True
+        task = self.comment_journal.next_due_scan_task(now)
+        if task is None:
+            self.comment_journal.purge_retired_lifecycles()
+            return False
+        async with self.get_uid_poll_lock(task.owner_uid):
+            await self.comment_capture.run_scan_task(
+                task,
+                target_uids=self.push_config.target_uids,
+                target_origins=target_origins,
+                now=now,
+            )
+        return True
 
     async def poll_bilibili_updates_for_uid(self, uid: str) -> None:
         lock = self._get_or_create_uid_lock(self._content_uid_poll_locks, uid)

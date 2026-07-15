@@ -42,7 +42,48 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
                 "target_uids": ["100"],
             },
         )
+        self.addCleanup(lambda: asyncio.run(plugin.terminate()))
         return plugin, plugin._bilibili_runtime
+
+    def test_runtime_uses_plugin_data_directory_for_comment_database(self) -> None:
+        plugin, runtime = self._new_runtime()
+
+        self.assertEqual(runtime.comment_journal.path.name, "bilibili_comments.sqlite3")
+        self.assertNotIn(
+            "plugins/astrbot_plugin_asoul", str(runtime.comment_journal.path)
+        )
+        asyncio.run(plugin.terminate())
+
+    def test_comment_work_continues_without_active_groups_to_prevent_replay(
+        self,
+    ) -> None:
+        _, runtime = self._new_runtime()
+        runtime.push_config = replace(
+            runtime.push_config,
+            enabled=True,
+            push_comment=True,
+            target_uids=["100"],
+        )
+        runtime.push_targets = {}
+        calls: list[str] = []
+
+        async def record_catalog(now: int) -> bool:
+            calls.append("catalog")
+            return True
+
+        runtime.refresh_one_due_comment_catalog = record_catalog
+        worked = asyncio.run(runtime.run_one_comment_work_item(NOW_TS))
+
+        self.assertTrue(worked)
+        self.assertEqual(calls, ["catalog"])
+
+    def test_terminate_closes_comment_journal(self) -> None:
+        plugin, runtime = self._new_runtime()
+        journal = runtime.comment_journal
+        asyncio.run(plugin.terminate())
+
+        with self.assertRaises(Exception):
+            journal.pending_delivery_count()
 
     def test_poll_error_classification_omits_html_response_body(self) -> None:
         risk_error = FakeRiskControlError("<!DOCTYPE html>blocked")
@@ -57,47 +98,6 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
         self.assertNotIn("DOCTYPE", risk.message)
         self.assertEqual(credential.category, "credential")
         self.assertEqual(credential.code, "-101")
-
-    def test_persisted_attempt_delays_first_poll_after_restart(self) -> None:
-        _, runtime = self._new_runtime()
-        runtime.push_config = replace(
-            runtime.push_config,
-            enabled=True,
-            push_comment=True,
-            target_uids=["100"],
-        )
-        runtime.refresh_config = lambda: None
-        runtime.gateway.has_credential = lambda: True
-        runtime.monitor_state = {
-            "targets": {},
-            "bootstrap_uids": {},
-            COMMENT_POLL_STATE_KEY: {
-                "100": {
-                    "last_attempt_at": NOW_TS - 10,
-                    "last_success_at": NOW_TS - 10,
-                    "last_result": "success",
-                }
-            },
-        }
-        poll_calls: list[str] = []
-        sleep_delays: list[float] = []
-
-        async def record_poll(uid: str) -> None:
-            poll_calls.append(uid)
-
-        async def stop_on_sleep(delay: float) -> None:
-            sleep_delays.append(delay)
-            raise asyncio.CancelledError
-
-        runtime.poll_bilibili_comments_for_uid = record_poll
-        with patch("asoul_bilibili_runtime.time.time", return_value=NOW_TS), patch(
-            "asoul_bilibili_runtime.time.monotonic", return_value=100.0
-        ), patch("asoul_bilibili_runtime.asyncio.sleep", new=stop_on_sleep):
-            with self.assertRaises(asyncio.CancelledError):
-                asyncio.run(runtime._run_comment_monitor_loop())
-
-        self.assertEqual(poll_calls, [])
-        self.assertEqual(sleep_delays, [2.0])
 
     def test_failed_poll_persists_structured_error_without_touching_target_state(self) -> None:
         _, runtime = self._new_runtime()

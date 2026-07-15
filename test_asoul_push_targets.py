@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from dataclasses import replace
@@ -59,6 +60,11 @@ def _install_astrbot_stubs() -> None:
         def get_platform_inst(self, *args, **kwargs):
             return None
 
+    class DummyStarTools:
+        @staticmethod
+        def get_data_dir(*args, **kwargs):
+            return Path(tempfile.mkdtemp(prefix="asoul_plugin_test_"))
+
     class DummyImage:
         @staticmethod
         def fromFileSystem(path):
@@ -90,6 +96,7 @@ def _install_astrbot_stubs() -> None:
     star_module = types.ModuleType("astrbot.api.star")
     star_module.Context = DummyContext
     star_module.Star = DummyStar
+    star_module.StarTools = DummyStarTools
     star_module.register = decorator_factory
 
     api_module = types.ModuleType("astrbot.api")
@@ -144,7 +151,7 @@ class ASoulPushTargetTest(unittest.TestCase):
         self.context = self.main.Context()
 
     def _new_plugin(self, group_whitelist: list[str]):
-        return self.main.ASoulPlugin(
+        plugin = self.main.ASoulPlugin(
             self.context,
             config={
                 "enabled": False,
@@ -152,6 +159,8 @@ class ASoulPushTargetTest(unittest.TestCase):
                 "target_uids": ["672328094"],
             },
         )
+        self.addCleanup(lambda: asyncio.run(plugin.terminate()))
+        return plugin
 
     def test_registers_multiple_groups_as_independent_targets(self) -> None:
         plugin = self._new_plugin(["100", "200"])
