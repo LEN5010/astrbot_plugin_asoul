@@ -11,10 +11,9 @@ _install_astrbot_stubs()
 from asoul_bilibili import BilibiliGateway
 from asoul_bilibili_runtime import (
     CONTENT_POLL_STATE_KEY,
-    COMMENT_POLL_STATE_KEY,
-    COMMENT_RESOURCE_CATALOGS_KEY,
     BilibiliRuntime,
 )
+from asoul_comment_journal import CommentJournalStatus
 
 
 NOW_TS = 1_700_000_000
@@ -99,123 +98,29 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
         self.assertEqual(credential.category, "credential")
         self.assertEqual(credential.code, "-101")
 
-    def test_failed_poll_persists_structured_error_without_touching_target_state(self) -> None:
+    def test_status_text_reports_journal_backlog_and_incomplete_resources(
+        self,
+    ) -> None:
         _, runtime = self._new_runtime()
-        runtime.monitor_state = {
-            "targets": {
-                "origin": {
-                    "uids": {
-                        "100": {
-                            "comment_resources": {
-                                "video:1": {"recent_comment_ids": ["9001"]}
-                            }
-                        }
-                    }
-                }
-            },
-            "bootstrap_uids": {},
-            COMMENT_POLL_STATE_KEY: {},
-        }
-        before_target_state = runtime.monitor_state["targets"]["origin"]["uids"]["100"]
-
-        asyncio.run(runtime.begin_comment_poll_attempt("100", NOW_TS))
-        asyncio.run(
-            runtime.finish_comment_poll_attempt(
-                "100",
-                finished_at=NOW_TS + 1,
-                error=runtime.classify_poll_error(FakeRiskControlError()),
-            )
+        runtime.comment_journal.status = lambda now: CommentJournalStatus(
+            lifecycle_counts={"bootstrapping": 1, "active": 5, "retired": 2},
+            incomplete_count=1,
+            pending_scan_count=4,
+            overdue_scan_count=2,
+            retrying_scan_count=1,
+            oldest_scan_due_at=NOW_TS - 600,
+            pending_delivery_count=3,
+            oldest_delivery_due_at=NOW_TS - 60,
+            last_reconciliation_at=NOW_TS - 1200,
         )
 
-        entry = runtime.monitor_state[COMMENT_POLL_STATE_KEY]["100"]
-        self.assertEqual(entry["last_attempt_at"], NOW_TS)
-        self.assertEqual(entry["last_result"], "error")
-        self.assertEqual(entry["last_error"]["category"], "risk_control")
-        self.assertEqual(
-            runtime.monitor_state["targets"]["origin"]["uids"]["100"],
-            before_target_state,
-        )
+        text = asyncio.run(runtime.build_bilibili_status_text())
 
-    def test_failed_resource_discovery_preserves_persisted_catalog(self) -> None:
-        _, runtime = self._new_runtime()
-        runtime.monitor_state = {
-            "targets": {},
-            "bootstrap_uids": {},
-            COMMENT_POLL_STATE_KEY: {},
-            COMMENT_RESOURCE_CATALOGS_KEY: {
-                "100": {
-                    "last_attempt_at": NOW_TS - 601,
-                    "last_success_at": NOW_TS - 700,
-                    "author_name": "测试账号",
-                    "resources": [
-                        {
-                            "key": "video:2003",
-                            "owner_uid": "100",
-                            "owner_name": "测试账号",
-                            "resource_kind": "video",
-                            "oid": 2003,
-                            "type_value": 1,
-                            "title": "第三个视频",
-                            "url": "https://www.bilibili.com/video/BV3",
-                        }
-                    ],
-                }
-            },
-        }
+        self.assertIn("活跃资源：5", text)
+        self.assertIn("不完整资源：1", text)
+        self.assertIn("待抓取任务：4（逾期 2，重试 1）", text)
+        self.assertIn("待投递：3", text)
 
-        async def fail_discovery(uid: str, author_name: str):
-            raise FakeRiskControlError()
-
-        runtime.monitor.discover_comment_resources = fail_discovery
-        with patch("asoul_bilibili_runtime.time.time", return_value=NOW_TS):
-            author_name, resources = asyncio.run(
-                runtime.ensure_comment_resource_catalog("100", "测试账号")
-            )
-
-        self.assertEqual(author_name, "测试账号")
-        self.assertEqual([resource.key for resource in resources], ["video:2003"])
-        entry = runtime.monitor_state[COMMENT_RESOURCE_CATALOGS_KEY]["100"]
-        self.assertEqual(entry["last_attempt_at"], NOW_TS)
-        self.assertEqual(entry["last_success_at"], NOW_TS - 700)
-        self.assertEqual(entry["resources"][0]["key"], "video:2003")
-
-    def test_comment_poll_does_not_block_content_poll_for_same_uid(self) -> None:
-        _, runtime = self._new_runtime()
-        comment_started = asyncio.Event()
-        release_comment = asyncio.Event()
-        content_started = asyncio.Event()
-
-        async def block_comment(_uid: str) -> None:
-            comment_started.set()
-            await release_comment.wait()
-
-        async def record_content(_uid: str) -> None:
-            content_started.set()
-
-        runtime._poll_bilibili_updates_for_uid = record_content
-        runtime._poll_bilibili_comments_for_uid = block_comment
-
-        async def run_both() -> bool:
-            comment_task = asyncio.create_task(
-                runtime.poll_bilibili_comments_for_uid("100")
-            )
-            await comment_started.wait()
-            content_task = asyncio.create_task(
-                runtime.poll_bilibili_updates_for_uid("100")
-            )
-            try:
-                try:
-                    await asyncio.wait_for(content_started.wait(), timeout=0.05)
-                except TimeoutError:
-                    pass
-                return content_started.is_set()
-            finally:
-                release_comment.set()
-                await asyncio.gather(comment_task, content_task)
-
-        content_started_before_release = asyncio.run(run_both())
-
-        self.assertTrue(content_started_before_release)
 
     def test_slow_content_uid_does_not_block_next_uid(self) -> None:
         _, runtime = self._new_runtime()
@@ -258,7 +163,7 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
 
         self.assertTrue(second_started.is_set())
 
-    def test_domain_commits_preserve_other_uid_state_fields(self) -> None:
+    def test_content_commit_preserves_legacy_comment_state(self) -> None:
         _, runtime = self._new_runtime()
         origin = "aiocqhttp:GroupMessage:100"
         runtime.monitor_state = {
@@ -276,35 +181,19 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
             "bootstrap_uids": {},
         }
 
-        async def commit_both_domains() -> None:
-            await asyncio.gather(
-                runtime.commit_target_uid_state(
-                    origin,
-                    "100",
-                    {"author_name": "新昵称", "last_dynamic_id": "dyn-2"},
-                ),
-                runtime.commit_target_uid_state(
-                    origin,
-                    "100",
-                    {
-                        "author_name": "新昵称",
-                        "comment_resources": {
-                            "video:1": {
-                                "initialized": True,
-                                "last_comment_id": "9001",
-                            }
-                        },
-                    },
-                ),
+        asyncio.run(
+            runtime.commit_target_uid_state(
+                origin,
+                "100",
+                {"author_name": "新昵称", "last_dynamic_id": "dyn-2"},
             )
-
-        asyncio.run(commit_both_domains())
+        )
 
         state = runtime.monitor_state["targets"][origin]["uids"]["100"]
         self.assertEqual(state.get("last_dynamic_id"), "dyn-2")
         self.assertEqual(
-            state["comment_resources"]["video:1"]["last_comment_id"],
-            "9001",
+            state["comment_resources"]["video:1"],
+            {"initialized": True},
         )
 
     def test_content_poll_attempt_records_success_and_duration(self) -> None:

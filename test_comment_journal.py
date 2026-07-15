@@ -123,7 +123,6 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
         self.assertEqual(
             self.journal.observed_rpids(task.lifecycle_id), ["9001", "9002"]
         )
-
     def test_duplicate_page_is_idempotent(self) -> None:
         task = self._activate_resource()
         post = BilibiliCommentPost(
@@ -180,6 +179,48 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
         assert reloaded is not None
         self.assertEqual(reloaded.cursor, "")
         self.assertEqual(self.journal.observed_rpids(task.lifecycle_id), [])
+
+
+class CommentJournalStatusTest(CommentJournalLifecycleTest):
+    def test_status_counts_backlog_retries_and_deliveries(self) -> None:
+        self.journal.sync_resource_catalog(
+            "100", "测试账号", [video_resource(2003)], now=100
+        )
+        task = self.journal.next_due_scan_task(100)
+        assert task is not None
+        self.journal.commit_scan_page(
+            task=task,
+            posts=[
+                BilibiliCommentPost(
+                    id="9002",
+                    author_uid="100",
+                    author_name="测试账号",
+                    text="新评论",
+                    created_at=101,
+                    is_reply=False,
+                    root_id="9002",
+                )
+            ],
+            target_uids=["100"],
+            target_origins=["origin-a", "origin-b"],
+            now=101,
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=281,
+        )
+        self.journal.mark_scan_failed(
+            task.task_id,
+            category="risk_control",
+            message="请求被拒绝",
+            next_attempt_at=160,
+        )
+
+        status = self.journal.status(now=1_000)
+
+        self.assertEqual(status.lifecycle_counts["bootstrapping"], 1)
+        self.assertEqual(status.retrying_scan_count, 1)
+        self.assertEqual(status.pending_delivery_count, 2)
+        self.assertEqual(status.oldest_scan_due_at, 101)
 
 
 if __name__ == "__main__":

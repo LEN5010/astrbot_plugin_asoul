@@ -59,6 +59,19 @@ class PendingCommentDelivery:
     attempt_count: int
 
 
+@dataclass(frozen=True)
+class CommentJournalStatus:
+    lifecycle_counts: dict[str, int]
+    incomplete_count: int
+    pending_scan_count: int
+    overdue_scan_count: int
+    retrying_scan_count: int
+    oldest_scan_due_at: int
+    pending_delivery_count: int
+    oldest_delivery_due_at: int
+    last_reconciliation_at: int
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS owner_catalog (
@@ -606,6 +619,55 @@ class CommentJournal:
             "SELECT COUNT(*) AS count FROM event_delivery WHERE state = 'pending'"
         ).fetchone()
         return int(row["count"])
+
+    def status(self, now: int) -> CommentJournalStatus:
+        lifecycle_rows = self._connection.execute(
+            "SELECT state, COUNT(*) AS count FROM resource_lifecycle GROUP BY state"
+        ).fetchall()
+        lifecycle_counts = {
+            "bootstrapping": 0,
+            "active": 0,
+            "retired": 0,
+        }
+        for row in lifecycle_rows:
+            lifecycle_counts[str(row["state"])] = int(row["count"])
+        incomplete_row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM resource_lifecycle
+            WHERE incomplete_reason != ''
+            """
+        ).fetchone()
+        scan_row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS pending,
+                   COALESCE(SUM(CASE WHEN next_attempt_at <= ? THEN 1 ELSE 0 END), 0)
+                       AS overdue,
+                   COALESCE(SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END), 0)
+                       AS retrying,
+                   COALESCE(MIN(next_attempt_at), 0) AS oldest_due,
+                   COALESCE(MAX(last_success_at), 0) AS last_success
+            FROM scan_task
+            """,
+            (int(now),),
+        ).fetchone()
+        delivery_row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS pending,
+                   COALESCE(MIN(next_attempt_at), 0) AS oldest_due
+            FROM event_delivery WHERE state = 'pending'
+            """
+        ).fetchone()
+        return CommentJournalStatus(
+            lifecycle_counts=lifecycle_counts,
+            incomplete_count=int(incomplete_row["count"]),
+            pending_scan_count=int(scan_row["pending"]),
+            overdue_scan_count=int(scan_row["overdue"]),
+            retrying_scan_count=int(scan_row["retrying"]),
+            oldest_scan_due_at=int(scan_row["oldest_due"]),
+            pending_delivery_count=int(delivery_row["pending"]),
+            oldest_delivery_due_at=int(delivery_row["oldest_due"]),
+            last_reconciliation_at=int(scan_row["last_success"]),
+        )
 
     def next_due_delivery(self, now: int) -> PendingCommentDelivery | None:
         row = self._connection.execute(

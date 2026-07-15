@@ -7,7 +7,6 @@ from unittest.mock import patch
 from asoul_bilibili import (
     BilibiliCommentPost,
     BilibiliCommentResource,
-    BilibiliCommentSnapshot,
     KV_BILIBILI_MONITOR_STATE,
     BilibiliNotification,
     BilibiliPlannedNotification,
@@ -101,94 +100,6 @@ class FakeMonitor:
             final_state=state_2,
         )
 
-    async def fetch_comment_snapshot(
-        self, uid, author_name, comment_resources, previous_state=None
-    ):
-        self.fetch_calls.append(
-            {
-                "uid": uid,
-                "previous_state": copy.deepcopy(previous_state),
-                "kind": "comment",
-            }
-        )
-        return BilibiliCommentSnapshot(
-            uid=uid,
-            author_name=author_name,
-            comment_resources=list(comment_resources),
-            comment_posts={resource.key: [] for resource in comment_resources},
-        )
-
-    def plan_comment_deliveries(self, config, previous_state, snapshot):
-        self.plan_inputs.append(copy.deepcopy(previous_state or {}))
-        state_1 = {
-            "author_name": snapshot.author_name,
-            "comment_resources": {
-                "video:2003": {
-                    "initialized": True,
-                    "last_comment_id": "9001",
-                    "recent_comment_ids": ["9001"],
-                    "recent_root_ids": ["9001"],
-                    "roots": {
-                        "9001": {
-                            "recent_reply_ids": [],
-                        }
-                    },
-                }
-            },
-        }
-        state_2 = {
-            "author_name": snapshot.author_name,
-            "comment_resources": {
-                "video:2003": {
-                    "initialized": True,
-                    "last_comment_id": "9002",
-                    "recent_comment_ids": ["9002", "9001"],
-                    "recent_root_ids": ["9001"],
-                    "roots": {
-                        "9001": {
-                            "last_reply_id": "9002",
-                            "recent_reply_ids": ["9002"],
-                        }
-                    },
-                }
-            },
-        }
-        deliveries = [
-            BilibiliPlannedNotification(
-                notification=BilibiliNotification(
-                    kind="comment",
-                    uid=snapshot.uid,
-                    author_name=snapshot.author_name,
-                    title="",
-                    url="https://www.bilibili.com/video/BV3",
-                    text="第一条评论",
-                    comment_resource_owner_name="测试账号",
-                    comment_resource_kind="视频",
-                    comment_resource_title="第三个视频",
-                    comment_action_text="发表了评论",
-                ),
-                uid_state=state_1,
-            ),
-            BilibiliPlannedNotification(
-                notification=BilibiliNotification(
-                    kind="comment",
-                    uid=snapshot.uid,
-                    author_name=snapshot.author_name,
-                    title="",
-                    url="https://www.bilibili.com/video/BV3",
-                    text="第二条回复",
-                    comment_resource_owner_name="测试账号",
-                    comment_resource_kind="视频",
-                    comment_resource_title="第三个视频",
-                    comment_action_text="回复了评论",
-                ),
-                uid_state=state_2,
-            ),
-        ]
-        return BilibiliUidDeliveryPlan(
-            deliveries=deliveries,
-            final_state=state_2,
-        )
 
 
 class ASoulDeliveryConfirmationTest(unittest.TestCase):
@@ -206,21 +117,6 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         )
         self.addCleanup(lambda: asyncio.run(plugin.terminate()))
         plugin._bilibili_runtime.monitor = FakeMonitor(self.main)
-        resource = BilibiliCommentResource(
-            key="video:2003",
-            owner_uid="100",
-            owner_name="测试账号",
-            resource_kind="video",
-            oid=2003,
-            type_value=1,
-            title="第三个视频",
-            url="https://www.bilibili.com/video/BV3",
-        )
-
-        async def load_catalog(uid: str, author_name: str):
-            return "测试账号", [resource]
-
-        plugin._bilibili_runtime.ensure_comment_resource_catalog = load_catalog
         return plugin
 
     def test_single_target_confirms_only_after_each_successful_send(self) -> None:

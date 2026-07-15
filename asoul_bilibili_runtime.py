@@ -21,7 +21,6 @@ from asoul_bilibili import (
     BilibiliAuthorCardProfile,
     BilibiliEngagementStats,
     BilibiliGateway,
-    BilibiliCommentResource,
     BilibiliMonitorService,
     BilibiliRichTextNode,
     build_bilibili_push_config,
@@ -58,9 +57,6 @@ CONTENT_UID_STATE_KEYS = frozenset(
         "last_live_room_id",
     }
 )
-COMMENT_UID_STATE_KEYS = frozenset({"author_name", "comment_resources"})
-
-
 @dataclass(frozen=True)
 class BilibiliPushTarget:
     group_id: str
@@ -574,178 +570,6 @@ class BilibiliRuntime:
                 }
             await self.persist_monitor_state_safely()
 
-    def get_comment_poll_entry(self, uid: str) -> dict[str, Any]:
-        state = self.normalize_monitor_state(self.monitor_state)
-        poll_runtime = state.setdefault(COMMENT_POLL_STATE_KEY, {})
-        entry = poll_runtime.setdefault(
-            str(uid),
-            {
-                "last_attempt_at": 0,
-                "last_success_at": 0,
-                "last_result": "",
-            },
-        )
-        self.monitor_state = state
-        return entry
-
-    def initial_comment_poll_due_at(
-        self,
-        uid: str,
-        *,
-        monotonic_now: float,
-        wall_now: int,
-    ) -> float:
-        entry = self.get_comment_poll_entry(uid)
-        last_attempt_at = self._safe_non_negative_int(entry.get("last_attempt_at"))
-        elapsed = (
-            max(0, wall_now - last_attempt_at)
-            if last_attempt_at
-            else COMMENT_POLL_INTERVAL_SECONDS
-        )
-        remaining = max(0, COMMENT_POLL_INTERVAL_SECONDS - elapsed)
-        return monotonic_now + remaining
-
-    async def begin_comment_poll_attempt(self, uid: str, attempted_at: int) -> None:
-        async with self._monitor_state_lock:
-            entry = self.get_comment_poll_entry(uid)
-            entry["last_attempt_at"] = max(0, int(attempted_at))
-            await self.persist_monitor_state()
-
-    async def finish_comment_poll_attempt(
-        self,
-        uid: str,
-        *,
-        finished_at: int,
-        error: Optional[BilibiliPollError] = None,
-    ) -> None:
-        async with self._monitor_state_lock:
-            entry = self.get_comment_poll_entry(uid)
-            if error is None:
-                entry["last_success_at"] = max(0, int(finished_at))
-                entry["last_result"] = "success"
-            else:
-                entry["last_result"] = "error"
-                entry["last_error"] = {
-                    "at": max(0, int(finished_at)),
-                    "category": error.category,
-                    "code": error.code,
-                    "message": error.message,
-                }
-            await self.persist_monitor_state_safely()
-
-    @staticmethod
-    def serialize_comment_resource(
-        resource: BilibiliCommentResource,
-    ) -> dict[str, Any]:
-        return {
-            "key": resource.key,
-            "owner_uid": resource.owner_uid,
-            "owner_name": resource.owner_name,
-            "resource_kind": resource.resource_kind,
-            "oid": resource.oid,
-            "type_value": resource.type_value,
-            "title": resource.title,
-            "url": resource.url,
-        }
-
-    @staticmethod
-    def deserialize_comment_resource(raw_value: Any) -> Optional[BilibiliCommentResource]:
-        if not isinstance(raw_value, dict):
-            return None
-        key = str(raw_value.get("key", "") or "").strip()
-        owner_uid = str(raw_value.get("owner_uid", "") or "").strip()
-        resource_kind = str(raw_value.get("resource_kind", "") or "").strip()
-        try:
-            oid = int(raw_value.get("oid", 0) or 0)
-            type_value = int(raw_value.get("type_value", 0) or 0)
-        except (TypeError, ValueError):
-            return None
-        if not key or not owner_uid or not resource_kind or oid <= 0 or type_value <= 0:
-            return None
-        return BilibiliCommentResource(
-            key=key,
-            owner_uid=owner_uid,
-            owner_name=str(raw_value.get("owner_name", "") or "").strip()
-            or owner_uid,
-            resource_kind=resource_kind,
-            oid=oid,
-            type_value=type_value,
-            title=str(raw_value.get("title", "") or "").strip(),
-            url=str(raw_value.get("url", "") or "").strip(),
-        )
-
-    def get_comment_resource_catalog_entry(self, uid: str) -> dict[str, Any]:
-        state = self.normalize_monitor_state(self.monitor_state)
-        catalogs = state.setdefault(COMMENT_RESOURCE_CATALOGS_KEY, {})
-        entry = catalogs.setdefault(
-            str(uid),
-            {
-                "last_attempt_at": 0,
-                "last_success_at": 0,
-                "author_name": "",
-                "resources": [],
-            },
-        )
-        self.monitor_state = state
-        return entry
-
-    def load_comment_resource_catalog(
-        self, uid: str
-    ) -> list[BilibiliCommentResource]:
-        entry = self.get_comment_resource_catalog_entry(uid)
-        resources: list[BilibiliCommentResource] = []
-        for raw_resource in entry.get("resources", []):
-            resource = self.deserialize_comment_resource(raw_resource)
-            if resource is not None:
-                resources.append(resource)
-        return resources
-
-    async def ensure_comment_resource_catalog(
-        self,
-        uid: str,
-        author_name: str,
-    ) -> tuple[str, list[BilibiliCommentResource]]:
-        entry = self.get_comment_resource_catalog_entry(uid)
-        now = int(time.time())
-        last_attempt_at = self._safe_non_negative_int(entry.get("last_attempt_at"))
-        current_resources = self.load_comment_resource_catalog(uid)
-        if last_attempt_at and now - last_attempt_at < COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS:
-            current_author_name = str(entry.get("author_name", "") or "").strip()
-            return current_author_name or author_name or uid, current_resources
-
-        async with self._monitor_state_lock:
-            entry = self.get_comment_resource_catalog_entry(uid)
-            entry["last_attempt_at"] = now
-            await self.persist_monitor_state_safely()
-
-        resolved_author_name = (
-            str(entry.get("author_name", "") or "").strip()
-            or str(author_name or "").strip()
-        )
-        try:
-            if not resolved_author_name or resolved_author_name == uid:
-                resolved_author_name = await self.gateway.get_comment_resource_owner_name(uid)
-            resources = await self.monitor.discover_comment_resources(
-                uid,
-                resolved_author_name,
-            )
-        except Exception as exc:
-            if not current_resources:
-                raise
-            error = self.classify_poll_error(exc)
-            self.log_comment_resource_error(uid, error)
-            return resolved_author_name or uid, current_resources
-
-        async with self._monitor_state_lock:
-            entry = self.get_comment_resource_catalog_entry(uid)
-            entry["last_success_at"] = int(time.time())
-            entry["author_name"] = resolved_author_name
-            entry["resources"] = [
-                self.serialize_comment_resource(resource) for resource in resources
-            ]
-            await self.persist_monitor_state_safely()
-        return resolved_author_name, resources
-
     @staticmethod
     def classify_poll_error(exc: Exception) -> BilibiliPollError:
         code_value = getattr(exc, "code", None)
@@ -1155,78 +979,6 @@ class BilibiliRuntime:
                 uid=uid,
                 plan=plan,
                 snapshot=snapshot,
-                state_domain="content",
-            )
-
-    async def poll_bilibili_comments_for_uid(self, uid: str) -> None:
-        lock = self._get_or_create_uid_lock(self._comment_uid_poll_locks, uid)
-        async with lock:
-            await self._poll_bilibili_comments_for_uid(uid)
-
-    async def _poll_bilibili_comments_for_uid(self, uid: str) -> None:
-        target_entries = self.get_active_push_targets()
-        if not target_entries:
-            logger.info("存在 B 站新评论通知，但当前没有已登记的白名单群")
-            return
-
-        snapshot_seed_state: dict[str, Any] | None = None
-        for target in target_entries:
-            target_state, _ = self.ensure_target_monitor_bucket(
-                target.unified_msg_origin
-            )
-            candidate_state = target_state.get("uids", {}).get(uid)
-            if isinstance(candidate_state, dict) and candidate_state:
-                snapshot_seed_state = deepcopy(candidate_state)
-                break
-
-        seed_author_name = ""
-        if isinstance(snapshot_seed_state, dict):
-            seed_author_name = str(
-                snapshot_seed_state.get("author_name", "") or ""
-            ).strip()
-        author_name, comment_resources = await self.ensure_comment_resource_catalog(
-            uid,
-            seed_author_name,
-        )
-        if not comment_resources:
-            return
-
-        snapshot = await self.monitor.fetch_comment_snapshot(
-            uid=uid,
-            author_name=author_name,
-            comment_resources=comment_resources,
-            previous_state=snapshot_seed_state,
-        )
-
-        for resource_key, exc in snapshot.resource_errors.items():
-            error = self.classify_poll_error(exc)
-            logger.warning(
-                "B 站评论资源扫描失败，状态未推进: uid=%s resource=%s category=%s code=%s message=%s",
-                uid,
-                resource_key,
-                error.category,
-                error.code or "-",
-                error.message,
-            )
-        if snapshot.resource_errors and not snapshot.comment_posts:
-            raise next(iter(snapshot.resource_errors.values()))
-
-        for target in target_entries:
-            target_state, _ = self.ensure_target_monitor_bucket(
-                target.unified_msg_origin
-            )
-            target_uid_state = target_state.setdefault("uids", {}).get(uid, {})
-            plan = self.monitor.plan_comment_deliveries(
-                config=self.push_config,
-                previous_state=target_uid_state,
-                snapshot=snapshot,
-            )
-            await self.apply_delivery_plan_to_target(
-                target=target,
-                uid=uid,
-                plan=plan,
-                snapshot=snapshot,
-                state_domain="comment",
             )
 
     async def apply_delivery_plan_to_target(
@@ -1235,7 +987,6 @@ class BilibiliRuntime:
         uid: str,
         plan: Any,
         snapshot: Any,
-        state_domain: str,
     ) -> None:
         for delivery in plan.deliveries:
             try:
@@ -1258,30 +1009,22 @@ class BilibiliRuntime:
             await self.commit_target_uid_state(
                 target.unified_msg_origin,
                 uid,
-                self.extract_uid_state_domain(delivery.uid_state, state_domain),
+                self.extract_content_uid_state(delivery.uid_state),
             )
 
         await self.commit_target_uid_state(
             target.unified_msg_origin,
             uid,
-            self.extract_uid_state_domain(plan.final_state, state_domain),
+            self.extract_content_uid_state(plan.final_state),
             only_if_changed=True,
         )
 
     @staticmethod
-    def extract_uid_state_domain(
-        uid_state: Any,
-        state_domain: str,
-    ) -> dict[str, Any]:
+    def extract_content_uid_state(uid_state: Any) -> dict[str, Any]:
         source = uid_state if isinstance(uid_state, dict) else {}
-        allowed_keys = (
-            COMMENT_UID_STATE_KEYS
-            if state_domain == "comment"
-            else CONTENT_UID_STATE_KEYS
-        )
         return {
             key: deepcopy(source[key])
-            for key in allowed_keys
+            for key in CONTENT_UID_STATE_KEYS
             if key in source
         }
 
@@ -1578,8 +1321,9 @@ class BilibiliRuntime:
         await self.ensure_ready()
         state = self.normalize_monitor_state(self.monitor_state)
         content_runtime = state[CONTENT_POLL_STATE_KEY]
-        comment_runtime = state[COMMENT_POLL_STATE_KEY]
+        comment_status = self.comment_journal.status(int(time.time()))
         active_targets = self.get_active_push_targets()
+        lifecycle_counts = comment_status.lifecycle_counts
         lines = [
             "【B站推送状态】",
             f"自动播报：{'已启用' if self.push_config.enabled else '未启用'}",
@@ -1591,7 +1335,31 @@ class BilibiliRuntime:
             f"已登记目标群：{len(active_targets)}",
             f"评论轮询间隔：{COMMENT_POLL_INTERVAL_SECONDS} 秒",
             f"评论资源发现间隔：{COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS} 秒",
+            f"活跃资源：{lifecycle_counts.get('active', 0)}",
+            f"初始化资源：{lifecycle_counts.get('bootstrapping', 0)}",
+            f"已退役资源：{lifecycle_counts.get('retired', 0)}",
+            f"不完整资源：{comment_status.incomplete_count}",
+            "待抓取任务："
+            f"{comment_status.pending_scan_count}（逾期 "
+            f"{comment_status.overdue_scan_count}，重试 "
+            f"{comment_status.retrying_scan_count}）",
+            f"待投递：{comment_status.pending_delivery_count}",
         ]
+        if comment_status.oldest_scan_due_at:
+            lines.append(
+                "最早抓取到期："
+                f"{self.format_status_time(comment_status.oldest_scan_due_at)}"
+            )
+        if comment_status.oldest_delivery_due_at:
+            lines.append(
+                "最早投递到期："
+                f"{self.format_status_time(comment_status.oldest_delivery_due_at)}"
+            )
+        if comment_status.last_reconciliation_at:
+            lines.append(
+                "最近完整分页："
+                f"{self.format_status_time(comment_status.last_reconciliation_at)}"
+            )
         for uid in self.push_config.target_uids:
             content_entry = content_runtime.get(uid, {})
             content_attempt_at = self._safe_non_negative_int(
@@ -1622,26 +1390,6 @@ class BilibiliRuntime:
                 )
                 lines.append(f"UID {uid} 内容：尚未轮询{inflight_text}")
 
-            entry = comment_runtime.get(uid, {})
-            last_attempt_at = self._safe_non_negative_int(entry.get("last_attempt_at"))
-            if not last_attempt_at:
-                lines.append(f"UID {uid} 评论：尚未轮询")
-                continue
-            last_result = str(entry.get("last_result", "") or "")
-            next_poll_at = last_attempt_at + COMMENT_POLL_INTERVAL_SECONDS
-            detail = (
-                f"UID {uid} 评论：最近轮询 {self.format_status_time(last_attempt_at)}；"
-                f"结果 {last_result or '未知'}；"
-                f"下次最早 {self.format_status_time(next_poll_at)}"
-            )
-            if last_result == "error":
-                error = entry.get("last_error", {})
-                if isinstance(error, dict):
-                    category = str(error.get("category", "") or "unknown")
-                    code = str(error.get("code", "") or "-")
-                    message = str(error.get("message", "") or "")
-                    detail += f"；错误 {category}/{code} {message}".rstrip()
-            lines.append(detail)
         return "\n".join(lines)
 
     @staticmethod
