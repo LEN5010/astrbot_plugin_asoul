@@ -55,7 +55,7 @@ def _build_comment_db_path() -> Path:
     return data_dir / "bilibili_comments.sqlite3"
 
 
-@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.3.0")
+@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.4.0")
 class ASoulPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)

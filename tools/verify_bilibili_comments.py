@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from asoul_comment_capture import (  # noqa: E402
     CommentCaptureCoordinator,
     CommentCaptureError,
     CommentRetryPolicy,
+    CommentWorkScheduler,
 )
 from asoul_comment_journal import CommentJournal  # noqa: E402
 
@@ -92,7 +94,7 @@ def _capture_snapshot(
     marker: str,
     target_uid: str,
 ) -> dict[str, Any]:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
@@ -135,22 +137,54 @@ def _capture_snapshot(
 
 
 def _force_full_rescan(db_path: Path, now: int) -> None:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.execute(
             """
             UPDATE scan_task
-            SET next_attempt_at = ?, last_success_at = 0
+            SET next_attempt_at = ?, last_success_at = 0,
+                task_state = 'scheduled', page_index = CASE
+                    WHEN scan_lane = 'reply' THEN 1 ELSE page_index END
+            WHERE lifecycle_id IN (
+                SELECT lifecycle_id FROM resource_lifecycle
+                WHERE retired_at = 0
+            ) AND (
+                scan_lane IN ('head', 'reconcile')
+                OR (
+                    scan_lane = 'reply'
+                    AND EXISTS (
+                        SELECT 1 FROM comment_root_state
+                        WHERE comment_root_state.lifecycle_id = scan_task.lifecycle_id
+                          AND comment_root_state.root_rpid = scan_task.root_rpid
+                          AND comment_root_state.known_reply_count > 0
+                    )
+                )
+            )
             """,
             (int(now),),
         )
+        connection.commit()
 
 
 def _rescan_complete(db_path: Path, started_at: int) -> bool:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         row = connection.execute(
             """
             SELECT COUNT(*) FROM scan_task
-            WHERE last_success_at < ?
+            JOIN resource_lifecycle USING(lifecycle_id)
+            WHERE resource_lifecycle.retired_at = 0
+              AND scan_task.last_success_at < ?
+              AND (
+                scan_task.scan_lane IN ('head', 'reconcile')
+                OR (
+                    scan_task.scan_lane = 'reply'
+                    AND EXISTS (
+                        SELECT 1 FROM comment_root_state
+                        WHERE comment_root_state.lifecycle_id = scan_task.lifecycle_id
+                          AND comment_root_state.root_rpid = scan_task.root_rpid
+                          AND comment_root_state.known_reply_count > 0
+                    )
+                )
+              )
             """,
             (int(started_at),),
         ).fetchone()
@@ -187,6 +221,7 @@ async def main_async(args: argparse.Namespace) -> int:
             classify_error=_classify_error,
             retry_policy=CommentRetryPolicy(random_value=random.random),
         )
+        scheduler = CommentWorkScheduler()
         resource = BilibiliCommentResource(
             key=resource_key,
             owner_uid=str(args.owner_uid),
@@ -217,7 +252,12 @@ async def main_async(args: argparse.Namespace) -> int:
                     await asyncio.sleep(0)
                     continue
 
-                task = journal.next_due_scan_task(now)
+                journal.activate_due_safety_scans(now)
+                task = scheduler.next_task(
+                    journal,
+                    now,
+                    [str(args.owner_uid)],
+                )
                 if task is not None:
                     await coordinator.run_scan_task(
                         task,

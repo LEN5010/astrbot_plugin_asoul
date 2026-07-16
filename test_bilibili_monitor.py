@@ -22,6 +22,7 @@ from asoul_bilibili import (
     BilibiliNotification,
     BilibiliPushConfig,
     BilibiliRichTextNode,
+    BilibiliRootReplyState,
     BilibiliUidSnapshot,
     BilibiliVideoPost,
     build_bilibili_push_config,
@@ -1313,6 +1314,50 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual(len([post for post in page.posts if not post.is_reply]), 25)
         self.assertEqual(page.next_offset, "page-2")
         self.assertEqual(self.gateway.comment_module.calls, [""])
+
+    def test_root_comment_page_exposes_reply_count_and_embedded_ids(self) -> None:
+        self.gateway.comment_module = FakeCommentModule(
+            {
+                "": {
+                    "replies": [
+                        {
+                            "rpid_str": "9001",
+                            "ctime": 101,
+                            "parent": 0,
+                            "rcount": 3,
+                            "member": {"mid": "200", "uname": "观众"},
+                            "content": {"message": "一级评论"},
+                            "replies": [
+                                {
+                                    "rpid_str": "9002",
+                                    "ctime": 102,
+                                    "parent": 9001,
+                                    "root": 9001,
+                                    "member": {"mid": "100", "uname": "测试账号"},
+                                    "content": {"message": "内嵌回复"},
+                                }
+                            ],
+                        }
+                    ],
+                    "cursor": {"pagination_reply": {"next_offset": "page-2"}},
+                }
+            }
+        )
+
+        page = asyncio.run(
+            self.gateway.get_root_comment_page(self._comment_resource(), offset="")
+        )
+
+        self.assertEqual(
+            page.root_states,
+            [
+                BilibiliRootReplyState(
+                    root_rpid="9001",
+                    reply_count=3,
+                    embedded_reply_ids=("9002",),
+                )
+            ],
+        )
 
     def test_reply_comment_page_does_not_assume_newest_first(self) -> None:
         self.gateway.comment_module = FakeCommentModule({})

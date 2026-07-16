@@ -2,6 +2,7 @@ import asyncio
 import time
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_asoul_push_targets import _install_astrbot_stubs, _load_main_module
@@ -66,15 +67,21 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
         runtime.push_targets = {}
         calls: list[str] = []
 
-        async def record_catalog(now: int) -> bool:
-            calls.append("catalog")
-            return True
+        async def no_delivery(send, now: int) -> bool:
+            return False
 
-        runtime.refresh_one_due_comment_catalog = record_catalog
+        async def record_scan(task, target_uids, target_origins, now) -> None:
+            calls.append("scan")
+
+        runtime.comment_capture.deliver_one = no_delivery
+        runtime.comment_capture.run_scan_task = record_scan
+        runtime.comment_scheduler.next_task = lambda journal, now, uids: (
+            SimpleNamespace(owner_uid="100")
+        )
         worked = asyncio.run(runtime.run_one_comment_work_item(NOW_TS))
 
         self.assertTrue(worked)
-        self.assertEqual(calls, ["catalog"])
+        self.assertEqual(calls, ["scan"])
 
     def test_terminate_closes_comment_journal(self) -> None:
         plugin, runtime = self._new_runtime()
@@ -112,14 +119,37 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
             pending_delivery_count=3,
             oldest_delivery_due_at=NOW_TS - 60,
             last_reconciliation_at=NOW_TS - 1200,
+            lane_due_counts={"head": 2, "reply": 1, "reconcile": 1},
+            dormant_reply_count=20,
+            reply_change_pending_count=1,
+            reply_continuation_count=1,
+            reply_retrying_count=1,
+            baseline_pending_count=1,
+            oldest_head_due_at=NOW_TS - 600,
+            last_root_reconciliation_at=NOW_TS - 1200,
+            last_reply_reconciliation_at=NOW_TS - 600,
+            request_count_15m=15,
+            request_count_60m=60,
+            reply_safety_interval_seconds=48 * 60 * 60,
+            owner_last_attempt_at={"100": NOW_TS - 10},
         )
 
         text = asyncio.run(runtime.build_bilibili_status_text())
 
         self.assertIn("活跃资源：5", text)
         self.assertIn("不完整资源：1", text)
-        self.assertIn("待抓取任务：4（逾期 2，重试 1）", text)
+        self.assertIn("头部待处理：2", text)
+        self.assertIn(
+            "回复任务：变化待核对 1；分页中 1；重试 1；当前到期 1",
+            text,
+        )
+        self.assertIn("休眠楼层：20", text)
+        self.assertIn("根索引待处理：1", text)
+        self.assertIn("评论请求吞吐：15 分钟 15；60 分钟 60", text)
+        self.assertIn("最近根评论完整核对", text)
+        self.assertIn("最近楼中楼完整核对", text)
         self.assertIn("待投递：3", text)
+        self.assertIn("安全复查工作量超过单日容量", text)
 
 
     def test_slow_content_uid_does_not_block_next_uid(self) -> None:
@@ -285,21 +315,64 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
 
         runtime.card_renderer = FakeRenderer()
 
-        async def exercise() -> tuple[asyncio.Task, asyncio.Task]:
+        async def exercise() -> tuple[asyncio.Task, asyncio.Task, asyncio.Task, asyncio.Task]:
             content_task = asyncio.create_task(asyncio.Event().wait())
             profile_task = asyncio.create_task(asyncio.Event().wait())
+            comment_task = asyncio.create_task(asyncio.Event().wait())
+            catalog_task = asyncio.create_task(asyncio.Event().wait())
             runtime._content_poll_tasks["100"] = content_task
             runtime._profile_refresh_tasks["100"] = profile_task
+            runtime.comment_task = comment_task
+            runtime.comment_catalog_task = catalog_task
             await runtime.terminate()
-            return content_task, profile_task
+            return content_task, profile_task, comment_task, catalog_task
 
-        content_task, profile_task = asyncio.run(exercise())
+        content_task, profile_task, comment_task, catalog_task = asyncio.run(exercise())
 
         self.assertTrue(content_task.cancelled())
         self.assertTrue(profile_task.cancelled())
+        self.assertTrue(comment_task.cancelled())
+        self.assertTrue(catalog_task.cancelled())
         self.assertEqual(runtime._content_poll_tasks, {})
         self.assertEqual(runtime._profile_refresh_tasks, {})
         self.assertTrue(cleanup_called)
+
+    def test_comment_catalog_timeout_does_not_create_resource_lifecycle(self) -> None:
+        _, runtime = self._new_runtime()
+        runtime.push_config = replace(
+            runtime.push_config,
+            enabled=True,
+            push_comment=True,
+            target_uids=["100"],
+        )
+
+        async def wait_forever(uid: str) -> str:
+            await asyncio.Event().wait()
+
+        runtime.gateway.get_comment_resource_owner_name = wait_forever
+        with patch(
+            "asoul_bilibili_runtime.COMMENT_CATALOG_TIMEOUT_SECONDS", 0.01
+        ):
+            worked = asyncio.run(
+                runtime.refresh_one_due_comment_catalog(NOW_TS)
+            )
+
+        lifecycle_count = runtime.comment_journal._connection.execute(
+            "SELECT COUNT(*) FROM resource_lifecycle"
+        ).fetchone()[0]
+        owner = runtime.comment_journal._connection.execute(
+            """
+            SELECT last_error_category, retry_count, next_attempt_at
+            FROM owner_catalog
+            WHERE owner_uid = '100'
+            """
+        ).fetchone()
+        self.assertTrue(worked)
+        self.assertEqual(lifecycle_count, 0)
+        self.assertEqual(owner["last_error_category"], "network")
+        self.assertEqual(owner["retry_count"], 1)
+        self.assertGreaterEqual(owner["next_attempt_at"], NOW_TS + 60)
+        self.assertLessEqual(owner["next_attempt_at"], NOW_TS + 43_200)
 
     def test_comment_gateway_spaces_all_monitor_requests(self) -> None:
         gateway = BilibiliGateway(comment_request_interval_seconds=2.0)

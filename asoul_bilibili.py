@@ -210,9 +210,17 @@ class BilibiliCommentPayloadError(ValueError):
 
 
 @dataclass(frozen=True)
+class BilibiliRootReplyState:
+    root_rpid: str
+    reply_count: int = 0
+    embedded_reply_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class BilibiliRootCommentPage:
     posts: List[BilibiliCommentPost] = field(default_factory=list)
     next_offset: str = ""
+    root_states: List[BilibiliRootReplyState] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -788,9 +796,14 @@ class BilibiliGateway:
             raise BilibiliCommentPayloadError("root comment payload must be a dict")
 
         posts: List[BilibiliCommentPost] = []
+        root_states: List[BilibiliRootReplyState] = []
         seen_ids: set[str] = set()
 
-        def append_reply(raw_reply: Dict[str, Any], root_id: str = "") -> None:
+        def append_reply(
+            raw_reply: Dict[str, Any],
+            root_id: str = "",
+            embedded_ids: Optional[List[str]] = None,
+        ) -> None:
             post = self._parse_comment_post(raw_reply, root_id=root_id)
             if post is None:
                 raise BilibiliCommentPayloadError("comment reply is missing rpid")
@@ -798,13 +811,15 @@ class BilibiliGateway:
                 return
             seen_ids.add(post.id)
             posts.append(post)
+            if embedded_ids is not None and post.is_reply:
+                embedded_ids.append(post.id)
             nested = raw_reply.get("replies")
             if not isinstance(nested, list):
                 return
             nested_root_id = post.root_id or post.id
             for raw_nested in nested:
                 if isinstance(raw_nested, dict):
-                    append_reply(raw_nested, nested_root_id)
+                    append_reply(raw_nested, nested_root_id, embedded_ids)
 
         replies = payload.get("replies")
         if replies is not None and not isinstance(replies, list):
@@ -812,10 +827,23 @@ class BilibiliGateway:
         for raw_reply in replies or []:
             if not isinstance(raw_reply, dict):
                 raise BilibiliCommentPayloadError("root reply must be a dict")
-            append_reply(raw_reply)
+            root_id = str(raw_reply.get("rpid_str") or raw_reply.get("rpid") or "")
+            embedded_ids: List[str] = []
+            append_reply(raw_reply, embedded_ids=embedded_ids)
+            root_states.append(
+                BilibiliRootReplyState(
+                    root_rpid=root_id,
+                    reply_count=max(
+                        _safe_int(raw_reply.get("rcount")),
+                        len(embedded_ids),
+                    ),
+                    embedded_reply_ids=tuple(embedded_ids),
+                )
+            )
         return BilibiliRootCommentPage(
             posts=posts,
             next_offset=self._extract_comment_next_offset(payload),
+            root_states=root_states,
         )
 
     async def get_reply_comment_page(

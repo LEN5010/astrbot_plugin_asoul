@@ -31,14 +31,19 @@ from asoul_comment_capture import (
     CommentCaptureCoordinator,
     CommentCaptureError,
     CommentRetryPolicy,
+    CommentWorkScheduler,
 )
-from asoul_comment_journal import CommentJournal
+from asoul_comment_journal import (
+    COMMENT_REPLY_SAFETY_MIN_SECONDS,
+    CommentJournal,
+)
 from asoul_core import DISPLAY_TZ
 
 MIN_AT_ALL_REMAINING = 1
 CONTENT_POLL_TIMEOUT_SECONDS = 90
 CARD_RENDER_TIMEOUT_SECONDS = 30
 MESSAGE_SEND_TIMEOUT_SECONDS = 30
+COMMENT_CATALOG_TIMEOUT_SECONDS = 30
 PROFILE_CACHE_TTL_SECONDS = 6 * 60 * 60
 PROFILE_FETCH_TIMEOUT_SECONDS = 20
 VIDEO_STATS_TIMEOUT_SECONDS = 12
@@ -90,17 +95,20 @@ class BilibiliRuntime:
         )
         self.monitor = BilibiliMonitorService(self.gateway)
         self.comment_journal = CommentJournal(comment_db_path)
+        self.comment_retry_policy = CommentRetryPolicy(random_value=random.random)
         self.comment_capture = CommentCaptureCoordinator(
             gateway=self.gateway,
             journal=self.comment_journal,
             classify_error=lambda exc: CommentCaptureError(
                 **self.classify_poll_error(exc).__dict__
             ),
-            retry_policy=CommentRetryPolicy(random_value=random.random),
+            retry_policy=self.comment_retry_policy,
         )
+        self.comment_scheduler = CommentWorkScheduler()
         self.card_renderer = BilibiliCardRenderer(owner)
         self.task: asyncio.Task | None = None
         self.comment_task: asyncio.Task | None = None
+        self.comment_catalog_task: asyncio.Task | None = None
         self.push_targets: dict[str, dict[str, str]] = {}
         self.monitor_state: dict[str, Any] = {}
         self.credential_data: dict[str, str] = {}
@@ -139,6 +147,12 @@ class BilibiliRuntime:
             not self.comment_task or self.comment_task.done()
         ):
             self.comment_task = asyncio.create_task(self._run_comment_monitor_loop())
+        if self.push_config.push_comment and (
+            not self.comment_catalog_task or self.comment_catalog_task.done()
+        ):
+            self.comment_catalog_task = asyncio.create_task(
+                self._run_comment_catalog_loop()
+            )
 
     async def terminate(self) -> None:
         if self.task and not self.task.done():
@@ -151,6 +165,12 @@ class BilibiliRuntime:
             self.comment_task.cancel()
             try:
                 await self.comment_task
+            except asyncio.CancelledError:
+                pass
+        if self.comment_catalog_task and not self.comment_catalog_task.done():
+            self.comment_catalog_task.cancel()
+            try:
+                await self.comment_catalog_task
             except asyncio.CancelledError:
                 pass
         await self._cancel_content_poll_tasks()
@@ -841,6 +861,31 @@ class BilibiliRuntime:
                 logger.exception("B 站评论自动播报任务执行异常，本轮跳过并等待下次轮询")
                 await asyncio.sleep(1)
 
+    async def _run_comment_catalog_loop(self) -> None:
+        logger.info(
+            "启动 B 站评论资源发现任务，发现间隔 %s 秒",
+            COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS,
+        )
+        while True:
+            try:
+                self.refresh_config()
+                if (
+                    not self.push_config.enabled
+                    or not self.push_config.push_comment
+                    or not self.push_config.target_uids
+                    or not self.gateway.has_credential()
+                ):
+                    await asyncio.sleep(COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS)
+                    continue
+                worked = await self.refresh_one_due_comment_catalog(int(time.time()))
+                await asyncio.sleep(0 if worked else 1)
+            except asyncio.CancelledError:
+                logger.info("B 站评论资源发现任务已停止")
+                raise
+            except Exception:
+                logger.exception("B 站评论资源发现任务异常，本轮跳过")
+                await asyncio.sleep(1)
+
     @staticmethod
     def _get_or_create_uid_lock(
         locks: dict[str, asyncio.Lock], uid: str
@@ -866,14 +911,28 @@ class BilibiliRuntime:
                 continue
             self.comment_journal.begin_catalog_refresh(uid, now)
             try:
-                author_name = await self.gateway.get_comment_resource_owner_name(uid)
-                resources = await self.monitor.discover_comment_resources(
-                    uid, author_name
+                async def discover() -> tuple[str, list[Any]]:
+                    author_name = await self.gateway.get_comment_resource_owner_name(
+                        uid
+                    )
+                    resources = await self.monitor.discover_comment_resources(
+                        uid, author_name
+                    )
+                    return author_name, resources
+
+                author_name, resources = await asyncio.wait_for(
+                    discover(), timeout=COMMENT_CATALOG_TIMEOUT_SECONDS
                 )
             except Exception as exc:
                 error = self.classify_poll_error(exc)
+                retry_delay = self.comment_retry_policy.delay_seconds(
+                    self.comment_journal.catalog_retry_count(uid)
+                )
                 self.comment_journal.fail_catalog_refresh(
-                    uid, error.category, error.message
+                    uid,
+                    error.category,
+                    error.message,
+                    next_attempt_at=now + retry_delay,
                 )
                 return True
             self.comment_journal.sync_resource_catalog(
@@ -909,11 +968,13 @@ class BilibiliRuntime:
             self.send_captured_comment, now
         ):
             return True
-        if await self.refresh_one_due_comment_catalog(now):
-            return True
-        task = self.comment_journal.next_due_scan_task(now)
+        self.comment_journal.activate_due_safety_scans(now)
+        task = self.comment_scheduler.next_task(
+            self.comment_journal,
+            now,
+            self.push_config.target_uids,
+        )
         if task is None:
-            self.comment_journal.purge_retired_lifecycles()
             return False
         async with self.get_uid_poll_lock(task.owner_uid):
             await self.comment_capture.run_scan_task(
@@ -1321,9 +1382,32 @@ class BilibiliRuntime:
         await self.ensure_ready()
         state = self.normalize_monitor_state(self.monitor_state)
         content_runtime = state[CONTENT_POLL_STATE_KEY]
-        comment_status = self.comment_journal.status(int(time.time()))
+        now = int(time.time())
+        comment_status = self.comment_journal.status(now)
         active_targets = self.get_active_push_targets()
         lifecycle_counts = comment_status.lifecycle_counts
+        lane_due_counts = comment_status.lane_due_counts or {}
+        head_delay_seconds = (
+            max(0, now - comment_status.oldest_head_due_at)
+            if comment_status.oldest_head_due_at
+            else 0
+        )
+        safety_hours = comment_status.reply_safety_interval_seconds / 3600
+        safety_capacity_overloaded = (
+            comment_status.reply_safety_interval_seconds
+            > COMMENT_REPLY_SAFETY_MIN_SECONDS
+        )
+        owner_attempts = comment_status.owner_last_attempt_at or {}
+        stale_comment_uids = [
+            uid
+            for uid in self.push_config.target_uids
+            if uid in owner_attempts
+            and (
+                owner_attempts[uid] <= 0
+                or now - owner_attempts[uid]
+                > COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS * 2
+            )
+        ]
         lines = [
             "【B站推送状态】",
             f"自动播报：{'已启用' if self.push_config.enabled else '未启用'}",
@@ -1332,6 +1416,7 @@ class BilibiliRuntime:
             f"请求客户端：{self.push_config.request_client}",
             f"内容任务：{'运行中' if self.task and not self.task.done() else '未运行'}；在途 {len(self._content_poll_tasks)}",
             f"评论任务：{'运行中' if self.comment_task and not self.comment_task.done() else '未运行'}",
+            f"资源发现任务：{'运行中' if self.comment_catalog_task and not self.comment_catalog_task.done() else '未运行'}",
             f"已登记目标群：{len(active_targets)}",
             f"评论轮询间隔：{COMMENT_POLL_INTERVAL_SECONDS} 秒",
             f"评论资源发现间隔：{COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS} 秒",
@@ -1339,27 +1424,53 @@ class BilibiliRuntime:
             f"初始化资源：{lifecycle_counts.get('bootstrapping', 0)}",
             f"已退役资源：{lifecycle_counts.get('retired', 0)}",
             f"不完整资源：{comment_status.incomplete_count}",
-            "待抓取任务："
-            f"{comment_status.pending_scan_count}（逾期 "
-            f"{comment_status.overdue_scan_count}，重试 "
-            f"{comment_status.retrying_scan_count}）",
+            f"历史补齐中：{comment_status.baseline_pending_count}",
+            "头部待处理："
+            f"{lane_due_counts.get('head', 0)}"
+            f"（最久延迟 {head_delay_seconds} 秒）",
+            "回复任务："
+            f"变化待核对 {comment_status.reply_change_pending_count}；"
+            f"分页中 {comment_status.reply_continuation_count}；"
+            f"重试 {comment_status.reply_retrying_count}；"
+            f"当前到期 {lane_due_counts.get('reply', 0)}",
+            f"休眠楼层：{comment_status.dormant_reply_count}",
+            f"根索引待处理：{lane_due_counts.get('reconcile', 0)}",
+            "评论请求吞吐："
+            f"15 分钟 {comment_status.request_count_15m}；"
+            f"60 分钟 {comment_status.request_count_60m}",
+            f"回复安全复查周期：约 {safety_hours:.1f} 小时",
             f"待投递：{comment_status.pending_delivery_count}",
         ]
-        if comment_status.oldest_scan_due_at:
-            lines.append(
-                "最早抓取到期："
-                f"{self.format_status_time(comment_status.oldest_scan_due_at)}"
-            )
         if comment_status.oldest_delivery_due_at:
             lines.append(
                 "最早投递到期："
                 f"{self.format_status_time(comment_status.oldest_delivery_due_at)}"
             )
-        if comment_status.last_reconciliation_at:
+        if comment_status.last_root_reconciliation_at:
             lines.append(
-                "最近完整分页："
-                f"{self.format_status_time(comment_status.last_reconciliation_at)}"
+                "最近根评论完整核对："
+                f"{self.format_status_time(comment_status.last_root_reconciliation_at)}"
             )
+        if comment_status.last_reply_reconciliation_at:
+            lines.append(
+                "最近楼中楼完整核对："
+                f"{self.format_status_time(comment_status.last_reply_reconciliation_at)}"
+            )
+        if (
+            head_delay_seconds > COMMENT_POLL_INTERVAL_SECONDS * 2
+            or stale_comment_uids
+            or safety_capacity_overloaded
+        ):
+            warning_reasons: list[str] = []
+            if head_delay_seconds > COMMENT_POLL_INTERVAL_SECONDS * 2:
+                warning_reasons.append("头部延迟超过两个轮询周期")
+            if stale_comment_uids:
+                warning_reasons.append(
+                    f"等待过久 UID：{', '.join(stale_comment_uids)}"
+                )
+            if safety_capacity_overloaded:
+                warning_reasons.append("安全复查工作量超过单日容量")
+            lines.append(f"⚠ 评论抓取容量告警：{'；'.join(warning_reasons)}")
         for uid in self.push_config.target_uids:
             content_entry = content_runtime.get(uid, {})
             content_attempt_at = self._safe_non_negative_int(
