@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from dataclasses import replace
@@ -59,6 +60,11 @@ def _install_astrbot_stubs() -> None:
         def get_platform_inst(self, *args, **kwargs):
             return None
 
+    class DummyStarTools:
+        @staticmethod
+        def get_data_dir(*args, **kwargs):
+            return Path(tempfile.mkdtemp(prefix="asoul_plugin_test_"))
+
     class DummyImage:
         @staticmethod
         def fromFileSystem(path):
@@ -90,6 +96,7 @@ def _install_astrbot_stubs() -> None:
     star_module = types.ModuleType("astrbot.api.star")
     star_module.Context = DummyContext
     star_module.Star = DummyStar
+    star_module.StarTools = DummyStarTools
     star_module.register = decorator_factory
 
     api_module = types.ModuleType("astrbot.api")
@@ -144,7 +151,7 @@ class ASoulPushTargetTest(unittest.TestCase):
         self.context = self.main.Context()
 
     def _new_plugin(self, group_whitelist: list[str]):
-        return self.main.ASoulPlugin(
+        plugin = self.main.ASoulPlugin(
             self.context,
             config={
                 "enabled": False,
@@ -152,6 +159,8 @@ class ASoulPushTargetTest(unittest.TestCase):
                 "target_uids": ["672328094"],
             },
         )
+        self.addCleanup(lambda: asyncio.run(plugin.terminate()))
+        return plugin
 
     def test_registers_multiple_groups_as_independent_targets(self) -> None:
         plugin = self._new_plugin(["100", "200"])
@@ -267,6 +276,43 @@ class ASoulPushTargetTest(unittest.TestCase):
         self.assertIn(("image_url", "https://i0.hdslb.com/comment-image.png"), parts)
         self.assertEqual(parts[-1][0], "plain")
         self.assertIn("https://www.bilibili.com/video/BV1xx411c7mD", parts[-1][1])
+
+    def test_comment_notification_uses_card_and_commenter_profile(self) -> None:
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        rendered = []
+
+        class RecordingRenderer:
+            async def render(self, notification):
+                rendered.append(notification)
+                return "/tmp/bilibili-comment-card.png"
+
+        async def profile(uid, *, fallback=None):
+            return BilibiliAuthorCardProfile(
+                uid=uid,
+                name=fallback.name,
+                follower=1234,
+            )
+
+        runtime.card_renderer = RecordingRenderer()
+        runtime.get_author_card_profile = profile
+        notification = BilibiliNotification(
+            kind="comment",
+            uid="200",
+            author_name="评论者",
+            title="",
+            text="评论正文",
+            url="https://t.bilibili.com/1",
+            content_id="9001",
+            comment_created_at=1_700_000_000,
+        )
+
+        parts = asyncio.run(runtime.build_card_or_fallback_parts(notification))
+
+        self.assertEqual(parts[0], ("image", "/tmp/bilibili-comment-card.png"))
+        self.assertEqual(parts[1], ("plain", "https://t.bilibili.com/1"))
+        self.assertEqual(rendered[0].author_profile.follower, 1234)
+        self.assertEqual(rendered[0].published_at, 1_700_000_000)
 
     def test_card_result_is_image_plus_clickable_url_and_only_live_uses_atall(self) -> None:
         from asoul_bilibili_runtime import BilibiliPushTarget

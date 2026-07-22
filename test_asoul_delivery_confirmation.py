@@ -5,8 +5,8 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from asoul_bilibili import (
+    BilibiliCommentPost,
     BilibiliCommentResource,
-    BilibiliCommentSnapshot,
     KV_BILIBILI_MONITOR_STATE,
     BilibiliNotification,
     BilibiliPlannedNotification,
@@ -100,94 +100,6 @@ class FakeMonitor:
             final_state=state_2,
         )
 
-    async def fetch_comment_snapshot(
-        self, uid, author_name, comment_resources, previous_state=None
-    ):
-        self.fetch_calls.append(
-            {
-                "uid": uid,
-                "previous_state": copy.deepcopy(previous_state),
-                "kind": "comment",
-            }
-        )
-        return BilibiliCommentSnapshot(
-            uid=uid,
-            author_name=author_name,
-            comment_resources=list(comment_resources),
-            comment_posts={resource.key: [] for resource in comment_resources},
-        )
-
-    def plan_comment_deliveries(self, config, previous_state, snapshot):
-        self.plan_inputs.append(copy.deepcopy(previous_state or {}))
-        state_1 = {
-            "author_name": snapshot.author_name,
-            "comment_resources": {
-                "video:2003": {
-                    "initialized": True,
-                    "last_comment_id": "9001",
-                    "recent_comment_ids": ["9001"],
-                    "recent_root_ids": ["9001"],
-                    "roots": {
-                        "9001": {
-                            "recent_reply_ids": [],
-                        }
-                    },
-                }
-            },
-        }
-        state_2 = {
-            "author_name": snapshot.author_name,
-            "comment_resources": {
-                "video:2003": {
-                    "initialized": True,
-                    "last_comment_id": "9002",
-                    "recent_comment_ids": ["9002", "9001"],
-                    "recent_root_ids": ["9001"],
-                    "roots": {
-                        "9001": {
-                            "last_reply_id": "9002",
-                            "recent_reply_ids": ["9002"],
-                        }
-                    },
-                }
-            },
-        }
-        deliveries = [
-            BilibiliPlannedNotification(
-                notification=BilibiliNotification(
-                    kind="comment",
-                    uid=snapshot.uid,
-                    author_name=snapshot.author_name,
-                    title="",
-                    url="https://www.bilibili.com/video/BV3",
-                    text="第一条评论",
-                    comment_resource_owner_name="测试账号",
-                    comment_resource_kind="视频",
-                    comment_resource_title="第三个视频",
-                    comment_action_text="发表了评论",
-                ),
-                uid_state=state_1,
-            ),
-            BilibiliPlannedNotification(
-                notification=BilibiliNotification(
-                    kind="comment",
-                    uid=snapshot.uid,
-                    author_name=snapshot.author_name,
-                    title="",
-                    url="https://www.bilibili.com/video/BV3",
-                    text="第二条回复",
-                    comment_resource_owner_name="测试账号",
-                    comment_resource_kind="视频",
-                    comment_resource_title="第三个视频",
-                    comment_action_text="回复了评论",
-                ),
-                uid_state=state_2,
-            ),
-        ]
-        return BilibiliUidDeliveryPlan(
-            deliveries=deliveries,
-            final_state=state_2,
-        )
 
 
 class ASoulDeliveryConfirmationTest(unittest.TestCase):
@@ -203,22 +115,8 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
                 "target_uids": ["100"],
             },
         )
+        self.addCleanup(lambda: asyncio.run(plugin.terminate()))
         plugin._bilibili_runtime.monitor = FakeMonitor(self.main)
-        resource = BilibiliCommentResource(
-            key="video:2003",
-            owner_uid="100",
-            owner_name="测试账号",
-            resource_kind="video",
-            oid=2003,
-            type_value=1,
-            title="第三个视频",
-            url="https://www.bilibili.com/video/BV3",
-        )
-
-        async def load_catalog(uid: str, author_name: str):
-            return "测试账号", [resource]
-
-        plugin._bilibili_runtime.ensure_comment_resource_catalog = load_catalog
         return plugin
 
     def test_single_target_confirms_only_after_each_successful_send(self) -> None:
@@ -272,11 +170,9 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         origin_fail = "aiocqhttp:GroupMessage:200"
         context.fail_rules[(origin_fail, 1)] = RuntimeError("comment send failed")
         plugin = self._new_plugin(context, ["100", "200"])
-        plugin._bilibili_runtime.push_config = replace(
-            plugin._bilibili_runtime.push_config,
-            push_comment=True,
-        )
-        plugin._bilibili_runtime.push_targets = {
+        runtime = plugin._bilibili_runtime
+        runtime.push_config = replace(runtime.push_config, push_comment=True)
+        runtime.push_targets = {
             origin_ok: {
                 "group_id": "100",
                 "platform_name": "aiocqhttp",
@@ -288,47 +184,51 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
                 "unified_msg_origin": origin_fail,
             },
         }
-
-        asyncio.run(plugin._bilibili_runtime.poll_bilibili_comments_for_uid("100"))
-
-        ok_state = plugin._bilibili_runtime.monitor_state["targets"][origin_ok]["uids"]["100"]
-        fail_state = plugin._bilibili_runtime.monitor_state["targets"][origin_fail]["uids"].get("100", {})
-        self.assertEqual(ok_state["comment_resources"]["video:2003"]["last_comment_id"], "9002")
-        self.assertEqual(fail_state, {})
-        self.assertEqual(context.origin_counts[origin_ok], 2)
-        self.assertEqual(context.origin_counts[origin_fail], 1)
-
-    def test_failed_comment_uid_waits_for_next_poll_cycle(self) -> None:
-        context = RecordingContext()
-        plugin = self._new_plugin(context, ["100"])
-        runtime = plugin._bilibili_runtime
-        runtime.push_config = replace(
-            runtime.push_config,
-            enabled=True,
-            push_comment=True,
-            target_uids=["100"],
+        resource = BilibiliCommentResource(
+            key="video:2003",
+            owner_uid="100",
+            owner_name="测试账号",
+            resource_kind="video",
+            oid=2003,
+            type_value=1,
+            title="第三个视频",
+            url="https://www.bilibili.com/video/BV3",
         )
-        runtime.refresh_config = lambda: None
-        runtime.gateway.has_credential = lambda: True
-        poll_calls: list[str] = []
-        sleep_delays: list[float] = []
+        runtime.comment_journal.sync_resource_catalog(
+            "100", "测试账号", [resource], now=100
+        )
+        task = runtime.comment_journal.next_due_scan_task(100)
+        assert task is not None
+        runtime.comment_journal.commit_scan_page(
+            task=task,
+            posts=[
+                BilibiliCommentPost(
+                    id="9002",
+                    author_uid="100",
+                    author_name="测试账号",
+                    text="第二条回复",
+                    created_at=101,
+                    is_reply=True,
+                    root_id="9001",
+                    parent_id="9001",
+                )
+            ],
+            target_uids=["100"],
+            target_origins=[origin_ok, origin_fail],
+            now=101,
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=281,
+        )
 
-        async def fail_poll(uid: str) -> None:
-            poll_calls.append(uid)
-            raise RuntimeError("HTTP 412")
+        asyncio.run(runtime.run_one_comment_work_item(101))
+        asyncio.run(runtime.run_one_comment_work_item(101))
 
-        async def stop_on_sleep(delay: float) -> None:
-            sleep_delays.append(delay)
-            raise asyncio.CancelledError
-
-        runtime.poll_bilibili_comments_for_uid = fail_poll
-        with patch("asoul_bilibili_runtime.asyncio.sleep", new=stop_on_sleep):
-            with self.assertRaises(asyncio.CancelledError):
-                asyncio.run(runtime._run_comment_monitor_loop())
-
-        self.assertEqual(poll_calls, ["100"])
-        self.assertEqual(len(sleep_delays), 1)
-        self.assertGreaterEqual(sleep_delays[0], 1.9)
+        self.assertEqual(
+            runtime.comment_journal.pending_delivery_origins(), [origin_fail]
+        )
+        self.assertEqual(context.origin_counts[origin_ok], 1)
+        self.assertEqual(context.origin_counts[origin_fail], 1)
 
     def test_no_active_targets_does_not_fetch_or_advance_state(self) -> None:
         context = RecordingContext()
