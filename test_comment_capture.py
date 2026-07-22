@@ -401,6 +401,17 @@ class CommentDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, {"origin-ok": 1, "origin-retry": 2})
         self.assertEqual(self.journal.pending_delivery_count(), 0)
 
+    async def test_delivery_notification_has_stable_card_identity(self) -> None:
+        notifications = []
+
+        async def sender(origin, notification) -> None:
+            notifications.append(notification)
+
+        await self.coordinator.deliver_one(sender, now=101)
+
+        self.assertEqual(notifications[0].content_id, "9002")
+        self.assertEqual(notifications[0].published_at, 101)
+
     async def test_ack_persistence_failure_leaves_delivery_pending(self) -> None:
         original_ack = self.journal.acknowledge_delivery
         calls = 0

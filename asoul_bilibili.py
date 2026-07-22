@@ -24,6 +24,8 @@ COMMENT_SUB_COMMENT_PAGE_SIZE = 20
 COMMENT_POLL_INTERVAL_SECONDS = 180
 COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS = 600
 COMMENT_REQUEST_INTERVAL_SECONDS = 2.0
+MIN_COMMENT_REQUEST_INTERVAL_SECONDS = 0.5
+MAX_COMMENT_REQUEST_INTERVAL_SECONDS = 60.0
 CONTENT_RECENT_IDS_LIMIT = 20
 RECENT_NOTIFICATION_WINDOW_SECONDS = 5 * 60
 DYNAMIC_FORWARD_SEPARATOR = "┈" * 24
@@ -58,6 +60,8 @@ class BilibiliPushConfig:
     request_client: str
     credential_data: Dict[str, str]
     render_bilibili_cards: bool = True
+    comment_target_uids: List[str] = field(default_factory=list)
+    comment_request_interval_seconds: float = COMMENT_REQUEST_INTERVAL_SECONDS
 
 
 @dataclass(frozen=True)
@@ -284,13 +288,28 @@ def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> Bilibili
     request_client = str(source.get("request_client", "aiohttp") or "aiohttp").strip().lower()
     if request_client not in {"aiohttp", "httpx", "curl_cffi"}:
         request_client = "aiohttp"
+    target_uids = _normalize_string_list(
+        source.get("target_uids", DEFAULT_BILIBILI_TARGET_UIDS)
+    )
+    comment_target_uids = _normalize_string_list(
+        source.get("comment_target_uids", [])
+    )
+    if not comment_target_uids:
+        comment_target_uids = list(target_uids)
+    comment_request_interval = _safe_parse_float(
+        source.get(
+            "comment_request_interval_seconds",
+            COMMENT_REQUEST_INTERVAL_SECONDS,
+        ),
+        COMMENT_REQUEST_INTERVAL_SECONDS,
+    )
 
     return BilibiliPushConfig(
         enabled=bool(source.get("enabled", False)),
         poll_interval_seconds=max(MIN_POLL_INTERVAL_SECONDS, poll_interval),
         task_gap_seconds=max(0.0, task_gap_seconds),
         group_whitelist=_normalize_string_list(source.get("group_whitelist", [])),
-        target_uids=_normalize_string_list(source.get("target_uids", DEFAULT_BILIBILI_TARGET_UIDS)),
+        target_uids=target_uids,
         push_dynamic=bool(source.get("push_dynamic", True)),
         push_video=bool(source.get("push_video", True)),
         push_live=bool(source.get("push_live", True)),
@@ -298,6 +317,11 @@ def build_bilibili_push_config(raw_config: Optional[Dict[str, Any]]) -> Bilibili
         request_client=request_client,
         credential_data=_normalize_credential_data(source),
         render_bilibili_cards=bool(source.get("render_bilibili_cards", True)),
+        comment_target_uids=comment_target_uids,
+        comment_request_interval_seconds=min(
+            MAX_COMMENT_REQUEST_INTERVAL_SECONDS,
+            max(MIN_COMMENT_REQUEST_INTERVAL_SECONDS, comment_request_interval),
+        ),
     )
 
 
@@ -369,9 +393,7 @@ class BilibiliGateway:
         self._client_selected = False
         self._credential_data = _normalize_credential_data(credential_data or {})
         self._credential = None
-        self._comment_request_interval_seconds = max(
-            0.0, float(comment_request_interval_seconds)
-        )
+        self.set_comment_request_interval_seconds(comment_request_interval_seconds)
         self._comment_request_lock = asyncio.Lock()
         self._next_comment_request_at = 0.0
         if self._credential_data:
@@ -426,6 +448,16 @@ class BilibiliGateway:
             return
         self._request_client = normalized
         self._client_selected = False
+
+    def set_comment_request_interval_seconds(self, value: float) -> None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = COMMENT_REQUEST_INTERVAL_SECONDS
+        self._comment_request_interval_seconds = min(
+            MAX_COMMENT_REQUEST_INTERVAL_SECONDS,
+            max(MIN_COMMENT_REQUEST_INTERVAL_SECONDS, parsed),
+        )
 
     def clear_credential(self) -> None:
         self._credential_data = {}

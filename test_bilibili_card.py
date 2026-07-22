@@ -53,10 +53,39 @@ class BilibiliCardFormattingTest(unittest.TestCase):
 
         self.assertIn("{{ brand_name }}", template)
         self.assertIn("{{ brand_logo_data_uri", template)
-        self.assertIn("本条内容", template)
-        self.assertIn("UP资料", template)
+        self.assertIn("{{ content_heading }}", template)
+        self.assertIn("{{ profile_heading }}", template)
         self.assertIn("{{ stats_note }}", template)
         self.assertNotIn("ASTRBOT · BILIBILI CARD", template)
+
+    def test_comment_context_identifies_source_and_hides_engagement(self) -> None:
+        notification = BilibiliNotification(
+            kind="comment",
+            uid="200",
+            author_name="评论者",
+            title="",
+            text="这是一条评论",
+            url="https://t.bilibili.com/123",
+            comment_created_at=1_700_000_000,
+            comment_resource_owner_name="UP主",
+            comment_resource_kind="动态",
+            comment_resource_title="来源标题",
+            comment_action_text="回复了评论",
+            author_profile=BilibiliAuthorCardProfile(uid="200", name="评论者"),
+        )
+
+        with patch(
+            "asoul_bilibili_card.build_qr_data_uri",
+            return_value="data:image/png;base64,qr",
+        ):
+            context = build_card_context(notification)
+
+        self.assertEqual(context["kind_label"], "回复评论")
+        self.assertEqual(context["content_heading"], "评论内容")
+        self.assertEqual(context["profile_heading"], "评论者资料")
+        self.assertFalse(context["show_engagement"])
+        self.assertIn("UP主的动态《来源标题》", context["comment_context"]["source"])
+        self.assertNotEqual(context["published_at"], "--")
 
     def test_format_card_number_uses_chinese_units_and_missing_marker(self) -> None:
         self.assertEqual(format_card_number(None), "--")

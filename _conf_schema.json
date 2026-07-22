@@ -92,6 +92,21 @@
     ],
     "hint": "用于轮询动态、新视频和直播状态的目标账号 UID。"
   },
+  "comment_target_uids": {
+    "description": "评论抓取目标 UID 列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "只为这些账号发表的新评论创建通知。留空时兼容使用监控目标 UID 列表；如需停止评论抓取请关闭“启动评论抓取”。"
+  },
+  "comment_request_interval_seconds": {
+    "description": "评论请求最小间隔（秒）",
+    "type": "float",
+    "default": 2,
+    "hint": "所有评论接口请求共享的全局最小间隔，范围 0.5–60 秒。低于 2 秒更容易触发 B 站风控，建议仅在确认账号与网络环境稳定时调低。"
+  },
   "push_dynamic": {
     "description": "播报新动态",
     "type": "bool",
@@ -111,7 +126,7 @@
     "description": "使用统一 B 站图片卡片",
     "type": "bool",
     "default": true,
-    "hint": "动态、新视频和开播通知默认渲染为图片卡片；关闭后立即回退旧消息格式。评论通知不受影响。"
+    "hint": "动态、新视频、开播和评论通知默认渲染为图片卡片；关闭后立即回退旧消息格式。"
   },
   "push_comment": {
     "description": "启动评论抓取",

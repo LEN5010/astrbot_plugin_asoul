@@ -63,6 +63,7 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
             enabled=True,
             push_comment=True,
             target_uids=["100"],
+            comment_target_uids=["200"],
         )
         runtime.push_targets = {}
         calls: list[str] = []
@@ -75,13 +76,16 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
 
         runtime.comment_capture.deliver_one = no_delivery
         runtime.comment_capture.run_scan_task = record_scan
+        selected_uids: list[list[str]] = []
         runtime.comment_scheduler.next_task = lambda journal, now, uids: (
-            SimpleNamespace(owner_uid="100")
+            selected_uids.append(list(uids))
+            or SimpleNamespace(owner_uid="200")
         )
         worked = asyncio.run(runtime.run_one_comment_work_item(NOW_TS))
 
         self.assertTrue(worked)
         self.assertEqual(calls, ["scan"])
+        self.assertEqual(selected_uids, [["200"]])
 
     def test_terminate_closes_comment_journal(self) -> None:
         plugin, runtime = self._new_runtime()
@@ -149,6 +153,9 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
         self.assertIn("最近根评论完整核对", text)
         self.assertIn("最近楼中楼完整核对", text)
         self.assertIn("待投递：3", text)
+        self.assertIn("内容监控 UID：1", text)
+        self.assertIn("评论监控 UID：1", text)
+        self.assertIn("评论请求最小间隔：2 秒", text)
         self.assertIn("安全复查工作量超过单日容量", text)
 
 

@@ -277,6 +277,43 @@ class ASoulPushTargetTest(unittest.TestCase):
         self.assertEqual(parts[-1][0], "plain")
         self.assertIn("https://www.bilibili.com/video/BV1xx411c7mD", parts[-1][1])
 
+    def test_comment_notification_uses_card_and_commenter_profile(self) -> None:
+        plugin = self._new_plugin(["100"])
+        runtime = plugin._bilibili_runtime
+        rendered = []
+
+        class RecordingRenderer:
+            async def render(self, notification):
+                rendered.append(notification)
+                return "/tmp/bilibili-comment-card.png"
+
+        async def profile(uid, *, fallback=None):
+            return BilibiliAuthorCardProfile(
+                uid=uid,
+                name=fallback.name,
+                follower=1234,
+            )
+
+        runtime.card_renderer = RecordingRenderer()
+        runtime.get_author_card_profile = profile
+        notification = BilibiliNotification(
+            kind="comment",
+            uid="200",
+            author_name="评论者",
+            title="",
+            text="评论正文",
+            url="https://t.bilibili.com/1",
+            content_id="9001",
+            comment_created_at=1_700_000_000,
+        )
+
+        parts = asyncio.run(runtime.build_card_or_fallback_parts(notification))
+
+        self.assertEqual(parts[0], ("image", "/tmp/bilibili-comment-card.png"))
+        self.assertEqual(parts[1], ("plain", "https://t.bilibili.com/1"))
+        self.assertEqual(rendered[0].author_profile.follower, 1234)
+        self.assertEqual(rendered[0].published_at, 1_700_000_000)
+
     def test_card_result_is_image_plus_clickable_url_and_only_live_uses_atall(self) -> None:
         from asoul_bilibili_runtime import BilibiliPushTarget
 

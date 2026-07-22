@@ -227,6 +227,8 @@ class CommentCaptureCoordinator:
             comment_action_text=(
                 "回复了评论" if delivery.post.is_reply else "发表了评论"
             ),
+            content_id=delivery.post.id,
+            published_at=delivery.post.created_at,
         )
         try:
             await send(delivery.unified_msg_origin, notification)

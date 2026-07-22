@@ -92,6 +92,9 @@ class BilibiliRuntime:
         self.gateway = BilibiliGateway(
             request_client=self.push_config.request_client,
             credential_data=self.push_config.credential_data,
+            comment_request_interval_seconds=(
+                self.push_config.comment_request_interval_seconds
+            ),
         )
         self.monitor = BilibiliMonitorService(self.gateway)
         self.comment_journal = CommentJournal(comment_db_path)
@@ -133,21 +136,24 @@ class BilibiliRuntime:
             await self.load_state()
             self._runtime_initialized = True
 
-        if not self.push_config.enabled or not self.push_config.target_uids:
+        if not self.push_config.enabled:
             return
 
         if (
-            self.push_config.push_dynamic
-            or self.push_config.push_video
-            or self.push_config.push_live
+            self.push_config.target_uids
+            and (
+                self.push_config.push_dynamic
+                or self.push_config.push_video
+                or self.push_config.push_live
+            )
         ) and (not self.task or self.task.done()):
             self.task = asyncio.create_task(self._run_monitor_loop())
 
-        if self.push_config.push_comment and (
+        if self.push_config.push_comment and self.push_config.comment_target_uids and (
             not self.comment_task or self.comment_task.done()
         ):
             self.comment_task = asyncio.create_task(self._run_comment_monitor_loop())
-        if self.push_config.push_comment and (
+        if self.push_config.push_comment and self.push_config.comment_target_uids and (
             not self.comment_catalog_task or self.comment_catalog_task.done()
         ):
             self.comment_catalog_task = asyncio.create_task(
@@ -192,6 +198,9 @@ class BilibiliRuntime:
             self.gateway.set_request_client(self.push_config.request_client)
         self.gateway.set_credential_data(
             self._resolve_credential_data(self.credential_data)
+        )
+        self.gateway.set_comment_request_interval_seconds(
+            self.push_config.comment_request_interval_seconds
         )
 
     async def load_state(self) -> None:
@@ -839,7 +848,7 @@ class BilibiliRuntime:
                 if (
                     not self.push_config.enabled
                     or not self.push_config.push_comment
-                    or not self.push_config.target_uids
+                    or not self.push_config.comment_target_uids
                 ):
                     await asyncio.sleep(COMMENT_POLL_INTERVAL_SECONDS)
                     continue
@@ -872,7 +881,7 @@ class BilibiliRuntime:
                 if (
                     not self.push_config.enabled
                     or not self.push_config.push_comment
-                    or not self.push_config.target_uids
+                    or not self.push_config.comment_target_uids
                     or not self.gateway.has_credential()
                 ):
                     await asyncio.sleep(COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS)
@@ -902,9 +911,9 @@ class BilibiliRuntime:
 
     async def refresh_one_due_comment_catalog(self, now: int) -> bool:
         self.comment_journal.retire_unconfigured_owners(
-            self.push_config.target_uids, now
+            self.push_config.comment_target_uids, now
         )
-        for uid in self.push_config.target_uids:
+        for uid in self.push_config.comment_target_uids:
             if not self.comment_journal.catalog_refresh_due(
                 uid, now, COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS
             ):
@@ -972,14 +981,14 @@ class BilibiliRuntime:
         task = self.comment_scheduler.next_task(
             self.comment_journal,
             now,
-            self.push_config.target_uids,
+            self.push_config.comment_target_uids,
         )
         if task is None:
             return False
         async with self.get_uid_poll_lock(task.owner_uid):
             await self.comment_capture.run_scan_task(
                 task,
-                target_uids=self.push_config.target_uids,
+                target_uids=self.push_config.comment_target_uids,
                 target_origins=target_origins,
                 now=now,
             )
@@ -1142,11 +1151,14 @@ class BilibiliRuntime:
 
     async def build_card_or_fallback_parts(self, notification: Any) -> list[Any]:
         if (
-            notification.kind in {"dynamic", "video", "live"}
+            notification.kind in {"dynamic", "video", "live", "comment"}
             and self.push_config.render_bilibili_cards
         ):
             try:
                 card_notification = await self.enrich_video_notification(notification)
+                card_notification = await self.enrich_comment_notification(
+                    card_notification
+                )
                 card_path = await asyncio.wait_for(
                     self.card_renderer.render(card_notification),
                     timeout=CARD_RENDER_TIMEOUT_SECONDS,
@@ -1164,6 +1176,34 @@ class BilibiliRuntime:
                     getattr(notification, "kind", ""),
                 )
         return self.build_notification_parts(notification)
+
+    async def enrich_comment_notification(self, notification: Any) -> Any:
+        if getattr(notification, "kind", "") != "comment":
+            return notification
+        fallback = getattr(notification, "author_profile", None)
+        if not isinstance(fallback, BilibiliAuthorCardProfile):
+            fallback = BilibiliAuthorCardProfile()
+        fallback = replace(
+            fallback,
+            uid=fallback.uid or str(getattr(notification, "uid", "") or ""),
+            name=(
+                fallback.name
+                or str(getattr(notification, "author_name", "") or "")
+            ),
+        )
+        profile = await self.get_author_card_profile(
+            str(getattr(notification, "uid", "") or ""),
+            fallback=fallback,
+        )
+        return replace(
+            notification,
+            author_profile=profile,
+            published_at=int(
+                getattr(notification, "comment_created_at", 0)
+                or getattr(notification, "published_at", 0)
+                or 0
+            ),
+        )
 
     async def enrich_video_notification(self, notification: Any) -> Any:
         if getattr(notification, "kind", "") != "video":
@@ -1400,7 +1440,7 @@ class BilibiliRuntime:
         owner_attempts = comment_status.owner_last_attempt_at or {}
         stale_comment_uids = [
             uid
-            for uid in self.push_config.target_uids
+            for uid in self.push_config.comment_target_uids
             if uid in owner_attempts
             and (
                 owner_attempts[uid] <= 0
@@ -1418,8 +1458,14 @@ class BilibiliRuntime:
             f"评论任务：{'运行中' if self.comment_task and not self.comment_task.done() else '未运行'}",
             f"资源发现任务：{'运行中' if self.comment_catalog_task and not self.comment_catalog_task.done() else '未运行'}",
             f"已登记目标群：{len(active_targets)}",
-            f"评论轮询间隔：{COMMENT_POLL_INTERVAL_SECONDS} 秒",
+            f"内容监控 UID：{len(self.push_config.target_uids)}",
+            f"评论监控 UID：{len(self.push_config.comment_target_uids)}",
+            f"评论头部核对间隔：{COMMENT_POLL_INTERVAL_SECONDS} 秒",
             f"评论资源发现间隔：{COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS} 秒",
+            "评论请求最小间隔："
+            f"{self.push_config.comment_request_interval_seconds:g} 秒"
+            "（理论上限 "
+            f"{60 / self.push_config.comment_request_interval_seconds:.1f} 次/分钟）",
             f"活跃资源：{lifecycle_counts.get('active', 0)}",
             f"初始化资源：{lifecycle_counts.get('bootstrapping', 0)}",
             f"已退役资源：{lifecycle_counts.get('retired', 0)}",

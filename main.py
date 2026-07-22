@@ -55,7 +55,7 @@ def _build_comment_db_path() -> Path:
     return data_dir / "bilibili_comments.sqlite3"
 
 
-@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.4.0")
+@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.5.0")
 class ASoulPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -326,7 +326,11 @@ class ASoulPlugin(Star):
             yield event.plain_result(f"UID {uid} 当前最近资源下没有抓到目标评论。")
         else:
             for notification in comment_notifications:
-                yield event.chain_result(self._bilibili_runtime.build_notification_parts(notification))
+                yield event.chain_result(
+                    await self._bilibili_runtime.build_card_or_fallback_parts(
+                        notification
+                    )
+                )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_test_comment")
@@ -346,7 +350,9 @@ class ASoulPlugin(Star):
             yield event.plain_result(f"UID {uid} 当前最近资源下没有抓到目标评论。")
             return
         for notification in notifications:
-            yield event.chain_result(self._bilibili_runtime.build_notification_parts(notification))
+            yield event.chain_result(
+                await self._bilibili_runtime.build_card_or_fallback_parts(notification)
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("bili_status")

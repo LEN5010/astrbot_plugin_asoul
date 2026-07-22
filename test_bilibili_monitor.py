@@ -678,6 +678,37 @@ class BilibiliMonitorServiceTest(unittest.TestCase):
 
 
 class BilibiliConfigParsingTest(unittest.TestCase):
+    def test_comment_targets_are_independent_with_upgrade_fallback(self) -> None:
+        fallback = build_bilibili_push_config({"target_uids": ["100", "200"]})
+        explicit = build_bilibili_push_config(
+            {
+                "target_uids": ["100"],
+                "comment_target_uids": ["300", "300", "400"],
+            }
+        )
+
+        self.assertEqual(fallback.comment_target_uids, ["100", "200"])
+        self.assertEqual(explicit.target_uids, ["100"])
+        self.assertEqual(explicit.comment_target_uids, ["300", "400"])
+
+    def test_comment_request_interval_is_parsed_and_clamped(self) -> None:
+        self.assertEqual(
+            build_bilibili_push_config({}).comment_request_interval_seconds,
+            2.0,
+        )
+        self.assertEqual(
+            build_bilibili_push_config(
+                {"comment_request_interval_seconds": 0.1}
+            ).comment_request_interval_seconds,
+            0.5,
+        )
+        self.assertEqual(
+            build_bilibili_push_config(
+                {"comment_request_interval_seconds": 999}
+            ).comment_request_interval_seconds,
+            60.0,
+        )
+
     def test_card_rendering_defaults_on_and_can_be_disabled(self) -> None:
         self.assertTrue(build_bilibili_push_config({}).render_bilibili_cards)
         self.assertFalse(

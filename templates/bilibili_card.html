@@ -60,6 +60,16 @@
     .body { font-size: 35px; line-height: 1.66; overflow-wrap: anywhere; }
     .body:empty { display: none; }
     .body a { color: #1388c5; text-decoration: none; }
+    .comment-context {
+      margin-bottom: 26px; padding: 20px 24px; border-radius: 22px;
+      color: #775e68; background: #fff5f8; border: 1px solid #ffe1eb;
+      font-size: 23px; line-height: 1.55;
+    }
+    .comment-action { color: #ff5f91; font-weight: 800; }
+    .comment-body-heading {
+      margin: 30px 0 12px; color: #9b7d88; font-size: 20px;
+      font-weight: 800; letter-spacing: 1px;
+    }
     .inline-emoji { width: 54px; height: 54px; margin: 0 4px; object-fit: contain; vertical-align: -14px; }
     .image-grid {
       display: grid; gap: 12px; margin-top: 34px; overflow: hidden; border-radius: 28px;
@@ -142,6 +152,13 @@
     </header>
 
     <section class="content">
+      {% if comment_context %}
+      <div class="comment-context">
+        <span class="comment-action">{{ comment_context.action | safe }}</span>
+        <span> · {{ comment_context.source | safe }}</span>
+      </div>
+      <div class="comment-body-heading">{{ content_heading }}</div>
+      {% endif %}
       {% if title %}<div class="title">{{ title | safe }}</div>{% endif %}
       <div class="body">{{ body_html | safe }}</div>
 
@@ -175,8 +192,9 @@
       {% endif %}
     </section>
 
+    {% if show_engagement %}
     <div class="section-heading">
-      <span>本条内容</span>
+      <span>{{ content_heading }}</span>
       {% if stats_note %}<span class="stats-note">{{ stats_note }}</span>{% endif %}
     </div>
     <div class="engagement">
@@ -184,6 +202,7 @@
       <div class="metric"><span class="metric-icon">●</span>{{ stats.comment }} 评论</div>
       <div class="metric"><span class="metric-icon">↗</span>{{ stats.forward }} 分享</div>
     </div>
+    {% endif %}
     <div class="generated">● 图片生成于：{{ generated_at }}</div>
     {% if url %}<div class="source-url">🔗 {{ url | e }}</div>{% endif %}
 
@@ -191,7 +210,7 @@
       <div class="profile">
         {% if author.avatar_url %}<img class="footer-avatar" src="{{ author.avatar_url | e }}">{% else %}<div class="footer-avatar"></div>{% endif %}
         <div class="footer-profile-meta">
-          <div class="profile-heading">UP资料</div>
+          <div class="profile-heading">{{ profile_heading }}</div>
           <div class="footer-name">{{ author.name | safe }}</div>
           <div class="uid">UID: {{ author.uid | safe }}</div>
           <div class="profile-stats">

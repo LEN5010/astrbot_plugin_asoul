@@ -178,7 +178,32 @@ def build_card_context(
         "dynamic": "动态",
         "video": "新视频",
         "live": "正在直播",
+        "comment": (
+            "回复评论"
+            if notification.comment_action_text == "回复了评论"
+            else "发表评论"
+        ),
     }
+    is_comment = notification.kind == "comment"
+    comment_context = None
+    if is_comment:
+        resource_kind = notification.comment_resource_kind or "内容"
+        owner_prefix = (
+            f"{notification.comment_resource_owner_name}的"
+            if notification.comment_resource_owner_name
+            else "该"
+        )
+        resource_title = notification.comment_resource_title
+        source_text = f"在{owner_prefix}{resource_kind}"
+        if resource_title:
+            source_text += f"《{resource_title}》"
+        source_text += "下"
+        comment_context = {
+            "action": html.escape(
+                notification.comment_action_text or "发表了评论", quote=True
+            ),
+            "source": html.escape(source_text, quote=True),
+        }
     body_fallback = notification.text
     if not body_fallback and notification.kind == "dynamic":
         body_fallback = "发布了新动态"
@@ -190,7 +215,11 @@ def build_card_context(
         "kind_label": kind_labels.get(notification.kind, "B站通知"),
         "title": html.escape(notification.title or "", quote=True),
         "body_html": render_rich_text_html(notification.rich_nodes, body_fallback),
-        "published_at": _format_timestamp(notification.published_at),
+        "published_at": _format_timestamp(
+            notification.comment_created_at
+            if is_comment
+            else notification.published_at
+        ),
         "generated_at": _format_timestamp(generated_ts, include_seconds=True),
         "url": safe_http_url(notification.url),
         "qr_data_uri": build_qr_data_uri(notification.url),
@@ -211,6 +240,10 @@ def build_card_context(
             "forward": format_card_number(notification.stats.forward_count),
         },
         "stats_note": "数据暂未刷新" if notification.stats_are_fallback else "",
+        "comment_context": comment_context,
+        "content_heading": "评论内容" if is_comment else "本条内容",
+        "profile_heading": "评论者资料" if is_comment else "UP资料",
+        "show_engagement": not is_comment,
         "additional": additional if additional.get("kind") else None,
         "forwarded": forwarded,
     }
