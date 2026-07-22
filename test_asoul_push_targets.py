@@ -216,7 +216,7 @@ class ASoulPushTargetTest(unittest.TestCase):
             marked = [
                 result
                 async for result in plugin.highlight_schedule(
-                    CommandEvent(), "2099-07-25", 1
+                    CommandEvent(), "2099-07-25", 1, "粉色"
                 )
             ]
             highlighted = await plugin._schedule_highlights.apply([item])
@@ -232,7 +232,9 @@ class ASoulPushTargetTest(unittest.TestCase):
         marked, highlighted, removed, plain = asyncio.run(exercise())
 
         self.assertIn("已设为特别关注", marked[0])
+        self.assertIn("粉色", marked[0])
         self.assertTrue(highlighted[0].highlighted)
+        self.assertEqual(highlighted[0].highlight_style, "pink")
         self.assertIn("已取消特别关注", removed[0])
         self.assertFalse(plain[0].highlighted)
 

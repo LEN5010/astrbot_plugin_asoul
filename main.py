@@ -28,7 +28,11 @@ from asoul_core import (
 )
 from asoul_render import ScheduleImageRenderer
 from asoul_schedule import ScheduleService
-from asoul_schedule_highlight import ScheduleHighlightManager
+from asoul_schedule_highlight import (
+    ScheduleHighlightManager,
+    normalize_schedule_highlight_style,
+    schedule_highlight_style_label,
+)
 
 DEFAULT_CALENDAR_CACHE_MINUTES = 30
 MIN_CALENDAR_CACHE_MINUTES = 10
@@ -56,7 +60,7 @@ def _build_comment_db_path() -> Path:
     return data_dir / "bilibili_comments.sqlite3"
 
 
-@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.6.0")
+@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.7.0")
 class ASoulPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -185,12 +189,16 @@ class ASoulPlugin(Star):
             return f"{target_day.isoformat()} 没有可标记的直播日程。"
         lines = [f"{target_day.isoformat()} 可标记日程："]
         for index, item in enumerate(items, start=1):
-            marker = " ⭐特别关注" if item.highlighted else ""
+            marker = (
+                f" ⭐特别关注·{schedule_highlight_style_label(item.highlight_style)}"
+                if item.highlighted
+                else ""
+            )
             lines.append(
                 f"{index}. {item.start_text}｜{item.hosts_text}｜{item.content}{marker}"
             )
         lines.append(
-            f"使用 /日程高亮 {target_day.isoformat()} 序号 进行标记。"
+            f"使用 /日程高亮 {target_day.isoformat()} 序号 [粉色|红色|白金色] 进行标记。"
         )
         return "\n".join(lines)
 
@@ -201,11 +209,12 @@ class ASoulPlugin(Star):
         event: AstrMessageEvent,
         target_date: str = "",
         item_index: int = 0,
+        highlight_color: str = "白金色",
     ):
         """查看某天日程，或将指定序号标记为特别关注。"""
         if not target_date:
             yield event.plain_result(
-                "用法：/日程高亮 YYYY-MM-DD [序号]"
+                "用法：/日程高亮 YYYY-MM-DD [序号] [粉色|红色|白金色]"
             )
             return
         try:
@@ -229,10 +238,17 @@ class ASoulPlugin(Star):
                 f"序号超出范围，当天共有 {len(items)} 条日程。"
             )
             return
+        highlight_style = normalize_schedule_highlight_style(highlight_color)
+        if not highlight_style:
+            yield event.plain_result(
+                "高亮颜色仅支持：粉色、红色、白金色。"
+            )
+            return
         item = items[item_index - 1]
-        await self._schedule_highlights.mark(item)
+        await self._schedule_highlights.mark(item, highlight_style)
         yield event.plain_result(
-            f"已设为特别关注：{target_day.isoformat()} "
+            f"已设为特别关注（{schedule_highlight_style_label(highlight_style)}）："
+            f"{target_day.isoformat()} "
             f"{item.start_text} {item.hosts_text}《{item.content}》"
         )
 
@@ -288,7 +304,8 @@ class ASoulPlugin(Star):
         for index, record in enumerate(records, start=1):
             lines.append(
                 f"{index}. ⭐ {record.target_date} {record.start_text}｜"
-                f"{record.hosts_text}｜{record.content}"
+                f"{record.hosts_text}｜{record.content}｜"
+                f"{schedule_highlight_style_label(record.style)}"
             )
         lines.append("日历中已消失的节目可使用 /取消日程高亮记录 序号 移除。")
         yield event.plain_result("\n".join(lines))

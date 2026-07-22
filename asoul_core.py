@@ -103,3 +103,4 @@ class ScheduleItem:
     label: str
     highlight_key: str = ""
     highlighted: bool = False
+    highlight_style: str = ""

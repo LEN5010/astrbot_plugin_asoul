@@ -9,6 +9,23 @@ from asoul_core import DISPLAY_TZ, ScheduleItem
 
 
 KV_SCHEDULE_HIGHLIGHTS = "schedule_highlights"
+DEFAULT_HIGHLIGHT_STYLE = "platinum"
+HIGHLIGHT_STYLE_LABELS = {
+    "pink": "粉色",
+    "red": "红色",
+    "platinum": "白金色",
+}
+HIGHLIGHT_STYLE_ALIASES = {
+    "pink": "pink",
+    "粉": "pink",
+    "粉色": "pink",
+    "red": "red",
+    "红": "red",
+    "红色": "red",
+    "platinum": "platinum",
+    "白金": "platinum",
+    "白金色": "platinum",
+}
 
 
 @dataclass(frozen=True)
@@ -19,6 +36,17 @@ class ScheduleHighlightRecord:
     content: str
     hosts_text: str
     created_at: int
+    style: str = DEFAULT_HIGHLIGHT_STYLE
+
+
+def normalize_schedule_highlight_style(raw_value: Any) -> str:
+    return HIGHLIGHT_STYLE_ALIASES.get(
+        str(raw_value or "").strip().lower(), ""
+    )
+
+
+def schedule_highlight_style_label(style: str) -> str:
+    return HIGHLIGHT_STYLE_LABELS.get(style, HIGHLIGHT_STYLE_LABELS[DEFAULT_HIGHLIGHT_STYLE])
 
 
 def build_schedule_highlight_key(item: ScheduleItem) -> str:
@@ -51,21 +79,30 @@ class ScheduleHighlightManager:
     async def apply(self, items: Iterable[ScheduleItem]) -> List[ScheduleItem]:
         await self._ensure_loaded()
         async with self._lock:
-            active_keys = set(self._records)
+            active_records = dict(self._records)
         applied: List[ScheduleItem] = []
         for item in items:
             key = build_schedule_highlight_key(item)
+            record = active_records.get(key)
             applied.append(
                 replace(
                     item,
                     highlight_key=key,
-                    highlighted=key in active_keys,
+                    highlighted=record is not None,
+                    highlight_style=(
+                        record.style if record is not None else ""
+                    ),
                 )
             )
         return applied
 
-    async def mark(self, item: ScheduleItem) -> ScheduleHighlightRecord:
+    async def mark(
+        self,
+        item: ScheduleItem,
+        style: str = DEFAULT_HIGHLIGHT_STYLE,
+    ) -> ScheduleHighlightRecord:
         await self._ensure_loaded()
+        normalized_style = normalize_schedule_highlight_style(style) or DEFAULT_HIGHLIGHT_STYLE
         key = build_schedule_highlight_key(item)
         start = item.start
         if start.tzinfo is None:
@@ -79,6 +116,7 @@ class ScheduleHighlightManager:
             content=item.content,
             hosts_text=item.hosts_text,
             created_at=int(datetime.now(DISPLAY_TZ).timestamp()),
+            style=normalized_style,
         )
         async with self._lock:
             self._records[key] = record
@@ -150,12 +188,16 @@ class ScheduleHighlightManager:
                 content=str(raw_record.get("content") or ""),
                 hosts_text=str(raw_record.get("hosts_text") or ""),
                 created_at=created_at,
+                style=(
+                    normalize_schedule_highlight_style(raw_record.get("style"))
+                    or DEFAULT_HIGHLIGHT_STYLE
+                ),
             )
         return normalized
 
     async def _persist_locked(self) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "records": {
                 key: asdict(record) for key, record in self._records.items()
             },

@@ -5,9 +5,11 @@ from datetime import datetime
 from asoul_core import DISPLAY_TZ, ScheduleItem
 from asoul_schedule import ScheduleService
 from asoul_schedule_highlight import (
+    DEFAULT_HIGHLIGHT_STYLE,
     KV_SCHEDULE_HIGHLIGHTS,
     ScheduleHighlightManager,
     build_schedule_highlight_key,
+    normalize_schedule_highlight_style,
 )
 
 
@@ -59,7 +61,7 @@ class ScheduleHighlightTest(unittest.TestCase):
 
         async def exercise():
             manager = ScheduleHighlightManager(owner)
-            record = await manager.mark(item)
+            record = await manager.mark(item, "红色")
             highlighted = await manager.apply([item])
 
             restored = ScheduleHighlightManager(owner)
@@ -73,11 +75,22 @@ class ScheduleHighlightTest(unittest.TestCase):
         )
 
         self.assertEqual(record.content, "测试节目")
+        self.assertEqual(record.style, "red")
         self.assertTrue(highlighted[0].highlighted)
+        self.assertEqual(highlighted[0].highlight_style, "red")
         self.assertTrue(restored_items[0].highlighted)
+        self.assertEqual(restored_items[0].highlight_style, "red")
         self.assertTrue(removed)
         self.assertFalse(plain_items[0].highlighted)
         self.assertIn("records", owner.store[KV_SCHEDULE_HIGHLIGHTS])
+
+    def test_supported_color_aliases_and_legacy_default(self) -> None:
+        self.assertEqual(normalize_schedule_highlight_style("粉色"), "pink")
+        self.assertEqual(normalize_schedule_highlight_style("red"), "red")
+        self.assertEqual(
+            normalize_schedule_highlight_style("白金色"), "platinum"
+        )
+        self.assertEqual(normalize_schedule_highlight_style("蓝色"), "")
 
     def test_text_fallback_marks_special_attention(self) -> None:
         item = schedule_item()
@@ -110,6 +123,7 @@ class ScheduleHighlightTest(unittest.TestCase):
         records = asyncio.run(manager.list_records())
 
         self.assertEqual([record.key for record in records], ["expired"])
+        self.assertEqual(records[0].style, DEFAULT_HIGHLIGHT_STYLE)
         self.assertIn(
             "expired", owner.store[KV_SCHEDULE_HIGHLIGHTS]["records"]
         )
