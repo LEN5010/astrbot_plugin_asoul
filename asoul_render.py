@@ -467,17 +467,29 @@ class ScheduleImageRenderer:
         font_content,
     ) -> None:
         row_bottom = row_y + row_height
+        if item.highlighted:
+            draw.rounded_rectangle(
+                (list_left - 7, row_y - 7, list_right + 7, row_bottom + 7),
+                radius=32,
+                fill="#ead7ae",
+            )
+            draw.rounded_rectangle(
+                (list_left - 3, row_y - 3, list_right + 3, row_bottom + 3),
+                radius=29,
+                outline="#d7b471",
+                width=5,
+            )
         draw.rounded_rectangle(
             (list_left, row_y, list_right, row_bottom),
             radius=26,
-            fill="#fffaf4",
-            outline="#eadbc9",
-            width=2,
+            fill="#fff9ea" if item.highlighted else "#fffaf4",
+            outline="#b88334" if item.highlighted else "#eadbc9",
+            width=4 if item.highlighted else 2,
         )
         draw.rounded_rectangle(
             (list_left + 24, row_y + 22, list_left + 168, row_y + row_height - 22),
             radius=24,
-            fill="#f1e4d3",
+            fill="#f1dfb9" if item.highlighted else "#f1e4d3",
         )
 
         time_box = draw.textbbox((0, 0), item.start_text, font=font_time)
@@ -496,6 +508,28 @@ class ScheduleImageRenderer:
             fill="#201a17",
         )
         draw.text((text_left + 13, row_y + 28), item.label, font=font_label, fill="#fff7ef")
+        if item.highlighted:
+            attention_text = "★ 特别关注"
+            attention_width = self._text_width(
+                draw, attention_text, font_label
+            ) + 26
+            attention_left = text_left + label_width + 12
+            draw.rounded_rectangle(
+                (
+                    attention_left,
+                    row_y + 22,
+                    attention_left + attention_width,
+                    row_y + 52,
+                ),
+                radius=15,
+                fill="#b88334",
+            )
+            draw.text(
+                (attention_left + 13, row_y + 28),
+                attention_text,
+                font=font_label,
+                fill="#fff7fb",
+            )
         draw.text((text_left, row_y + 64), item.hosts_text, font=font_hosts, fill="#74685f")
         self._draw_multiline_text(
             draw,

@@ -73,7 +73,10 @@ class ScheduleService:
 
         lines = [f"{day_text} {title_text}安排"]
         for item in items:
-            lines.append(f"{item.start_text} {item.hosts_text} {item.content}")
+            prefix = "⭐【特别关注】" if item.highlighted else ""
+            lines.append(
+                f"{prefix}{item.start_text} {item.hosts_text} {item.content}"
+            )
         return "\n".join(lines)
 
     def _format_start_time(self, start: datetime) -> str:

@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from asoul_bilibili import (
     BilibiliVideoPost,
     KV_BILIBILI_GROUP_ORIGINS,
 )
+from asoul_core import DISPLAY_TZ, ScheduleItem
 
 
 def _install_astrbot_stubs() -> None:
@@ -186,6 +188,53 @@ class ASoulPushTargetTest(unittest.TestCase):
             sorted(target.unified_msg_origin for target in targets),
             ["aiocqhttp:GroupMessage:100", "aiocqhttp:GroupMessage:200"],
         )
+
+    def test_admin_can_mark_and_unmark_schedule_by_display_index(self) -> None:
+        plugin = self._new_plugin([])
+        item = ScheduleItem(
+            start=datetime(2099, 7, 25, 20, 0, tzinfo=DISPLAY_TZ),
+            start_text="20:00",
+            hosts=["贝拉"],
+            hosts_text="贝拉",
+            content="特别节目",
+            label="节目",
+        )
+
+        async def get_items(_target_date):
+            return item.start.date(), await plugin._schedule_highlights.apply(
+                [item]
+            )
+
+        class CommandEvent:
+            @staticmethod
+            def plain_result(text):
+                return text
+
+        plugin._get_schedule_items_for_admin = get_items
+
+        async def exercise():
+            marked = [
+                result
+                async for result in plugin.highlight_schedule(
+                    CommandEvent(), "2099-07-25", 1
+                )
+            ]
+            highlighted = await plugin._schedule_highlights.apply([item])
+            removed = [
+                result
+                async for result in plugin.unhighlight_schedule(
+                    CommandEvent(), "2099-07-25", 1
+                )
+            ]
+            plain = await plugin._schedule_highlights.apply([item])
+            return marked, highlighted, removed, plain
+
+        marked, highlighted, removed, plain = asyncio.run(exercise())
+
+        self.assertIn("已设为特别关注", marked[0])
+        self.assertTrue(highlighted[0].highlighted)
+        self.assertIn("已取消特别关注", removed[0])
+        self.assertFalse(plain[0].highlighted)
 
     def test_same_group_replaces_stale_origin(self) -> None:
         plugin = self._new_plugin(["100"])

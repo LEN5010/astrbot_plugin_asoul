@@ -101,3 +101,5 @@ class ScheduleItem:
     hosts_text: str
     content: str
     label: str
+    highlight_key: str = ""
+    highlighted: bool = False

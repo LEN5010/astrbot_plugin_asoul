@@ -28,6 +28,7 @@ from asoul_core import (
 )
 from asoul_render import ScheduleImageRenderer
 from asoul_schedule import ScheduleService
+from asoul_schedule_highlight import ScheduleHighlightManager
 
 DEFAULT_CALENDAR_CACHE_MINUTES = 30
 MIN_CALENDAR_CACHE_MINUTES = 10
@@ -55,7 +56,7 @@ def _build_comment_db_path() -> Path:
     return data_dir / "bilibili_comments.sqlite3"
 
 
-@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.5.0")
+@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.6.0")
 class ASoulPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -64,6 +65,7 @@ class ASoulPlugin(Star):
             cache_ttl=_build_calendar_cache_ttl(self.config)
         )
         self._schedule_service = ScheduleService()
+        self._schedule_highlights = ScheduleHighlightManager(self)
         self._image_renderer = ScheduleImageRenderer()
         self._bilibili_runtime = BilibiliRuntime(
             self,
@@ -114,6 +116,7 @@ class ASoulPlugin(Star):
                 items = self._schedule_service.build_schedule_items(day_events.get(target_day, []))
                 if exclude_filtered_hosts:
                     items = self._schedule_service.exclude_hosts(items, LIVE_REQUEST_FILTERED_HOSTS)
+                items = await self._schedule_highlights.apply(items)
                 day_items.append((target_day, items))
             try:
                 image_url = await self._image_renderer.render_week_schedule_image(
@@ -157,6 +160,7 @@ class ASoulPlugin(Star):
         items = self._schedule_service.build_schedule_items(events)
         if exclude_filtered_hosts:
             items = self._schedule_service.exclude_hosts(items, LIVE_REQUEST_FILTERED_HOSTS)
+        items = await self._schedule_highlights.apply(items)
         try:
             image_url = await self._image_renderer.render_schedule_image(items, target_day, title_text)
         except Exception:
@@ -165,6 +169,150 @@ class ASoulPlugin(Star):
             return
 
         yield event.image_result(image_url)
+
+    async def _get_schedule_items_for_admin(self, target_date_text: str):
+        try:
+            target_day = datetime.strptime(target_date_text, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("日期格式错误，请使用 YYYY-MM-DD。") from exc
+        events = await self._calendar_repository.get_live_events_for_day(target_day)
+        items = self._schedule_service.build_schedule_items(events)
+        return target_day, await self._schedule_highlights.apply(items)
+
+    @staticmethod
+    def _format_schedule_candidates(target_day, items) -> str:
+        if not items:
+            return f"{target_day.isoformat()} 没有可标记的直播日程。"
+        lines = [f"{target_day.isoformat()} 可标记日程："]
+        for index, item in enumerate(items, start=1):
+            marker = " ⭐特别关注" if item.highlighted else ""
+            lines.append(
+                f"{index}. {item.start_text}｜{item.hosts_text}｜{item.content}{marker}"
+            )
+        lines.append(
+            f"使用 /日程高亮 {target_day.isoformat()} 序号 进行标记。"
+        )
+        return "\n".join(lines)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("日程高亮")
+    async def highlight_schedule(
+        self,
+        event: AstrMessageEvent,
+        target_date: str = "",
+        item_index: int = 0,
+    ):
+        """查看某天日程，或将指定序号标记为特别关注。"""
+        if not target_date:
+            yield event.plain_result(
+                "用法：/日程高亮 YYYY-MM-DD [序号]"
+            )
+            return
+        try:
+            target_day, items = await self._get_schedule_items_for_admin(
+                target_date
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except Exception:
+            logger.exception("读取待高亮日程失败")
+            yield event.plain_result("⚠️ 直播日历暂时不可用，请稍后再试。")
+            return
+        if item_index <= 0:
+            yield event.plain_result(
+                self._format_schedule_candidates(target_day, items)
+            )
+            return
+        if item_index > len(items):
+            yield event.plain_result(
+                f"序号超出范围，当天共有 {len(items)} 条日程。"
+            )
+            return
+        item = items[item_index - 1]
+        await self._schedule_highlights.mark(item)
+        yield event.plain_result(
+            f"已设为特别关注：{target_day.isoformat()} "
+            f"{item.start_text} {item.hosts_text}《{item.content}》"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("取消日程高亮")
+    async def unhighlight_schedule(
+        self,
+        event: AstrMessageEvent,
+        target_date: str = "",
+        item_index: int = 0,
+    ):
+        """取消某天指定序号日程的特别关注。"""
+        if not target_date or item_index <= 0:
+            yield event.plain_result(
+                "用法：/取消日程高亮 YYYY-MM-DD 序号"
+            )
+            return
+        try:
+            target_day, items = await self._get_schedule_items_for_admin(
+                target_date
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except Exception:
+            logger.exception("读取待取消高亮日程失败")
+            yield event.plain_result("⚠️ 直播日历暂时不可用，请稍后再试。")
+            return
+        if item_index > len(items):
+            yield event.plain_result(
+                f"序号超出范围，当天共有 {len(items)} 条日程。"
+            )
+            return
+        item = items[item_index - 1]
+        removed = await self._schedule_highlights.unmark(item)
+        if not removed:
+            yield event.plain_result("该日程当前没有设置特别关注。")
+            return
+        yield event.plain_result(
+            f"已取消特别关注：{target_day.isoformat()} "
+            f"{item.start_text} {item.hosts_text}《{item.content}》"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("日程高亮列表")
+    async def list_schedule_highlights(self, event: AstrMessageEvent):
+        """列出当前保存的全部特别关注日程。"""
+        records = await self._schedule_highlights.list_records()
+        if not records:
+            yield event.plain_result("当前没有特别关注日程。")
+            return
+        lines = ["【特别关注日程】"]
+        for index, record in enumerate(records, start=1):
+            lines.append(
+                f"{index}. ⭐ {record.target_date} {record.start_text}｜"
+                f"{record.hosts_text}｜{record.content}"
+            )
+        lines.append("日历中已消失的节目可使用 /取消日程高亮记录 序号 移除。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("取消日程高亮记录")
+    async def remove_schedule_highlight_record(
+        self,
+        event: AstrMessageEvent,
+        record_index: int = 0,
+    ):
+        """按保存列表序号移除特别关注记录。"""
+        records = await self._schedule_highlights.list_records()
+        if record_index <= 0 or record_index > len(records):
+            yield event.plain_result(
+                f"用法：/取消日程高亮记录 序号（当前共 {len(records)} 条）"
+            )
+            return
+        record = records[record_index - 1]
+        await self._schedule_highlights.unmark_key(record.key)
+        yield event.plain_result(
+            f"已取消特别关注：{record.target_date} {record.start_text} "
+            f"{record.hosts_text}《{record.content}》"
+        )
 
     async def terminate(self):
         """插件卸载时调用。"""
