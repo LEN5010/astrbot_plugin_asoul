@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import shutil
 import subprocess
 import tempfile
@@ -10,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from asoul_core import AVATAR_NAMES, PLUGIN_DIR, ScheduleItem
 
 logger = logging.getLogger(__name__)
+AVATAR_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
 
 SCHEDULE_HIGHLIGHT_PALETTES = {
     "pink": {
@@ -80,6 +82,7 @@ class ScheduleImageRenderer:
         font_content = self._load_pillow_font(32)
         font_empty = self._load_pillow_font(30)
         font_footer = self._load_pillow_font(14)
+        avatar_path_map = self._get_avatar_path_map()
 
         measure_image = Image.new("RGBA", (width, 10), (0, 0, 0, 0))
         measure_draw = ImageDraw.Draw(measure_image)
@@ -185,6 +188,7 @@ class ScheduleImageRenderer:
                     font_label=font_label,
                     font_hosts=font_hosts,
                     font_content=font_content,
+                    avatar_path_map=avatar_path_map,
                 )
                 row_y = row_y + row_height + row_gap
         else:
@@ -253,6 +257,7 @@ class ScheduleImageRenderer:
         font_day = self._load_pillow_font(34)
         font_day_meta = self._load_pillow_font(20)
         font_footer = self._load_pillow_font(14)
+        avatar_path_map = self._get_avatar_path_map()
 
         measure_image = Image.new("RGBA", (width, 10), (0, 0, 0, 0))
         measure_draw = ImageDraw.Draw(measure_image)
@@ -375,6 +380,7 @@ class ScheduleImageRenderer:
                         font_label=font_label,
                         font_hosts=font_hosts,
                         font_content=font_content,
+                        avatar_path_map=avatar_path_map,
                     )
                     item_y += row_height + row_gap
             else:
@@ -492,6 +498,7 @@ class ScheduleImageRenderer:
         font_label,
         font_hosts,
         font_content,
+        avatar_path_map: Dict[str, Path],
     ) -> None:
         row_bottom = row_y + row_height
         highlight_palette = SCHEDULE_HIGHLIGHT_PALETTES.get(
@@ -577,6 +584,7 @@ class ScheduleImageRenderer:
             top=row_y + 18,
             slot_width=avatar_slot_width - 24,
             slot_height=row_height - 36,
+            avatar_path_map=avatar_path_map,
         )
 
     def _weekday_text(self, target_day: date) -> str:
@@ -647,11 +655,15 @@ class ScheduleImageRenderer:
         top: int,
         slot_width: int,
         slot_height: int,
+        avatar_path_map: Dict[str, Path],
     ) -> None:
         from PIL import Image
 
-        avatar_map = self._get_avatar_path_map()
-        avatar_paths = [avatar_map[host] for host in hosts if host in avatar_map]
+        avatar_paths = [
+            avatar_path_map[host]
+            for host in hosts
+            if host in avatar_path_map
+        ]
         if not avatar_paths:
             return
 
@@ -671,7 +683,12 @@ class ScheduleImageRenderer:
         start_x = left + max(0, (slot_width - total_width) // 2)
         base_y = top + max(0, (slot_height - avatar_size) // 2)
         for index, avatar_path in enumerate(avatar_paths):
-            avatar = Image.open(avatar_path).convert("RGBA")
+            try:
+                with Image.open(avatar_path) as source:
+                    avatar = source.convert("RGBA")
+            except Exception:
+                logger.warning("读取成员表情包失败，跳过本张素材: %s", avatar_path)
+                continue
             avatar.thumbnail((avatar_size, avatar_size), resampling.LANCZOS)
             x = start_x + index * (avatar_size + gap)
             y = base_y + max(0, avatar_size - avatar.height) // 2
@@ -680,7 +697,27 @@ class ScheduleImageRenderer:
     def _get_avatar_path_map(self) -> Dict[str, Path]:
         avatar_map: Dict[str, Path] = {}
         for name in AVATAR_NAMES:
-            path = PLUGIN_DIR / f"{name}.png"
-            if path.exists():
-                avatar_map[name] = path
+            candidates = self._get_avatar_candidates(name)
+            if candidates:
+                avatar_map[name] = random.choice(candidates)
         return avatar_map
+
+    @staticmethod
+    def _get_avatar_candidates(name: str) -> List[Path]:
+        member_dir = PLUGIN_DIR / name
+        candidates: List[Path] = []
+        if member_dir.is_dir():
+            candidates = sorted(
+                (
+                    path
+                    for path in member_dir.rglob("*")
+                    if path.is_file()
+                    and path.suffix.lower() in AVATAR_IMAGE_SUFFIXES
+                ),
+                key=lambda path: str(path).casefold(),
+            )
+        if candidates:
+            return candidates
+
+        legacy_path = PLUGIN_DIR / f"{name}.png"
+        return [legacy_path] if legacy_path.is_file() else []
