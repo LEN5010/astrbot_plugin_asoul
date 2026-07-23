@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from asoul_core import AVATAR_NAMES, PLUGIN_DIR, ScheduleItem
 
@@ -82,7 +82,8 @@ class ScheduleImageRenderer:
         font_content = self._load_pillow_font(32)
         font_empty = self._load_pillow_font(30)
         font_footer = self._load_pillow_font(14)
-        avatar_path_map = self._get_avatar_path_map()
+        avatar_candidates_map = self._get_avatar_candidates_map()
+        used_avatar_paths: Dict[str, Set[Path]] = {}
 
         measure_image = Image.new("RGBA", (width, 10), (0, 0, 0, 0))
         measure_draw = ImageDraw.Draw(measure_image)
@@ -188,7 +189,8 @@ class ScheduleImageRenderer:
                     font_label=font_label,
                     font_hosts=font_hosts,
                     font_content=font_content,
-                    avatar_path_map=avatar_path_map,
+                    avatar_candidates_map=avatar_candidates_map,
+                    used_avatar_paths=used_avatar_paths,
                 )
                 row_y = row_y + row_height + row_gap
         else:
@@ -257,7 +259,8 @@ class ScheduleImageRenderer:
         font_day = self._load_pillow_font(34)
         font_day_meta = self._load_pillow_font(20)
         font_footer = self._load_pillow_font(14)
-        avatar_path_map = self._get_avatar_path_map()
+        avatar_candidates_map = self._get_avatar_candidates_map()
+        used_avatar_paths: Dict[str, Set[Path]] = {}
 
         measure_image = Image.new("RGBA", (width, 10), (0, 0, 0, 0))
         measure_draw = ImageDraw.Draw(measure_image)
@@ -380,7 +383,8 @@ class ScheduleImageRenderer:
                         font_label=font_label,
                         font_hosts=font_hosts,
                         font_content=font_content,
-                        avatar_path_map=avatar_path_map,
+                        avatar_candidates_map=avatar_candidates_map,
+                        used_avatar_paths=used_avatar_paths,
                     )
                     item_y += row_height + row_gap
             else:
@@ -498,7 +502,8 @@ class ScheduleImageRenderer:
         font_label,
         font_hosts,
         font_content,
-        avatar_path_map: Dict[str, Path],
+        avatar_candidates_map: Dict[str, List[Path]],
+        used_avatar_paths: Dict[str, Set[Path]],
     ) -> None:
         row_bottom = row_y + row_height
         highlight_palette = SCHEDULE_HIGHLIGHT_PALETTES.get(
@@ -584,7 +589,8 @@ class ScheduleImageRenderer:
             top=row_y + 18,
             slot_width=avatar_slot_width - 24,
             slot_height=row_height - 36,
-            avatar_path_map=avatar_path_map,
+            avatar_candidates_map=avatar_candidates_map,
+            used_avatar_paths=used_avatar_paths,
         )
 
     def _weekday_text(self, target_day: date) -> str:
@@ -655,15 +661,14 @@ class ScheduleImageRenderer:
         top: int,
         slot_width: int,
         slot_height: int,
-        avatar_path_map: Dict[str, Path],
+        avatar_candidates_map: Dict[str, List[Path]],
+        used_avatar_paths: Dict[str, Set[Path]],
     ) -> None:
         from PIL import Image
 
-        avatar_paths = [
-            avatar_path_map[host]
-            for host in hosts
-            if host in avatar_path_map
-        ]
+        avatar_paths = self._select_avatar_paths(
+            hosts, avatar_candidates_map, used_avatar_paths
+        )
         if not avatar_paths:
             return
 
@@ -694,13 +699,41 @@ class ScheduleImageRenderer:
             y = base_y + max(0, avatar_size - avatar.height) // 2
             image.alpha_composite(avatar, (x, y))
 
+    @staticmethod
+    def _select_avatar_paths(
+        hosts: List[str],
+        avatar_candidates_map: Dict[str, List[Path]],
+        used_avatar_paths: Dict[str, Set[Path]],
+    ) -> List[Path]:
+        avatar_paths: List[Path] = []
+        for host in hosts:
+            candidates = avatar_candidates_map.get(host, [])
+            if not candidates:
+                continue
+            used_paths = used_avatar_paths.setdefault(host, set())
+            available = [path for path in candidates if path not in used_paths]
+            if not available:
+                used_paths.clear()
+                available = candidates
+            selected_path = random.choice(available)
+            used_paths.add(selected_path)
+            avatar_paths.append(selected_path)
+        return avatar_paths
+
     def _get_avatar_path_map(self) -> Dict[str, Path]:
+        """Return one random sticker per member for backwards-compatible callers."""
         avatar_map: Dict[str, Path] = {}
-        for name in AVATAR_NAMES:
-            candidates = self._get_avatar_candidates(name)
+        for name, candidates in self._get_avatar_candidates_map().items():
             if candidates:
                 avatar_map[name] = random.choice(candidates)
         return avatar_map
+
+    def _get_avatar_candidates_map(self) -> Dict[str, List[Path]]:
+        return {
+            name: candidates
+            for name in AVATAR_NAMES
+            if (candidates := self._get_avatar_candidates(name))
+        }
 
     @staticmethod
     def _get_avatar_candidates(name: str) -> List[Path]:

@@ -86,6 +86,23 @@ class ScheduleImageRendererStickerTest(unittest.TestCase):
 
         self.assertNotEqual(first_map["嘉然"], second_map["嘉然"])
 
+    def test_repeated_member_rows_do_not_reuse_sticker_until_pool_exhausted(self) -> None:
+        first = Path("a.png")
+        second = Path("b.png")
+        candidates_map = {"嘉然": [first, second]}
+        used_paths = {}
+
+        with patch("asoul_render.random.choice", side_effect=lambda items: items[0]):
+            first_selected = ScheduleImageRenderer._select_avatar_paths(
+                ["嘉然"], candidates_map, used_paths
+            )
+            second_selected = ScheduleImageRenderer._select_avatar_paths(
+                ["嘉然"], candidates_map, used_paths
+            )
+
+        self.assertEqual(first_selected, [first])
+        self.assertEqual(second_selected, [second])
+
     def test_empty_member_folder_falls_back_to_legacy_single_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             plugin_dir = Path(temp_dir)
