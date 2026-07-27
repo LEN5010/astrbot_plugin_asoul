@@ -17,8 +17,6 @@ from asoul_bilibili_runtime import BilibiliRuntime
 from asoul_calendar import CalendarRepository
 from asoul_core import (
     DISPLAY_TZ,
-    HELP_MESSAGE,
-    HELP_TRIGGER_TEXTS,
     LIVE_REQUEST_FILTERED_HOSTS,
     NO_NEXT_WEEK_SCHEDULE_TEXT,
     THIS_WEEK_TRIGGER_TEXTS,
@@ -60,7 +58,7 @@ def _build_comment_db_path() -> Path:
     return data_dir / "bilibili_comments.sqlite3"
 
 
-@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.9.0")
+@register("astrbot_plugin_asoul", "LEN5010", "查询 A-SOUL 今日直播安排", "v3.9.1")
 class ASoulPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -86,15 +84,6 @@ class ASoulPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def remember_group_origin(self, event: AstrMessageEvent):
         await self._bilibili_runtime.remember_group_origin(event)
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def handle_bot_help(self, event: AstrMessageEvent):
-        """用户发送 /bot帮助 时返回使用说明。"""
-        if event.message_str.strip() not in HELP_TRIGGER_TEXTS:
-            return
-
-        event.stop_event()
-        yield event.plain_result(HELP_MESSAGE)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_live_request(self, event: AstrMessageEvent):
