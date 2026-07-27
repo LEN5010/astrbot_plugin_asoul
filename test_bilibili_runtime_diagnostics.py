@@ -134,8 +134,10 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
             last_reply_reconciliation_at=NOW_TS - 600,
             request_count_15m=15,
             request_count_60m=60,
-            reply_safety_interval_seconds=48 * 60 * 60,
+            reply_safety_interval_seconds=0,
             owner_last_attempt_at={"100": NOW_TS - 10},
+            reply_gap_count=4,
+            terminal_reply_count=2,
         )
 
         text = asyncio.run(runtime.build_bilibili_status_text())
@@ -147,6 +149,8 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
             "回复任务：变化待核对 1；分页中 1；重试 1；当前到期 1",
             text,
         )
+        self.assertIn("楼中楼缺口：4", text)
+        self.assertIn("已删除终态楼：2", text)
         self.assertIn("休眠楼层：20", text)
         self.assertIn("根索引待处理：1", text)
         self.assertIn("评论请求吞吐：15 分钟 15；60 分钟 60", text)
@@ -156,7 +160,8 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
         self.assertIn("内容监控 UID：1", text)
         self.assertIn("评论监控 UID：1", text)
         self.assertIn("评论请求最小间隔：2 秒", text)
-        self.assertIn("安全复查工作量超过单日容量", text)
+        self.assertIn("缺口驱动", text)
+        self.assertIn("楼中楼缺口 4 处待补扫", text)
 
 
     def test_slow_content_uid_does_not_block_next_uid(self) -> None:

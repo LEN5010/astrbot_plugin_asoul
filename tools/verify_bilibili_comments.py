@@ -252,7 +252,7 @@ async def main_async(args: argparse.Namespace) -> int:
                     await asyncio.sleep(0)
                     continue
 
-                journal.activate_due_safety_scans(now)
+                journal.activate_reply_gaps(now)
                 task = scheduler.next_task(
                     journal,
                     now,

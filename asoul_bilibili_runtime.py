@@ -33,10 +33,7 @@ from asoul_comment_capture import (
     CommentRetryPolicy,
     CommentWorkScheduler,
 )
-from asoul_comment_journal import (
-    COMMENT_REPLY_SAFETY_MIN_SECONDS,
-    CommentJournal,
-)
+from asoul_comment_journal import CommentJournal
 from asoul_core import DISPLAY_TZ
 
 MIN_AT_ALL_REMAINING = 1
@@ -601,6 +598,8 @@ class BilibiliRuntime:
 
     @staticmethod
     def classify_poll_error(exc: Exception) -> BilibiliPollError:
+        from asoul_comment_journal import CommentJournal
+
         code_value = getattr(exc, "code", None)
         status_value = getattr(exc, "status", None)
         try:
@@ -626,6 +625,20 @@ class BilibiliRuntime:
             )
 
         exception_name = exc.__class__.__name__
+        raw_message = str(
+            getattr(exc, "msg", "") or getattr(exc, "message", "") or exc or ""
+        )
+        raw_message = " ".join(raw_message.split())[:160]
+        code_text = str(code if code is not None else status or "")
+        if CommentJournal.is_deleted_comment_error(
+            "api", raw_message, code=code_text
+        ):
+            return BilibiliPollError(
+                category="gone",
+                code=code_text,
+                message=raw_message or "评论已删除或不存在",
+            )
+
         if status is not None or exception_name in {
             "NetworkException",
             "TimeoutError",
@@ -640,15 +653,14 @@ class BilibiliRuntime:
             "ResponseCodeException",
             "ApiException",
         }:
-            message = str(getattr(exc, "msg", "") or "B 站接口返回错误")
-            message = " ".join(message.split())[:160]
+            message = raw_message or "B 站接口返回错误"
             return BilibiliPollError(
                 category="api",
                 code=str(code or ""),
                 message=message,
             )
 
-        message = " ".join(str(exc or exception_name).split())[:160]
+        message = raw_message or exception_name
         return BilibiliPollError(
             category="internal",
             code=exception_name,
@@ -977,7 +989,7 @@ class BilibiliRuntime:
             self.send_captured_comment, now
         ):
             return True
-        self.comment_journal.activate_due_safety_scans(now)
+        self.comment_journal.activate_reply_gaps(now)
         task = self.comment_scheduler.next_task(
             self.comment_journal,
             now,
@@ -1517,11 +1529,6 @@ class BilibiliRuntime:
             if comment_status.oldest_head_due_at
             else 0
         )
-        safety_hours = comment_status.reply_safety_interval_seconds / 3600
-        safety_capacity_overloaded = (
-            comment_status.reply_safety_interval_seconds
-            > COMMENT_REPLY_SAFETY_MIN_SECONDS
-        )
         owner_attempts = comment_status.owner_last_attempt_at or {}
         stale_comment_uids = [
             uid
@@ -1533,6 +1540,10 @@ class BilibiliRuntime:
                 > COMMENT_RESOURCE_REFRESH_INTERVAL_SECONDS * 2
             )
         ]
+        reply_gap_count = int(getattr(comment_status, "reply_gap_count", 0) or 0)
+        terminal_reply_count = int(
+            getattr(comment_status, "terminal_reply_count", 0) or 0
+        )
         lines = [
             "【B站推送状态】",
             f"自动播报：{'已启用' if self.push_config.enabled else '未启用'}",
@@ -1564,12 +1575,14 @@ class BilibiliRuntime:
             f"分页中 {comment_status.reply_continuation_count}；"
             f"重试 {comment_status.reply_retrying_count}；"
             f"当前到期 {lane_due_counts.get('reply', 0)}",
+            f"楼中楼缺口：{reply_gap_count}",
+            f"已删除终态楼：{terminal_reply_count}",
             f"休眠楼层：{comment_status.dormant_reply_count}",
             f"根索引待处理：{lane_due_counts.get('reconcile', 0)}",
             "评论请求吞吐："
             f"15 分钟 {comment_status.request_count_15m}；"
             f"60 分钟 {comment_status.request_count_60m}",
-            f"回复安全复查周期：约 {safety_hours:.1f} 小时",
+            "回复复查：缺口驱动（已禁用定期全量 safety）",
             f"待投递：{comment_status.pending_delivery_count}",
         ]
         if comment_status.oldest_delivery_due_at:
@@ -1590,7 +1603,7 @@ class BilibiliRuntime:
         if (
             head_delay_seconds > COMMENT_POLL_INTERVAL_SECONDS * 2
             or stale_comment_uids
-            or safety_capacity_overloaded
+            or reply_gap_count > 0
         ):
             warning_reasons: list[str] = []
             if head_delay_seconds > COMMENT_POLL_INTERVAL_SECONDS * 2:
@@ -1599,8 +1612,8 @@ class BilibiliRuntime:
                 warning_reasons.append(
                     f"等待过久 UID：{', '.join(stale_comment_uids)}"
                 )
-            if safety_capacity_overloaded:
-                warning_reasons.append("安全复查工作量超过单日容量")
+            if reply_gap_count > 0:
+                warning_reasons.append(f"楼中楼缺口 {reply_gap_count} 处待补扫")
             lines.append(f"⚠ 评论抓取容量告警：{'；'.join(warning_reasons)}")
         for uid in self.push_config.target_uids:
             content_entry = content_runtime.get(uid, {})

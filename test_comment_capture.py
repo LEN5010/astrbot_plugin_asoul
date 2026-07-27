@@ -283,6 +283,40 @@ class CommentCaptureCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retried.cursor, "")
         self.assertEqual(retried.retry_count, 1)
 
+    async def test_deleted_reply_error_retires_task_without_retry(self) -> None:
+        self.gateway.root_pages = {
+            "": BilibiliRootCommentPage(
+                posts=[root_post("9001", 101)],
+                root_states=[BilibiliRootReplyState("9001", 1, ())],
+            )
+        }
+        head = self.journal.next_due_scan_task(100, lane="head", owner_uid="100")
+        assert head is not None
+        await self.coordinator.run_scan_task(head, ["100"], ["origin-a"], 101)
+        self.gateway.reply_error = RuntimeError("已经被删除了")
+        self.coordinator = CommentCaptureCoordinator(
+            gateway=self.gateway,
+            journal=self.journal,
+            classify_error=lambda exc: CommentCaptureError(
+                category="gone", code="12006", message=str(exc)
+            ),
+            retry_policy=CommentRetryPolicy(random_value=lambda: 0.5),
+        )
+        reply = self.journal.next_due_scan_task(
+            101, lane="reply", owner_uid="100"
+        )
+        assert reply is not None
+        await self.coordinator.run_scan_task(reply, ["100"], ["origin-a"], 102)
+        row = self.journal._connection.execute(
+            "SELECT task_state, last_error_category FROM scan_task WHERE task_id = ?",
+            (reply.task_id,),
+        ).fetchone()
+        self.assertEqual(row["task_state"], "retired")
+        self.assertEqual(row["last_error_category"], "gone")
+        self.assertIsNone(
+            self.journal.next_due_scan_task(10_000, lane="reply", owner_uid="100")
+        )
+
     async def test_page_timeout_preserves_cursor_and_schedules_retry(self) -> None:
         async def wait_forever(resource, offset=""):
             await asyncio.Event().wait()

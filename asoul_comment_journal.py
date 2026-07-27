@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -16,8 +15,20 @@ from asoul_bilibili import (
 
 
 COMMENT_HEAD_ROOT_SENTINEL = "__head__"
+# Fallback only when resource_published_at is missing on legacy rows.
+COMMENT_BASELINE_GRACE_SECONDS = 15 * 60
+# Kept for status/compat imports; periodic safety activation is disabled.
 COMMENT_REPLY_SAFETY_MIN_SECONDS = 24 * 60 * 60
 COMMENT_REPLY_SAFETY_DAILY_BUDGET = 10_000
+
+DELETED_COMMENT_ERROR_MARKERS = (
+    "已经被删除",
+    "已删除",
+    "没有该评论",
+    "评论不存在",
+    "评论区已关闭",
+)
+DELETED_COMMENT_ERROR_CODES = frozenset({"12002", "12006", "-404", "404"})
 
 
 @dataclass(frozen=True)
@@ -30,6 +41,7 @@ class CommentResourceLifecycle:
     incomplete_reason: str
     head_ready_at: int = 0
     baseline_completed_at: int = 0
+    resource_published_at: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,8 +109,10 @@ class CommentJournalStatus:
     last_reply_reconciliation_at: int = 0
     request_count_15m: int = 0
     request_count_60m: int = 0
-    reply_safety_interval_seconds: int = COMMENT_REPLY_SAFETY_MIN_SECONDS
+    reply_safety_interval_seconds: int = 0
     owner_last_attempt_at: dict[str, int] | None = None
+    reply_gap_count: int = 0
+    terminal_reply_count: int = 0
 
 
 SCHEMA_SQL = """
@@ -128,7 +142,8 @@ CREATE TABLE IF NOT EXISTS resource_lifecycle (
     state TEXT NOT NULL CHECK(state IN ('bootstrapping', 'active', 'retired')),
     incomplete_reason TEXT NOT NULL DEFAULT '',
     head_ready_at INTEGER NOT NULL DEFAULT 0,
-    baseline_completed_at INTEGER NOT NULL DEFAULT 0
+    baseline_completed_at INTEGER NOT NULL DEFAULT 0,
+    resource_published_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_resource
 ON resource_lifecycle(owner_uid, resource_key)
@@ -265,6 +280,10 @@ class CommentJournal:
             if "baseline_completed_at" not in lifecycle_columns:
                 self._connection.execute(
                     "ALTER TABLE resource_lifecycle ADD COLUMN baseline_completed_at INTEGER NOT NULL DEFAULT 0"
+                )
+            if "resource_published_at" not in lifecycle_columns:
+                self._connection.execute(
+                    "ALTER TABLE resource_lifecycle ADD COLUMN resource_published_at INTEGER NOT NULL DEFAULT 0"
                 )
 
             scan_columns = column_names("scan_task")
@@ -450,11 +469,16 @@ class CommentJournal:
             for resource_key, row in active_by_key.items():
                 if resource_key in current_resources:
                     resource = current_resources[resource_key]
+                    published_at = max(0, int(resource.published_at or 0))
                     self._connection.execute(
                         """
                         UPDATE resource_lifecycle SET
                             owner_name = ?, resource_kind = ?, oid = ?,
-                            type_value = ?, title = ?, url = ?
+                            type_value = ?, title = ?, url = ?,
+                            resource_published_at = CASE
+                                WHEN ? > 0 THEN ?
+                                ELSE resource_published_at
+                            END
                         WHERE lifecycle_id = ?
                         """,
                         (
@@ -464,6 +488,8 @@ class CommentJournal:
                             int(resource.type_value),
                             resource.title,
                             resource.url,
+                            published_at,
+                            published_at,
                             str(row["lifecycle_id"]),
                         ),
                     )
@@ -474,13 +500,15 @@ class CommentJournal:
                 if resource_key in active_by_key:
                     continue
                 lifecycle_id = uuid.uuid4().hex
+                published_at = max(0, int(resource.published_at or 0))
                 self._connection.execute(
                     """
                     INSERT INTO resource_lifecycle(
                         lifecycle_id, owner_uid, owner_name, resource_key,
                         resource_kind, oid, type_value, title, url, entered_at,
-                        retired_at, state, incomplete_reason
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'bootstrapping', '')
+                        retired_at, state, incomplete_reason,
+                        resource_published_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'bootstrapping', '', ?)
                     """,
                     (
                         lifecycle_id,
@@ -493,6 +521,7 @@ class CommentJournal:
                         resource.title,
                         resource.url,
                         int(now),
+                        published_at,
                     ),
                 )
                 self._connection.execute(
@@ -701,8 +730,16 @@ class CommentJournal:
 
             lifecycle_state = str(lifecycle["state"])
             entered_at = int(lifecycle["entered_at"])
+            try:
+                resource_published_at = int(lifecycle["resource_published_at"] or 0)
+            except (KeyError, IndexError, TypeError, ValueError):
+                resource_published_at = 0
+            baseline_cutoff = self._baseline_cutoff(
+                resource_published_at=resource_published_at,
+                entered_at=entered_at,
+            )
             for post in posts:
-                baseline = int(int(post.created_at) < entered_at)
+                baseline = int(int(post.created_at) < baseline_cutoff)
                 inserted = self._connection.execute(
                     """
                     INSERT OR IGNORE INTO observed_comment(
@@ -848,17 +885,23 @@ class CommentJournal:
                     ),
                 )
                 if stream_exhausted:
-                    safety_interval = self.calculate_reply_safety_interval_seconds()
+                    # Full reply walk finished: archive is source of truth until
+                    # a later primary page reports a higher rcount/fingerprint.
+                    observed_replies = self._observed_reply_count(
+                        str(task.lifecycle_id), str(task.root_rpid)
+                    )
                     self._connection.execute(
                         """
                         UPDATE comment_root_state
-                        SET reconciled_reply_count = known_reply_count,
-                            last_reply_scan_at = ?, next_safety_scan_at = ?
+                        SET known_reply_count = ?,
+                            reconciled_reply_count = ?,
+                            last_reply_scan_at = ?, next_safety_scan_at = 0
                         WHERE lifecycle_id = ? AND root_rpid = ?
                         """,
                         (
+                            observed_replies,
+                            observed_replies,
                             int(now),
-                            int(now) + safety_interval,
                             str(task.lifecycle_id),
                             str(task.root_rpid),
                         ),
@@ -919,16 +962,36 @@ class CommentJournal:
         )
         previous = self._connection.execute(
             """
-            SELECT known_reply_count, embedded_reply_ids_json
+            SELECT known_reply_count, reconciled_reply_count, embedded_reply_ids_json
             FROM comment_root_state
             WHERE lifecycle_id = ? AND root_rpid = ?
             """,
             (lifecycle_id, root_rpid),
         ).fetchone()
-        changed = (
+        observed_replies = self._observed_reply_count(lifecycle_id, root_rpid)
+        previous_known = (
+            int(previous["known_reply_count"]) if previous is not None else -1
+        )
+        previous_reconciled = (
+            int(previous["reconciled_reply_count"]) if previous is not None else -1
+        )
+        previous_fingerprint = (
+            str(previous["embedded_reply_ids_json"]) if previous is not None else ""
+        )
+        count_changed = previous is None or previous_known != reply_count
+        fingerprint_changed = previous_fingerprint != fingerprint
+        gap_vs_observed = reply_count > observed_replies
+        gap_vs_reconciled = (
+            reply_count > 0
+            and previous_reconciled >= 0
+            and reply_count > previous_reconciled
+        )
+        needs_scan = reply_count > 0 and (
             previous is None
-            or int(previous["known_reply_count"]) != reply_count
-            or str(previous["embedded_reply_ids_json"]) != fingerprint
+            or count_changed
+            or fingerprint_changed
+            or gap_vs_observed
+            or gap_vs_reconciled
         )
         reconciled_count = 0 if reply_count == 0 else -1
         self._connection.execute(
@@ -968,7 +1031,7 @@ class CommentJournal:
             """,
             (lifecycle_id, root_rpid),
         ).fetchone()
-        desired_state = "scheduled" if reply_count > 0 else "dormant"
+        desired_state = "scheduled" if needs_scan else "dormant"
         if existing_task is None:
             cursor = self._connection.execute(
                 """
@@ -988,11 +1051,14 @@ class CommentJournal:
             )
             return max(0, cursor.rowcount)
 
+        if str(existing_task["task_state"]) == "retired":
+            return 0
+
         in_progress = (
             int(existing_task["page_index"]) > 1
             or int(existing_task["retry_count"]) > 0
         )
-        if reply_count <= 0 and not in_progress:
+        if reply_count <= 0 and not in_progress and not needs_scan:
             self._connection.execute(
                 """
                 UPDATE scan_task
@@ -1002,7 +1068,7 @@ class CommentJournal:
                 """,
                 (int(existing_task["task_id"]),),
             )
-        elif changed and not in_progress:
+        elif needs_scan and not in_progress:
             self._connection.execute(
                 """
                 UPDATE scan_task
@@ -1017,24 +1083,15 @@ class CommentJournal:
         return 0
 
     def calculate_reply_safety_interval_seconds(self) -> int:
-        row = self._connection.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM comment_root_state
-            JOIN resource_lifecycle USING(lifecycle_id)
-            WHERE resource_lifecycle.retired_at = 0
-              AND comment_root_state.known_reply_count > 0
-            """
-        ).fetchone()
-        roots_with_replies = int(row["count"])
-        capacity_interval = math.ceil(
-            roots_with_replies
-            * (24 * 60 * 60)
-            / COMMENT_REPLY_SAFETY_DAILY_BUDGET
-        )
-        return max(COMMENT_REPLY_SAFETY_MIN_SECONDS, capacity_interval)
+        """Periodic safety is disabled; kept for diagnostics compatibility."""
+        return 0
 
     def activate_due_safety_scans(self, now: int) -> int:
+        """Backward-compatible alias for gap-driven reply activation."""
+        return self.activate_reply_gaps(now)
+
+    def activate_reply_gaps(self, now: int) -> int:
+        """Schedule dormant reply tasks whose known rcount exceeds observed replies."""
         with self._connection:
             rows = self._connection.execute(
                 """
@@ -1045,16 +1102,18 @@ class CommentJournal:
                   ON scan_task.lifecycle_id = comment_root_state.lifecycle_id
                  AND scan_task.root_rpid = comment_root_state.root_rpid
                  AND scan_task.kind = 'reply'
-                WHERE comment_root_state.known_reply_count > 0
-                  AND comment_root_state.next_safety_scan_at > 0
-                  AND comment_root_state.next_safety_scan_at <= ?
-                  AND resource_lifecycle.retired_at = 0
+                WHERE resource_lifecycle.retired_at = 0
                   AND scan_task.task_state = 'dormant'
-                ORDER BY comment_root_state.next_safety_scan_at,
-                         scan_task.task_id
+                  AND comment_root_state.known_reply_count > (
+                      SELECT COUNT(*)
+                      FROM observed_comment
+                      WHERE observed_comment.lifecycle_id = comment_root_state.lifecycle_id
+                        AND observed_comment.root_rpid = comment_root_state.root_rpid
+                        AND observed_comment.is_reply = 1
+                  )
+                ORDER BY comment_root_state.last_seen_at DESC, scan_task.task_id
                 LIMIT 500
-                """,
-                (int(now),),
+                """
             ).fetchall()
             task_ids = [int(row["task_id"]) for row in rows]
             if not task_ids:
@@ -1064,12 +1123,29 @@ class CommentJournal:
                 f"""
                 UPDATE scan_task
                 SET task_state = 'scheduled', next_attempt_at = ?,
-                    page_index = 1, reply_change_pending = 0
+                    page_index = 1, reply_change_pending = 1,
+                    retry_count = 0,
+                    last_error_category = '', last_error_message = ''
                 WHERE task_id IN ({placeholders})
                 """,
                 (int(now), *task_ids),
             )
         return max(0, cursor.rowcount)
+
+    @staticmethod
+    def is_deleted_comment_error(
+        category: str, message: str, code: str = ""
+    ) -> bool:
+        normalized_category = str(category or "").strip().lower()
+        normalized_code = str(code or "").strip()
+        normalized_message = str(message or "")
+        if normalized_category in {"gone", "deleted"}:
+            return True
+        if normalized_code in DELETED_COMMENT_ERROR_CODES:
+            return True
+        return any(
+            marker in normalized_message for marker in DELETED_COMMENT_ERROR_MARKERS
+        )
 
     def mark_scan_failed(
         self,
@@ -1078,12 +1154,22 @@ class CommentJournal:
         message: str,
         next_attempt_at: int,
         attempted_at: int | None = None,
+        *,
+        code: str = "",
     ) -> None:
         normalized_attempted_at = (
             int(attempted_at)
             if attempted_at is not None
             else max(0, int(next_attempt_at) - 1)
         )
+        if self.is_deleted_comment_error(category, message, code=code):
+            self.mark_scan_terminal(
+                task_id,
+                category="gone",
+                message=str(message or "评论已删除或不存在"),
+                attempted_at=normalized_attempted_at,
+            )
+            return
         with self._connection:
             task = self._connection.execute(
                 """
@@ -1115,6 +1201,53 @@ class CommentJournal:
             )
             if task is not None:
                 self._record_scan_attempt(normalized_attempted_at)
+
+    def mark_scan_terminal(
+        self,
+        task_id: int,
+        category: str,
+        message: str,
+        attempted_at: int,
+    ) -> None:
+        with self._connection:
+            task = self._connection.execute(
+                """
+                SELECT scan_task.lifecycle_id, scan_task.root_rpid
+                FROM scan_task
+                WHERE scan_task.task_id = ?
+                """,
+                (int(task_id),),
+            ).fetchone()
+            self._connection.execute(
+                """
+                UPDATE scan_task
+                SET retry_count = retry_count + 1,
+                    last_error_category = ?,
+                    last_error_message = ?,
+                    next_attempt_at = 0,
+                    task_state = 'retired',
+                    last_attempt_at = ?,
+                    reply_change_pending = 0,
+                    page_index = 1
+                WHERE task_id = ?
+                """,
+                (
+                    str(category),
+                    str(message),
+                    int(attempted_at),
+                    int(task_id),
+                ),
+            )
+            if task is not None:
+                self._connection.execute(
+                    """
+                    UPDATE comment_root_state
+                    SET next_safety_scan_at = 0
+                    WHERE lifecycle_id = ? AND root_rpid = ?
+                    """,
+                    (str(task["lifecycle_id"]), str(task["root_rpid"])),
+                )
+                self._record_scan_attempt(int(attempted_at))
 
     def _record_scan_attempt(self, attempted_at: int) -> None:
         minute_started_at = max(0, int(attempted_at)) // 60 * 60
@@ -1313,6 +1446,16 @@ class CommentJournal:
             FROM event_delivery WHERE state = 'pending'
             """
         ).fetchone()
+        terminal_reply_row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM scan_task
+            JOIN resource_lifecycle USING(lifecycle_id)
+            WHERE scan_task.kind = 'reply'
+              AND scan_task.task_state = 'retired'
+              AND resource_lifecycle.retired_at = 0
+            """
+        ).fetchone()
         last_root_reconciliation_at = int(reconciliation_row["root_success"])
         last_reply_reconciliation_at = int(reconciliation_row["reply_success"])
         return CommentJournalStatus(
@@ -1345,13 +1488,13 @@ class CommentJournal:
                 int(legacy_attempt_row["count_60m"])
                 + int(minute_attempt_row["count_60m"])
             ),
-            reply_safety_interval_seconds=(
-                self.calculate_reply_safety_interval_seconds()
-            ),
+            reply_safety_interval_seconds=0,
             owner_last_attempt_at={
                 str(row["owner_uid"]): int(row["last_attempt"])
                 for row in owner_rows
             },
+            reply_gap_count=self._count_reply_gaps(),
+            terminal_reply_count=int(terminal_reply_row["count"]),
         )
 
     def next_due_delivery(self, now: int) -> PendingCommentDelivery | None:
@@ -1497,8 +1640,49 @@ class CommentJournal:
         ).fetchall()
         return [str(row["rpid"]) for row in rows]
 
+    def _observed_reply_count(self, lifecycle_id: str, root_rpid: str) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM observed_comment
+            WHERE lifecycle_id = ? AND root_rpid = ? AND is_reply = 1
+            """,
+            (str(lifecycle_id), str(root_rpid)),
+        ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def _count_reply_gaps(self) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM comment_root_state
+            JOIN resource_lifecycle USING(lifecycle_id)
+            WHERE resource_lifecycle.retired_at = 0
+              AND comment_root_state.known_reply_count > (
+                  SELECT COUNT(*)
+                  FROM observed_comment
+                  WHERE observed_comment.lifecycle_id = comment_root_state.lifecycle_id
+                    AND observed_comment.root_rpid = comment_root_state.root_rpid
+                    AND observed_comment.is_reply = 1
+              )
+            """
+        ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    @staticmethod
+    def _baseline_cutoff(*, resource_published_at: int, entered_at: int) -> int:
+        published_at = max(0, int(resource_published_at or 0))
+        if published_at > 0:
+            return published_at
+        return max(0, int(entered_at) - COMMENT_BASELINE_GRACE_SECONDS)
+
     @staticmethod
     def _resource_from_row(row: sqlite3.Row) -> BilibiliCommentResource:
+        published_at = 0
+        try:
+            published_at = int(row["resource_published_at"] or 0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            published_at = 0
         return BilibiliCommentResource(
             key=str(row["resource_key"]),
             owner_uid=str(row["owner_uid"]),
@@ -1508,10 +1692,16 @@ class CommentJournal:
             type_value=int(row["type_value"]),
             title=str(row["title"]),
             url=str(row["url"]),
+            published_at=published_at,
         )
 
     @classmethod
     def _row_to_lifecycle(cls, row: sqlite3.Row) -> CommentResourceLifecycle:
+        published_at = 0
+        try:
+            published_at = int(row["resource_published_at"] or 0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            published_at = 0
         return CommentResourceLifecycle(
             lifecycle_id=str(row["lifecycle_id"]),
             resource=cls._resource_from_row(row),
@@ -1521,4 +1711,5 @@ class CommentJournal:
             incomplete_reason=str(row["incomplete_reason"]),
             head_ready_at=int(row["head_ready_at"]),
             baseline_completed_at=int(row["baseline_completed_at"]),
+            resource_published_at=published_at,
         )

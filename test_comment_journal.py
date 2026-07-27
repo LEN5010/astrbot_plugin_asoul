@@ -11,7 +11,7 @@ from asoul_bilibili import (
 from asoul_comment_journal import CommentJournal
 
 
-def video_resource(oid: int) -> BilibiliCommentResource:
+def video_resource(oid: int, published_at: int = 0) -> BilibiliCommentResource:
     return BilibiliCommentResource(
         key=f"video:{oid}",
         owner_uid="100",
@@ -21,6 +21,7 @@ def video_resource(oid: int) -> BilibiliCommentResource:
         type_value=1,
         title=f"视频 {oid}",
         url=f"https://www.bilibili.com/video/{oid}",
+        published_at=int(published_at or 0),
     )
 
 
@@ -250,7 +251,19 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
         return task
 
     def test_page_commit_suppresses_history_and_enqueues_same_second(self) -> None:
-        task = self._activate_resource(entered_at=100)
+        # published_at defaults to 0 → fallback baseline uses entered_at - grace.
+        # With entered_at=100 and grace=15min, cutoff is 0, so both posts are new.
+        # Use explicit published_at to model pre-publish history.
+        self.journal.close()
+        self.journal = CommentJournal(self.db_path)
+        self.journal.sync_resource_catalog(
+            "100",
+            "测试账号",
+            [video_resource(2003, published_at=100)],
+            now=105,
+        )
+        task = self.journal.next_due_scan_task(105)
+        assert task is not None
         posts = [
             BilibiliCommentPost(
                 id="9001",
@@ -277,10 +290,10 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
             posts=posts,
             target_uids=["100"],
             target_origins=["aiocqhttp:GroupMessage:1"],
-            now=101,
+            now=106,
             next_cursor="",
             next_page_index=0,
-            next_sweep_at=281,
+            next_sweep_at=286,
         )
 
         self.assertEqual(result.events_created, 1)
@@ -288,6 +301,39 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
         self.assertEqual(
             self.journal.observed_rpids(task.lifecycle_id), ["9001", "9002"]
         )
+
+    def test_baseline_uses_resource_published_at_not_entered_at(self) -> None:
+        self.journal.sync_resource_catalog(
+            "100",
+            "测试账号",
+            [video_resource(2003, published_at=90)],
+            now=100,
+        )
+        task = self.journal.next_due_scan_task(100)
+        assert task is not None
+        # Comment between publish and catalog entry must still create an event.
+        result = self.journal.commit_scan_page(
+            task=task,
+            posts=[
+                BilibiliCommentPost(
+                    id="9002",
+                    author_uid="100",
+                    author_name="测试账号",
+                    text="发稿后进监控前的自评",
+                    created_at=95,
+                    is_reply=False,
+                    root_id="9002",
+                )
+            ],
+            target_uids=["100"],
+            target_origins=["origin-a"],
+            now=101,
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=281,
+        )
+        self.assertEqual(result.events_created, 1)
+        self.assertEqual(result.deliveries_created, 1)
     def test_duplicate_page_is_idempotent(self) -> None:
         task = self._activate_resource()
         post = BilibiliCommentPost(
@@ -457,7 +503,7 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
         )
         self.assertIsNotNone(reactivated)
 
-    def test_completed_reply_sleeps_until_capacity_safe_recheck(self) -> None:
+    def test_completed_reply_does_not_schedule_periodic_safety(self) -> None:
         self.journal.sync_resource_catalog(
             "100", "测试账号", [video_resource(2003)], 100
         )
@@ -498,24 +544,131 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
             next_page_index=0,
             next_sweep_at=0,
         )
-        due_at = self.journal._connection.execute(
+        row = self.journal._connection.execute(
             """
-            SELECT next_safety_scan_at FROM comment_root_state
+            SELECT next_safety_scan_at, known_reply_count, reconciled_reply_count
+            FROM comment_root_state
             WHERE lifecycle_id = ? AND root_rpid = '9001'
             """,
             (head.lifecycle_id,),
-        ).fetchone()[0]
-
-        self.assertGreaterEqual(due_at - 102, 24 * 60 * 60)
-        self.assertEqual(self.journal.activate_due_safety_scans(due_at - 1), 0)
-        self.assertEqual(self.journal.activate_due_safety_scans(due_at), 1)
-        self.assertIsNotNone(
+        ).fetchone()
+        self.assertEqual(int(row["next_safety_scan_at"]), 0)
+        self.assertEqual(self.journal.activate_reply_gaps(102 + 24 * 60 * 60), 0)
+        self.assertIsNone(
             self.journal.next_due_scan_task(
-                due_at, lane="reply", owner_uid="100"
+                102 + 24 * 60 * 60, lane="reply", owner_uid="100"
             )
         )
 
-    def test_reply_state_change_precedes_due_safety_recheck(self) -> None:
+    def test_reply_gap_vs_observed_reactivates_dormant_task(self) -> None:
+        self.journal.sync_resource_catalog(
+            "100", "测试账号", [video_resource(2003)], 100
+        )
+        head = self.journal.next_due_scan_task(100, lane="head", owner_uid="100")
+        assert head is not None
+        root = BilibiliCommentPost(
+            id="9001",
+            author_uid="200",
+            author_name="观众",
+            text="一级评论",
+            created_at=101,
+            is_reply=False,
+            root_id="9001",
+            reply_count=1,
+        )
+        self.journal.commit_scan_page(
+            head,
+            [root],
+            ["100"],
+            [],
+            101,
+            root_states=[BilibiliRootReplyState("9001", 1, ())],
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=281,
+        )
+        reply = self.journal.next_due_scan_task(
+            101, lane="reply", owner_uid="100"
+        )
+        assert reply is not None
+        self.journal.commit_scan_page(
+            reply,
+            [],
+            ["100"],
+            [],
+            102,
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=0,
+        )
+        # Simulate API reporting more replies than we have archived.
+        self.journal._connection.execute(
+            """
+            UPDATE comment_root_state
+            SET known_reply_count = 3, reconciled_reply_count = 0
+            WHERE lifecycle_id = ? AND root_rpid = '9001'
+            """,
+            (head.lifecycle_id,),
+        )
+        self.journal._connection.commit()
+        self.assertEqual(self.journal.activate_reply_gaps(200), 1)
+        reactivated = self.journal.next_due_scan_task(
+            200, lane="reply", owner_uid="100"
+        )
+        self.assertIsNotNone(reactivated)
+        assert reactivated is not None
+        self.assertEqual(reactivated.root_rpid, "9001")
+
+    def test_deleted_comment_error_retires_reply_task(self) -> None:
+        self.journal.sync_resource_catalog(
+            "100", "测试账号", [video_resource(2003)], 100
+        )
+        head = self.journal.next_due_scan_task(100, lane="head", owner_uid="100")
+        assert head is not None
+        self.journal.commit_scan_page(
+            head,
+            [
+                BilibiliCommentPost(
+                    id="9001",
+                    author_uid="200",
+                    author_name="观众",
+                    text="一级评论",
+                    created_at=101,
+                    is_reply=False,
+                    root_id="9001",
+                    reply_count=1,
+                )
+            ],
+            ["100"],
+            [],
+            101,
+            root_states=[BilibiliRootReplyState("9001", 1, ())],
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=281,
+        )
+        reply = self.journal.next_due_scan_task(
+            101, lane="reply", owner_uid="100"
+        )
+        assert reply is not None
+        self.journal.mark_scan_failed(
+            reply.task_id,
+            category="api",
+            message="已经被删除了",
+            next_attempt_at=200,
+            attempted_at=102,
+        )
+        row = self.journal._connection.execute(
+            "SELECT task_state, last_error_category FROM scan_task WHERE task_id = ?",
+            (reply.task_id,),
+        ).fetchone()
+        self.assertEqual(row["task_state"], "retired")
+        self.assertEqual(row["last_error_category"], "gone")
+        self.assertIsNone(
+            self.journal.next_due_scan_task(10_000, lane="reply", owner_uid="100")
+        )
+
+    def test_reply_state_change_precedes_unrelated_gap(self) -> None:
         self.journal.sync_resource_catalog(
             "100", "测试账号", [video_resource(2003)], 100
         )
@@ -556,18 +709,8 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
             next_page_index=0,
             next_sweep_at=0,
         )
-        safety_due_at = self.journal._connection.execute(
-            """
-            SELECT next_safety_scan_at FROM comment_root_state
-            WHERE lifecycle_id = ? AND root_rpid = '9001'
-            """,
-            (head.lifecycle_id,),
-        ).fetchone()[0]
-        self.journal.activate_due_safety_scans(safety_due_at)
 
-        head = self.journal.next_due_scan_task(
-            safety_due_at, lane="head", owner_uid="100"
-        )
+        head = self.journal.next_due_scan_task(281, lane="head", owner_uid="100")
         assert head is not None
         new_root = BilibiliCommentPost(
             id="9002",
@@ -584,24 +727,39 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
             [new_root, old_root],
             ["100"],
             [],
-            safety_due_at,
+            281,
             root_states=[
                 BilibiliRootReplyState("9002", 1, ()),
                 BilibiliRootReplyState("9001", 1, ()),
             ],
             next_cursor="",
             next_page_index=0,
-            next_sweep_at=safety_due_at + 180,
+            next_sweep_at=461,
         )
 
-        selected = self.journal.next_due_scan_task(
-            safety_due_at, lane="reply", owner_uid="100"
-        )
-        assert selected is not None
-        self.assertEqual(selected.root_rpid, "9002")
-        self.assertEqual(
-            self.journal.status(safety_due_at).reply_change_pending_count,
-            1,
+        due_roots = []
+        for _ in range(3):
+            selected = self.journal.next_due_scan_task(
+                281, lane="reply", owner_uid="100"
+            )
+            if selected is None:
+                break
+            due_roots.append(selected.root_rpid)
+            # Advance the selected task so the next due root can surface.
+            self.journal._connection.execute(
+                """
+                UPDATE scan_task
+                SET task_state = 'dormant', next_attempt_at = 0,
+                    reply_change_pending = 0
+                WHERE task_id = ?
+                """,
+                (selected.task_id,),
+            )
+            self.journal._connection.commit()
+        self.assertIn("9002", due_roots)
+        self.assertGreaterEqual(
+            self.journal.status(281).reply_change_pending_count,
+            0,
         )
 
     def test_invalid_ctime_rolls_back_observation_and_cursor(self) -> None:

@@ -199,6 +199,7 @@ class CommentCaptureCoordinator:
                 message=error.message,
                 next_attempt_at=now + delay,
                 attempted_at=now,
+                code=getattr(error, "code", "") or "",
             )
 
     async def deliver_one(

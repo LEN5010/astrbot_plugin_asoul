@@ -192,6 +192,7 @@ class BilibiliCommentResource:
     type_value: int
     title: str
     url: str
+    published_at: int = 0
 
 
 @dataclass(frozen=True)
@@ -2172,6 +2173,7 @@ class BilibiliMonitorService:
                     type_value=post.comment_type,
                     title=_trim_text(post.text or "动态", 80),
                     url=post.url,
+                    published_at=max(0, int(post.created_at or 0)),
                 )
             )
 
@@ -2188,6 +2190,7 @@ class BilibiliMonitorService:
                     type_value=1,
                     title=_trim_text(post.title or "视频", 80),
                     url=post.url,
+                    published_at=max(0, int(post.created_at or 0)),
                 )
             )
 
