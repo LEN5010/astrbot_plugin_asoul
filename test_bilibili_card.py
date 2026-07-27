@@ -9,6 +9,7 @@ from asoul_bilibili import (
     BilibiliAdditionalCard,
     BilibiliAuthorCardProfile,
     BilibiliEngagementStats,
+    BilibiliForwardedContent,
     BilibiliNotification,
     BilibiliRichTextNode,
 )
@@ -183,6 +184,50 @@ class BilibiliCardFormattingTest(unittest.TestCase):
             context = build_card_context(notification)
 
         self.assertEqual(context["stats_note"], "数据暂未刷新")
+
+    def test_forwarded_content_is_separate_and_uses_balanced_image_count(self) -> None:
+        notification = BilibiliNotification(
+            kind="dynamic",
+            uid="100",
+            author_name="转发者",
+            title="",
+            text="只展示外层附言",
+            rich_nodes=[
+                BilibiliRichTextNode(kind="text", text="只展示外层附言")
+            ],
+            url="https://t.bilibili.com/123",
+            image_urls=[
+                "https://i.example/original-1.png",
+                "https://i.example/original-2.png",
+                "https://i.example/original-3.png",
+                "https://i.example/original-4.png",
+            ],
+            forwarded=BilibiliForwardedContent(
+                author_name="原作者",
+                text="原动态正文",
+                rich_nodes=[
+                    BilibiliRichTextNode(kind="text", text="原动态正文")
+                ],
+                image_urls=[
+                    "https://i.example/original-1.png",
+                    "https://i.example/original-2.png",
+                    "https://i.example/original-3.png",
+                    "https://i.example/original-4.png",
+                ],
+            ),
+        )
+
+        with patch(
+            "asoul_bilibili_card.build_qr_data_uri",
+            return_value="data:image/png;base64,qr",
+        ):
+            context = build_card_context(notification)
+
+        self.assertEqual(context["body_html"], "只展示外层附言")
+        self.assertNotIn("原动态正文", context["body_html"])
+        self.assertEqual(context["forwarded"]["body_html"], "原动态正文")
+        self.assertEqual(context["forwarded"]["image_count"], 4)
+        self.assertEqual(context["images"], [])
 
 
 class BilibiliCardRendererTest(unittest.TestCase):

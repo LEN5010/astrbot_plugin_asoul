@@ -28,7 +28,6 @@ MIN_COMMENT_REQUEST_INTERVAL_SECONDS = 0.5
 MAX_COMMENT_REQUEST_INTERVAL_SECONDS = 60.0
 CONTENT_RECENT_IDS_LIMIT = 20
 RECENT_NOTIFICATION_WINDOW_SECONDS = 5 * 60
-DYNAMIC_FORWARD_SEPARATOR = "┈" * 24
 BILIBILI_CREDENTIAL_FIELDS = (
     "sessdata",
     "bili_jct",
@@ -1080,13 +1079,14 @@ class BilibiliGateway:
 
         rich_nodes, plain_text = self._extract_dynamic_rich_nodes(item)
         image_urls = self._extract_dynamic_image_urls(item)
+        forwarded = self._parse_forwarded_content(item)
 
         url_value = self._extract_dynamic_url(item)
         url = _normalize_url(str(url_value).strip() if url_value is not None else "")
         if not url:
             url = f"https://t.bilibili.com/{dynamic_id}"
 
-        text = plain_text or "发布了新动态"
+        text = plain_text or ("" if forwarded is not None else "发布了新动态")
         comment_oid = _safe_int(
             self._find_first_value(item.get("basic", {}), ("comment_id_str", "comment_id"))
         )
@@ -1137,7 +1137,7 @@ class BilibiliGateway:
             author=self._parse_dynamic_author(item),
             stats=self._parse_dynamic_stats(item),
             additional_card=self._parse_dynamic_additional_card(item),
-            forwarded=self._parse_forwarded_content(item),
+            forwarded=forwarded,
             is_live_room_dynamic=is_live_room_dynamic,
             is_video_dynamic=is_video_dynamic,
         )
@@ -1295,7 +1295,6 @@ class BilibiliGateway:
             part
             for part in (
                 self._extract_dynamic_card_text(item),
-                self._extract_dynamic_forward_text(item),
             )
             if part
         ]
@@ -1536,23 +1535,6 @@ class BilibiliGateway:
             )
 
         return "\n".join(lines).strip()
-
-    def _extract_dynamic_forward_text(self, item: Dict[str, Any]) -> str:
-        orig = item.get("orig")
-        if not isinstance(orig, dict):
-            return ""
-
-        modules = orig.get("modules", {}) if isinstance(orig.get("modules"), dict) else {}
-        module_author = modules.get("module_author", {}) if isinstance(modules.get("module_author"), dict) else {}
-        author_name = str(module_author.get("name", "") or "").strip()
-        _, original_text = self._extract_primary_dynamic_rich_nodes(orig)
-        original_card_text = self._extract_dynamic_card_text(orig)
-        combined = "\n".join([part for part in (original_text, original_card_text) if part]).strip()
-        if not combined:
-            return ""
-        if author_name:
-            return f"{DYNAMIC_FORWARD_SEPARATOR}\n转发自 {author_name}\n{combined}"
-        return f"{DYNAMIC_FORWARD_SEPARATOR}\n转发内容\n{combined}"
 
     @staticmethod
     def _append_unique_line(lines: List[str], raw_value: Any) -> None:

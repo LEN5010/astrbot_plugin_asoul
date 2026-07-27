@@ -882,7 +882,7 @@ class BilibiliParsingTest(unittest.TestCase):
         self.assertEqual(post.image_urls, ["https://i0.hdslb.com/live-cover.jpg"])
         self.assertTrue(post.is_live_room_dynamic)
 
-    def test_parse_forward_dynamic_includes_original_content(self) -> None:
+    def test_parse_forward_dynamic_keeps_original_content_out_of_outer_text(self) -> None:
         item = {
             "id_str": "dyn-forward",
             "modules": {
@@ -913,9 +913,12 @@ class BilibiliParsingTest(unittest.TestCase):
 
         self.assertIsNotNone(post)
         assert post is not None
-        self.assertIn("┈" * 24 + "\n转发自 A-SOUL_Official", post.text)
-        self.assertIn("转发自 A-SOUL_Official", post.text)
-        self.assertIn("Hello小伙伴们大家好", post.text)
+        self.assertEqual(post.text, "")
+        self.assertNotIn("Hello小伙伴们大家好", post.text)
+        self.assertIsNotNone(post.forwarded)
+        assert post.forwarded is not None
+        self.assertEqual(post.forwarded.author_name, "A-SOUL_Official")
+        self.assertIn("Hello小伙伴们大家好", post.forwarded.text)
         self.assertIn("https://i0.hdslb.com/forward-preview.jpg", post.image_urls)
 
     def test_parse_reserve_dynamic_includes_reservation_card(self) -> None:
@@ -1102,6 +1105,7 @@ class BilibiliParsingTest(unittest.TestCase):
         assert post is not None
         self.assertIsNotNone(post.forwarded)
         assert post.forwarded is not None
+        self.assertEqual(post.text, "转发一下")
         self.assertEqual(post.forwarded.author_name, "A-SOUL_Official")
         self.assertEqual(post.forwarded.text, "原动态正文")
         self.assertEqual(

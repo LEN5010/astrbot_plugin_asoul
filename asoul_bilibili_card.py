@@ -171,6 +171,7 @@ def build_card_context(
                 if url
             ][:9],
         }
+        forwarded["image_count"] = len(forwarded["images"])
         forwarded_image_urls = set(forwarded["images"])
         images = [url for url in images if url not in forwarded_image_urls]
 

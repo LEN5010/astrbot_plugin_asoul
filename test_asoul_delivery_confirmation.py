@@ -19,6 +19,7 @@ from test_asoul_push_targets import _load_main_module
 class RecordingContext:
     def __init__(self) -> None:
         self.sent: list[str] = []
+        self.results: list[object] = []
         self.fail_rules: dict[tuple[str, int], Exception] = {}
         self.origin_counts: dict[str, int] = {}
 
@@ -26,6 +27,7 @@ class RecordingContext:
         count = self.origin_counts.get(origin, 0) + 1
         self.origin_counts[origin] = count
         self.sent.append(origin)
+        self.results.append(result)
         failure = self.fail_rules.get((origin, count))
         if failure is not None:
             raise failure
@@ -297,6 +299,167 @@ class ASoulDeliveryConfirmationTest(unittest.TestCase):
         target_state = runtime.monitor_state["targets"][origin]["uids"].get("100", {})
         self.assertEqual(target_state, {})
         self.assertEqual(context.sent, [origin])
+
+    def test_live_atall_send_failure_retries_without_atall_and_confirms(self) -> None:
+        from asoul_bilibili_runtime import BilibiliPushTarget
+
+        context = RecordingContext()
+        origin = "aiocqhttp:GroupMessage:100"
+        context.fail_rules[(origin, 1)] = RuntimeError("AtAll unsupported")
+        plugin = self._new_plugin(context, ["100"])
+        runtime = plugin._bilibili_runtime
+        runtime.push_config = replace(
+            runtime.push_config,
+            render_bilibili_cards=False,
+        )
+
+        async def allow_atall(_target):
+            return True
+
+        runtime.should_send_live_atall = allow_atall
+        target = BilibiliPushTarget(
+            group_id="100",
+            platform_name="aiocqhttp",
+            unified_msg_origin=origin,
+        )
+        final_state = {
+            "author_name": "测试账号",
+            "last_live_active": True,
+            "last_live_room_id": "1",
+        }
+        plan = BilibiliUidDeliveryPlan(
+            deliveries=[
+                BilibiliPlannedNotification(
+                    notification=BilibiliNotification(
+                        kind="live",
+                        uid="100",
+                        author_name="测试账号",
+                        title="开播了",
+                        url="https://live.bilibili.com/1",
+                    ),
+                    uid_state=final_state,
+                )
+            ],
+            final_state=final_state,
+        )
+
+        asyncio.run(
+            runtime.apply_delivery_plan_to_target(
+                target,
+                "100",
+                plan,
+                BilibiliUidSnapshot(uid="100", author_name="测试账号"),
+            )
+        )
+
+        self.assertEqual(context.origin_counts[origin], 2)
+        self.assertTrue(
+            any(isinstance(part, self.main.Comp.AtAll) for part in context.results[0].chain)
+        )
+        self.assertFalse(
+            any(isinstance(part, self.main.Comp.AtAll) for part in context.results[1].chain)
+        )
+        target_state = runtime.monitor_state["targets"][origin]["uids"]["100"]
+        self.assertTrue(target_state["last_live_active"])
+
+    def test_live_without_atall_capability_still_sends_plain_notification(self) -> None:
+        from asoul_bilibili_runtime import BilibiliPushTarget
+
+        context = RecordingContext()
+        origin = "unsupported:GroupMessage:100"
+        plugin = self._new_plugin(context, ["100"])
+        runtime = plugin._bilibili_runtime
+        runtime.push_config = replace(
+            runtime.push_config,
+            render_bilibili_cards=False,
+        )
+
+        async def deny_atall(_target):
+            return False
+
+        runtime.should_send_live_atall = deny_atall
+        target = BilibiliPushTarget(
+            group_id="100",
+            platform_name="unsupported",
+            unified_msg_origin=origin,
+        )
+        notification = BilibiliNotification(
+            kind="live",
+            uid="100",
+            author_name="测试账号",
+            title="开播了",
+            url="https://live.bilibili.com/1",
+        )
+
+        asyncio.run(runtime.send_notification_to_target(notification, target))
+
+        self.assertEqual(context.origin_counts[origin], 1)
+        self.assertFalse(
+            any(
+                isinstance(part, self.main.Comp.AtAll)
+                for part in context.results[0].chain
+            )
+        )
+        self.assertIn("【B站开播】", context.results[0].chain[0][1])
+
+    def test_live_atall_and_plain_fallback_failure_does_not_confirm(self) -> None:
+        from asoul_bilibili_runtime import BilibiliPushTarget
+
+        context = RecordingContext()
+        origin = "aiocqhttp:GroupMessage:100"
+        context.fail_rules[(origin, 1)] = RuntimeError("AtAll unsupported")
+        context.fail_rules[(origin, 2)] = RuntimeError("plain send failed")
+        plugin = self._new_plugin(context, ["100"])
+        runtime = plugin._bilibili_runtime
+        runtime.push_config = replace(
+            runtime.push_config,
+            render_bilibili_cards=False,
+        )
+
+        async def allow_atall(_target):
+            return True
+
+        runtime.should_send_live_atall = allow_atall
+        target = BilibiliPushTarget(
+            group_id="100",
+            platform_name="aiocqhttp",
+            unified_msg_origin=origin,
+        )
+        final_state = {
+            "author_name": "测试账号",
+            "last_live_active": True,
+            "last_live_room_id": "1",
+        }
+        plan = BilibiliUidDeliveryPlan(
+            deliveries=[
+                BilibiliPlannedNotification(
+                    notification=BilibiliNotification(
+                        kind="live",
+                        uid="100",
+                        author_name="测试账号",
+                        title="开播了",
+                        url="https://live.bilibili.com/1",
+                    ),
+                    uid_state=final_state,
+                )
+            ],
+            final_state=final_state,
+        )
+
+        asyncio.run(
+            runtime.apply_delivery_plan_to_target(
+                target,
+                "100",
+                plan,
+                BilibiliUidSnapshot(uid="100", author_name="测试账号"),
+            )
+        )
+
+        self.assertEqual(context.origin_counts[origin], 2)
+        target_state = runtime.monitor_state.get("targets", {}).get(
+            origin, {}
+        ).get("uids", {}).get("100", {})
+        self.assertEqual(target_state, {})
 
 
 if __name__ == "__main__":

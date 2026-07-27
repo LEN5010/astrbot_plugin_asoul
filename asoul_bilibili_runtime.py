@@ -796,7 +796,7 @@ class BilibiliRuntime:
         except asyncio.CancelledError:
             result = "cancelled"
             raise
-        except TimeoutError:
+        except asyncio.TimeoutError:
             result = "timeout"
             error = BilibiliPollError(
                 category="timeout",
@@ -1060,12 +1060,9 @@ class BilibiliRuntime:
     ) -> None:
         for delivery in plan.deliveries:
             try:
-                result = await self.build_notification_result(
-                    delivery.notification, target
-                )
-                await asyncio.wait_for(
-                    self.context.send_message(target.unified_msg_origin, result),
-                    timeout=MESSAGE_SEND_TIMEOUT_SECONDS,
+                await self.send_notification_to_target(
+                    delivery.notification,
+                    target,
                 )
             except Exception:
                 logger.exception(
@@ -1143,11 +1140,54 @@ class BilibiliRuntime:
         self,
         notification: Any,
         target: BilibiliPushTarget,
+        *,
+        allow_live_atall: bool = True,
     ) -> MessageEventResult:
         chain_parts = await self.build_card_or_fallback_parts(notification)
-        if notification.kind == "live" and await self.should_send_live_atall(target):
+        if (
+            allow_live_atall
+            and notification.kind == "live"
+            and await self.should_send_live_atall(target)
+        ):
             chain_parts = [Comp.AtAll(), Comp.Plain(self.safe_plain_newline())] + chain_parts
         return MessageEventResult(chain=chain_parts).use_t2i(False)
+
+    async def send_notification_to_target(
+        self,
+        notification: Any,
+        target: BilibiliPushTarget,
+    ) -> None:
+        result = await self.build_notification_result(notification, target)
+        try:
+            await asyncio.wait_for(
+                self.context.send_message(target.unified_msg_origin, result),
+                timeout=MESSAGE_SEND_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            raise
+        except Exception:
+            if notification.kind != "live" or not any(
+                isinstance(part, Comp.AtAll) for part in result.chain
+            ):
+                raise
+            logger.warning(
+                "群 %s 的开播通知携带 @全体发送失败，降级为普通通知重试",
+                target.group_id,
+            )
+            fallback_result = await self.build_notification_result(
+                notification,
+                target,
+                allow_live_atall=False,
+            )
+            await asyncio.wait_for(
+                self.context.send_message(
+                    target.unified_msg_origin,
+                    fallback_result,
+                ),
+                timeout=MESSAGE_SEND_TIMEOUT_SECONDS,
+            )
 
     async def build_card_or_fallback_parts(self, notification: Any) -> list[Any]:
         if (
@@ -1289,10 +1329,55 @@ class BilibiliRuntime:
 
         if notification.kind == "dynamic":
             chain_parts.append(Comp.Plain(self.safe_plain_newline()))
-            self.append_rich_text_parts(chain_parts, notification.rich_nodes, notification.text)
+            forwarded = getattr(notification, "forwarded", None)
+            if notification.rich_nodes or str(notification.text or "").strip():
+                self.append_rich_text_parts(
+                    chain_parts,
+                    notification.rich_nodes,
+                    notification.text,
+                )
+            elif forwarded is None:
+                chain_parts.append(Comp.Plain("发布了新动态"))
+
+            forwarded_image_urls = set(
+                getattr(forwarded, "image_urls", []) or []
+            )
             for image_url in notification.image_urls:
+                if image_url in forwarded_image_urls:
+                    continue
                 chain_parts.append(Comp.Plain(self.safe_plain_newline()))
                 chain_parts.append(Comp.Image.fromURL(image_url))
+            if forwarded is not None:
+                author_name = str(
+                    getattr(forwarded, "author_name", "") or ""
+                ).strip()
+                chain_parts.append(Comp.Plain(self.safe_plain_newline()))
+                chain_parts.append(
+                    Comp.Plain(
+                        f"↪ 转发自 {author_name}" if author_name else "↪ 转发内容"
+                    )
+                )
+                forwarded_title = str(
+                    getattr(forwarded, "title", "") or ""
+                ).strip()
+                if forwarded_title:
+                    chain_parts.append(
+                        Comp.Plain(
+                            f"{self.safe_plain_newline()}{forwarded_title}"
+                        )
+                    )
+                forwarded_nodes = getattr(forwarded, "rich_nodes", []) or []
+                forwarded_text = getattr(forwarded, "text", "") or ""
+                if forwarded_nodes or str(forwarded_text).strip():
+                    chain_parts.append(Comp.Plain(self.safe_plain_newline()))
+                    self.append_rich_text_parts(
+                        chain_parts,
+                        forwarded_nodes,
+                        forwarded_text,
+                    )
+                for image_url in getattr(forwarded, "image_urls", []) or []:
+                    chain_parts.append(Comp.Plain(self.safe_plain_newline()))
+                    chain_parts.append(Comp.Image.fromURL(image_url))
         elif notification.kind == "comment":
             detail_parts: list[str] = []
             timestamp = int(getattr(notification, "comment_created_at", 0) or 0)

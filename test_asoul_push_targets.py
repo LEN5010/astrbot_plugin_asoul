@@ -12,7 +12,9 @@ from unittest.mock import patch
 from asoul_bilibili import (
     BilibiliAuthorCardProfile,
     BilibiliEngagementStats,
+    BilibiliForwardedContent,
     BilibiliNotification,
+    BilibiliRichTextNode,
     BilibiliUidDeliveryPlan,
     BilibiliVideoPost,
     KV_BILIBILI_GROUP_ORIGINS,
@@ -327,6 +329,43 @@ class ASoulPushTargetTest(unittest.TestCase):
         self.assertIn(("image_url", "https://i0.hdslb.com/comment-image.png"), parts)
         self.assertEqual(parts[-1][0], "plain")
         self.assertIn("https://www.bilibili.com/video/BV1xx411c7mD", parts[-1][1])
+
+    def test_forwarded_fallback_separates_outer_and_original_content(self) -> None:
+        plugin = self._new_plugin(["100"])
+        original_image = "https://i0.hdslb.com/original.png"
+        notification = BilibiliNotification(
+            kind="dynamic",
+            uid="100",
+            author_name="转发者",
+            title="",
+            url="https://t.bilibili.com/1",
+            text="外层附言",
+            rich_nodes=[
+                BilibiliRichTextNode(kind="text", text="外层附言")
+            ],
+            image_urls=[original_image],
+            forwarded=BilibiliForwardedContent(
+                author_name="原作者",
+                text="原动态正文",
+                rich_nodes=[
+                    BilibiliRichTextNode(kind="text", text="原动态正文")
+                ],
+                image_urls=[original_image],
+            ),
+        )
+
+        parts = plugin._bilibili_runtime.build_notification_parts(notification)
+        plain_text = "".join(
+            value for kind, value in parts if kind == "plain"
+        )
+
+        self.assertEqual(plain_text.count("外层附言"), 1)
+        self.assertEqual(plain_text.count("原动态正文"), 1)
+        self.assertIn("↪ 转发自 原作者", plain_text)
+        self.assertEqual(
+            parts.count(("image_url", original_image)),
+            1,
+        )
 
     def test_comment_notification_uses_card_and_commenter_profile(self) -> None:
         plugin = self._new_plugin(["100"])
