@@ -183,6 +183,8 @@ CREATE TABLE IF NOT EXISTS observed_comment (
     observed_at INTEGER NOT NULL,
     PRIMARY KEY(lifecycle_id, rpid)
 );
+CREATE INDEX IF NOT EXISTS ix_observed_root_reply
+ON observed_comment(lifecycle_id, root_rpid, is_reply);
 CREATE TABLE IF NOT EXISTS comment_event (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     lifecycle_id TEXT NOT NULL,
@@ -307,6 +309,12 @@ class CommentJournal:
                 """
                 CREATE INDEX IF NOT EXISTS ix_scan_lane_due
                 ON scan_task(task_state, scan_lane, next_attempt_at, task_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_scan_reply_gap
+                ON scan_task(task_state, kind, lifecycle_id, root_rpid)
                 """
             )
 

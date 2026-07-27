@@ -53,6 +53,55 @@ class CommentJournalLifecycleTest(unittest.TestCase):
         self.assertEqual(task.kind, "primary")
         self.assertEqual(task.cursor, "")
 
+    def test_reply_gap_indexes_cover_production_query(self) -> None:
+        observed_plan = self.journal._connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(*)
+            FROM observed_comment
+            WHERE lifecycle_id = ? AND root_rpid = ? AND is_reply = 1
+            """,
+            ("lifecycle", "root"),
+        ).fetchall()
+        scan_index_columns = [
+            str(row["name"])
+            for row in self.journal._connection.execute(
+                "PRAGMA index_info(ix_scan_reply_gap)"
+            ).fetchall()
+        ]
+
+        self.assertIn(
+            "ix_observed_root_reply",
+            " ".join(str(row["detail"]) for row in observed_plan),
+        )
+        self.assertEqual(
+            scan_index_columns,
+            ["task_state", "kind", "lifecycle_id", "root_rpid"],
+        )
+
+    def test_reopening_existing_database_creates_reply_gap_indexes(self) -> None:
+        self.journal._connection.execute("DROP INDEX ix_observed_root_reply")
+        self.journal._connection.execute("DROP INDEX ix_scan_reply_gap")
+        self.journal._connection.commit()
+        self.journal.close()
+
+        self.journal = CommentJournal(self.db_path)
+        observed_indexes = {
+            str(row["name"])
+            for row in self.journal._connection.execute(
+                "PRAGMA index_list(observed_comment)"
+            ).fetchall()
+        }
+        scan_indexes = {
+            str(row["name"])
+            for row in self.journal._connection.execute(
+                "PRAGMA index_list(scan_task)"
+            ).fetchall()
+        }
+
+        self.assertIn("ix_observed_root_reply", observed_indexes)
+        self.assertIn("ix_scan_reply_gap", scan_indexes)
+
     def test_catalog_sync_creates_independent_head_and_reconcile_lanes(self) -> None:
         self.journal.sync_resource_catalog(
             "100", "测试账号", [video_resource(2003)], now=100
