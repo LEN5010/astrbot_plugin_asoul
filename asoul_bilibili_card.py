@@ -213,6 +213,7 @@ def build_card_context(
         "brand_name": BRAND_NAME,
         "brand_logo_data_uri": build_brand_logo_data_uri(),
         "kind": notification.kind,
+        "is_comment": is_comment,
         "kind_label": kind_labels.get(notification.kind, "B站通知"),
         "title": html.escape(notification.title or "", quote=True),
         "body_html": render_rich_text_html(notification.rich_nodes, body_fallback),
@@ -223,7 +224,7 @@ def build_card_context(
         ),
         "generated_at": _format_timestamp(generated_ts, include_seconds=True),
         "url": safe_http_url(notification.url),
-        "qr_data_uri": build_qr_data_uri(notification.url),
+        "qr_data_uri": "" if is_comment else build_qr_data_uri(notification.url),
         "images": images,
         "image_count": len(images),
         "author": {

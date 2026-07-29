@@ -60,7 +60,7 @@ class BilibiliCardFormattingTest(unittest.TestCase):
         self.assertIn("{{ stats_note }}", template)
         self.assertNotIn("ASTRBOT · BILIBILI CARD", template)
 
-    def test_comment_context_identifies_source_and_hides_engagement(self) -> None:
+    def test_comment_context_identifies_source_and_uses_compact_card(self) -> None:
         notification = BilibiliNotification(
             kind="comment",
             uid="200",
@@ -85,9 +85,23 @@ class BilibiliCardFormattingTest(unittest.TestCase):
         self.assertEqual(context["kind_label"], "回复评论")
         self.assertEqual(context["content_heading"], "评论内容")
         self.assertEqual(context["profile_heading"], "评论者资料")
+        self.assertTrue(context["is_comment"])
         self.assertFalse(context["show_engagement"])
+        self.assertEqual(context["qr_data_uri"], "")
         self.assertIn("UP主的动态《来源标题》", context["comment_context"]["source"])
         self.assertNotEqual(context["published_at"], "--")
+
+    def test_template_hides_non_comment_chrome_for_comment_cards(self) -> None:
+        template = (
+            Path(__file__).resolve().parent / "templates" / "bilibili_card.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("comment-card", template)
+        self.assertIn("{% if not is_comment %}", template)
+        self.assertNotIn(
+            '<div class="comment-body-heading">{{ content_heading }}</div>',
+            template,
+        )
 
     def test_format_card_number_uses_chinese_units_and_missing_marker(self) -> None:
         self.assertEqual(format_card_number(None), "--")
