@@ -66,7 +66,15 @@ class BilibiliCardFormattingTest(unittest.TestCase):
             uid="200",
             author_name="评论者",
             title="",
-            text="这是一条评论",
+            text="这是一条评论[嘉然_暗中观察]",
+            rich_nodes=[
+                BilibiliRichTextNode(kind="text", text="这是一条评论"),
+                BilibiliRichTextNode(
+                    kind="emoji",
+                    text="[嘉然_暗中观察]",
+                    image_url="https://i0.hdslb.com/emote.png",
+                ),
+            ],
             url="https://t.bilibili.com/123",
             comment_created_at=1_700_000_000,
             comment_resource_owner_name="UP主",
@@ -88,6 +96,8 @@ class BilibiliCardFormattingTest(unittest.TestCase):
         self.assertTrue(context["is_comment"])
         self.assertFalse(context["show_engagement"])
         self.assertEqual(context["qr_data_uri"], "")
+        self.assertIn('class="inline-emoji"', context["body_html"])
+        self.assertNotIn("这是一条评论[嘉然_暗中观察]", context["body_html"])
         self.assertIn("UP主的动态《来源标题》", context["comment_context"]["source"])
         self.assertNotEqual(context["published_at"], "--")
 

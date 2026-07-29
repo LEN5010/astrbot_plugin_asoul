@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol, Sequence
 
 from asoul_bilibili import BilibiliGateway, BilibiliNotification
-from asoul_comment_journal import CommentJournal, CommentScanTask
+from asoul_comment_journal import (
+    COMMENT_NOTIFICATION_MAX_AGE_SECONDS,
+    CommentJournal,
+    CommentScanTask,
+)
 
 COMMENT_PRIMARY_RESCAN_SECONDS = 180
 COMMENT_RECONCILE_RESCAN_SECONDS = 6 * 60 * 60
@@ -215,6 +219,12 @@ class CommentCaptureCoordinator:
         delivery = self.journal.next_due_delivery(now)
         if delivery is None:
             return False
+        if (
+            delivery.post.created_at
+            < int(now) - COMMENT_NOTIFICATION_MAX_AGE_SECONDS
+        ):
+            self.journal.cancel_delivery(delivery.delivery_id)
+            return True
         resource_text = (
             "动态" if delivery.resource.resource_kind == "dynamic" else "视频"
         )
@@ -225,6 +235,7 @@ class CommentCaptureCoordinator:
             title="",
             url=delivery.resource.url,
             text=delivery.post.text,
+            rich_nodes=list(delivery.post.rich_nodes),
             image_urls=list(delivery.post.image_urls),
             comment_created_at=delivery.post.created_at,
             comment_resource_owner_name=delivery.resource.owner_name,

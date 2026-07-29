@@ -1284,7 +1284,7 @@ class BilibiliParsingTest(unittest.TestCase):
         )
         self.assertEqual(plan.final_state["last_dynamic_id"], "dyn-recent")
 
-    def test_parse_comment_post_preserves_images_and_emotes_without_text(self) -> None:
+    def test_parse_comment_post_separates_pictures_and_inline_emotes(self) -> None:
         post = self.gateway._parse_comment_post(
             {
                 "rpid_str": "99001",
@@ -1295,14 +1295,15 @@ class BilibiliParsingTest(unittest.TestCase):
                     "uname": "乃琳Queen",
                 },
                 "content": {
-                    "message": "",
+                    "message": "看看午饭[嘉然_暗中观察]",
                     "pictures": [
                         {"img_src": "//i0.hdslb.com/comment-a.png"},
                         {"url": "https://i0.hdslb.com/comment-b.png"},
                     ],
                     "emote": {
-                        "1": {"url": "https://i0.hdslb.com/emote-a.png"},
-                        "2": {"icon_url": "https://i0.hdslb.com/emote-b.png"},
+                        "[嘉然_暗中观察]": {
+                            "url": "https://i0.hdslb.com/emote-a.png"
+                        },
                     },
                 },
             }
@@ -1310,14 +1311,26 @@ class BilibiliParsingTest(unittest.TestCase):
 
         self.assertIsNotNone(post)
         assert post is not None
-        self.assertEqual(post.text, "")
+        self.assertEqual(post.text, "看看午饭[嘉然_暗中观察]")
         self.assertEqual(
             post.image_urls,
             [
                 "https://i0.hdslb.com/comment-a.png",
                 "https://i0.hdslb.com/comment-b.png",
-                "https://i0.hdslb.com/emote-a.png",
-                "https://i0.hdslb.com/emote-b.png",
+            ],
+        )
+        self.assertEqual(
+            [
+                (node.kind, node.text, node.image_url)
+                for node in post.rich_nodes
+            ],
+            [
+                ("text", "看看午饭", ""),
+                (
+                    "emoji",
+                    "[嘉然_暗中观察]",
+                    "https://i0.hdslb.com/emote-a.png",
+                ),
             ],
         )
         self.assertFalse(post.is_reply)

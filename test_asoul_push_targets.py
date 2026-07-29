@@ -325,7 +325,7 @@ class ASoulPushTargetTest(unittest.TestCase):
         self.assertIn("【B站评论】乃琳Queen", parts[0][1])
         self.assertIn("乃琳Queen于2023-11-15 06:13", parts[0][1])
         self.assertIn("在嘉然今天吃什么的视频《鸣潮3.1主线上半！》下发表了评论：", parts[0][1])
-        self.assertIn("今天状态很好", parts[0][1])
+        self.assertIn(("plain", "今天状态很好"), parts)
         self.assertIn(("image_url", "https://i0.hdslb.com/comment-image.png"), parts)
         self.assertEqual(parts[-1][0], "plain")
         self.assertIn("https://www.bilibili.com/video/BV1xx411c7mD", parts[-1][1])
@@ -399,8 +399,9 @@ class ASoulPushTargetTest(unittest.TestCase):
 
         parts = asyncio.run(runtime.build_card_or_fallback_parts(notification))
 
-        self.assertEqual(parts[0], ("image", "/tmp/bilibili-comment-card.png"))
-        self.assertEqual(parts[1], ("plain", "https://t.bilibili.com/1"))
+        self.assertEqual(parts[0], ("plain", "[评论者]发布了一条新评论"))
+        self.assertEqual(parts[2], ("image", "/tmp/bilibili-comment-card.png"))
+        self.assertEqual(parts[3], ("plain", "https://t.bilibili.com/1"))
         self.assertEqual(rendered[0].author_profile.follower, 1234)
         self.assertEqual(rendered[0].published_at, 1_700_000_000)
 
@@ -444,12 +445,21 @@ class ASoulPushTargetTest(unittest.TestCase):
         dynamic_result = asyncio.run(runtime.build_notification_result(dynamic, target))
         live_result = asyncio.run(runtime.build_notification_result(live, target))
 
-        self.assertEqual(dynamic_result.chain[0], ("image", "/tmp/bilibili-card.png"))
-        self.assertEqual(dynamic_result.chain[1], ("plain", "https://t.bilibili.com/1"))
+        self.assertEqual(dynamic_result.chain[0], ("plain", "[测试账号]发布了一条新动态"))
+        self.assertEqual(dynamic_result.chain[2], ("image", "/tmp/bilibili-card.png"))
+        self.assertEqual(dynamic_result.chain[3], ("plain", "https://t.bilibili.com/1"))
         self.assertFalse(any(isinstance(part, self.main.Comp.AtAll) for part in dynamic_result.chain))
         self.assertIsInstance(live_result.chain[0], self.main.Comp.AtAll)
         self.assertEqual(live_result.chain[-2], ("image", "/tmp/bilibili-card.png"))
         self.assertEqual(live_result.chain[-1], ("plain", "https://live.bilibili.com/1"))
+        self.assertIn(
+            "[测试账号]开播了",
+            [
+                part[1]
+                for part in live_result.chain
+                if isinstance(part, tuple) and part[0] == "plain"
+            ],
+        )
         self.assertEqual(rendered_kinds, ["dynamic", "live"])
 
     def test_card_render_failure_falls_back_to_legacy_notification(self) -> None:

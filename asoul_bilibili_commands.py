@@ -228,6 +228,7 @@ class BilibiliCommandService:
             title="",
             url=resource.url,
             text=comment_post.text,
+            rich_nodes=list(getattr(comment_post, "rich_nodes", []) or []),
             image_urls=list(getattr(comment_post, "image_urls", []) or []),
             comment_created_at=getattr(comment_post, "created_at", 0),
             comment_resource_owner_name=resource.owner_name,

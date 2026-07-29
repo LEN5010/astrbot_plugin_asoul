@@ -500,6 +500,21 @@ class CommentDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notifications[0].content_id, "9002")
         self.assertEqual(notifications[0].published_at, 101)
 
+    async def test_delivery_older_than_one_day_is_cancelled_without_send(
+        self,
+    ) -> None:
+        sent = 0
+
+        async def sender(origin, notification) -> None:
+            nonlocal sent
+            sent += 1
+
+        await self.coordinator.deliver_one(sender, now=86_502)
+        await self.coordinator.deliver_one(sender, now=86_502)
+
+        self.assertEqual(sent, 0)
+        self.assertEqual(self.journal.pending_delivery_count(), 0)
+
     async def test_ack_persistence_failure_leaves_delivery_pending(self) -> None:
         original_ack = self.journal.acknowledge_delivery
         calls = 0

@@ -1216,6 +1216,8 @@ class BilibiliRuntime:
                     timeout=CARD_RENDER_TIMEOUT_SECONDS,
                 )
                 return [
+                    Comp.Plain(self.notification_summary_text(card_notification)),
+                    Comp.Plain(self.safe_plain_newline()),
                     Comp.Image.fromFileSystem(card_path),
                     Comp.Plain(str(notification.url or "")),
                 ]
@@ -1228,6 +1230,23 @@ class BilibiliRuntime:
                     getattr(notification, "kind", ""),
                 )
         return self.build_notification_parts(notification)
+
+    @staticmethod
+    def notification_summary_text(notification: Any) -> str:
+        author_name = str(
+            getattr(notification, "author_name", "") or getattr(notification, "uid", "")
+        ).strip()
+        action_map = {
+            "dynamic": "发布了一条新动态",
+            "video": "发布了一个新视频",
+            "comment": "发布了一条新评论",
+            "live": "开播了",
+        }
+        action = action_map.get(
+            str(getattr(notification, "kind", "") or ""),
+            "发布了一条新消息",
+        )
+        return f"[{author_name}]{action}"
 
     async def enrich_comment_notification(self, notification: Any) -> Any:
         if getattr(notification, "kind", "") != "comment":
@@ -1418,12 +1437,18 @@ class BilibiliRuntime:
                 context_text += f"《{resource_title}》"
             detail_parts.append(f"{context_text}下{action_text}：")
             comment_text = str(notification.text or "").strip()
-            if comment_text:
-                detail_parts.append(comment_text)
             chain_parts[0] = Comp.Plain(
                 f"{prefix}{notification.author_name}{self.safe_plain_newline()}"
                 + self.safe_plain_newline().join(detail_parts)
             )
+            rich_nodes = list(getattr(notification, "rich_nodes", []) or [])
+            if rich_nodes or comment_text:
+                chain_parts.append(Comp.Plain(self.safe_plain_newline()))
+                self.append_rich_text_parts(
+                    chain_parts,
+                    rich_nodes,
+                    comment_text,
+                )
             for image_url in notification.image_urls:
                 chain_parts.append(Comp.Plain(self.safe_plain_newline()))
                 chain_parts.append(Comp.Image.fromURL(image_url))

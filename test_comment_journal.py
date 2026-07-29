@@ -6,6 +6,7 @@ from pathlib import Path
 from asoul_bilibili import (
     BilibiliCommentPost,
     BilibiliCommentResource,
+    BilibiliRichTextNode,
     BilibiliRootReplyState,
 )
 from asoul_comment_journal import CommentJournal
@@ -101,6 +102,42 @@ class CommentJournalLifecycleTest(unittest.TestCase):
 
         self.assertIn("ix_observed_root_reply", observed_indexes)
         self.assertIn("ix_scan_reply_gap", scan_indexes)
+
+    def test_reopening_legacy_database_adds_comment_rich_nodes_column(self) -> None:
+        self.journal.close()
+        self.db_path.unlink()
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            """
+            CREATE TABLE observed_comment (
+                lifecycle_id TEXT NOT NULL,
+                rpid TEXT NOT NULL,
+                author_uid TEXT NOT NULL,
+                author_name TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                is_reply INTEGER NOT NULL,
+                root_rpid TEXT NOT NULL,
+                parent_rpid TEXT NOT NULL,
+                image_urls_json TEXT NOT NULL,
+                baseline INTEGER NOT NULL,
+                observed_at INTEGER NOT NULL,
+                PRIMARY KEY(lifecycle_id, rpid)
+            )
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        self.journal = CommentJournal(self.db_path)
+        columns = {
+            str(row["name"])
+            for row in self.journal._connection.execute(
+                "PRAGMA table_info(observed_comment)"
+            ).fetchall()
+        }
+
+        self.assertIn("rich_nodes_json", columns)
 
     def test_catalog_sync_creates_independent_head_and_reconcile_lanes(self) -> None:
         self.journal.sync_resource_catalog(
@@ -383,6 +420,104 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
         )
         self.assertEqual(result.events_created, 1)
         self.assertEqual(result.deliveries_created, 1)
+
+    def test_comments_older_than_one_day_are_observed_without_notification(
+        self,
+    ) -> None:
+        self.journal.sync_resource_catalog(
+            "100",
+            "测试账号",
+            [video_resource(2003, published_at=1)],
+            now=100_000,
+        )
+        task = self.journal.next_due_scan_task(100_000)
+        assert task is not None
+        result = self.journal.commit_scan_page(
+            task=task,
+            posts=[
+                BilibiliCommentPost(
+                    id="old",
+                    author_uid="100",
+                    author_name="测试账号",
+                    text="超过一天",
+                    created_at=13_599,
+                    is_reply=False,
+                    root_id="old",
+                ),
+                BilibiliCommentPost(
+                    id="boundary",
+                    author_uid="100",
+                    author_name="测试账号",
+                    text="刚好一天",
+                    created_at=13_600,
+                    is_reply=False,
+                    root_id="boundary",
+                ),
+            ],
+            target_uids=["100"],
+            target_origins=["origin-a"],
+            now=100_000,
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=100_180,
+        )
+
+        self.assertEqual(result.events_created, 1)
+        self.assertEqual(result.deliveries_created, 1)
+        self.assertEqual(
+            self.journal.observed_rpids(task.lifecycle_id),
+            ["boundary", "old"],
+        )
+
+    def test_comment_rich_nodes_survive_delivery_persistence(self) -> None:
+        task = self._activate_resource()
+        self.journal.commit_scan_page(
+            task=task,
+            posts=[
+                BilibiliCommentPost(
+                    id="9002",
+                    author_uid="100",
+                    author_name="测试账号",
+                    text="看看[嘉然_暗中观察]",
+                    created_at=101,
+                    is_reply=False,
+                    root_id="9002",
+                    rich_nodes=[
+                        BilibiliRichTextNode(kind="text", text="看看"),
+                        BilibiliRichTextNode(
+                            kind="emoji",
+                            text="[嘉然_暗中观察]",
+                            image_url="https://i0.hdslb.com/emote.png",
+                        ),
+                    ],
+                )
+            ],
+            target_uids=["100"],
+            target_origins=["origin-a"],
+            now=102,
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=282,
+        )
+
+        delivery = self.journal.next_due_delivery(102)
+
+        assert delivery is not None
+        self.assertEqual(
+            [
+                (node.kind, node.text, node.image_url)
+                for node in delivery.post.rich_nodes
+            ],
+            [
+                ("text", "看看", ""),
+                (
+                    "emoji",
+                    "[嘉然_暗中观察]",
+                    "https://i0.hdslb.com/emote.png",
+                ),
+            ],
+        )
+
     def test_duplicate_page_is_idempotent(self) -> None:
         task = self._activate_resource()
         post = BilibiliCommentPost(

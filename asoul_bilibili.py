@@ -207,6 +207,7 @@ class BilibiliCommentPost:
     parent_id: str = ""
     image_urls: List[str] = field(default_factory=list)
     reply_count: int = 0
+    rich_nodes: List[BilibiliRichTextNode] = field(default_factory=list)
 
 
 class BilibiliCommentPayloadError(ValueError):
@@ -1660,8 +1661,11 @@ class BilibiliGateway:
         author_uid = str(member.get("mid", "") or "").strip()
         author_name = str(member.get("uname", "") or "").strip()
         text = str(content.get("message", "") or "").strip()
-        image_urls = self._extract_comment_image_urls(content)
-        if not author_uid or not author_name or (not text and not image_urls):
+        image_urls = self._extract_comment_picture_urls(content)
+        rich_nodes = self._extract_comment_rich_nodes(text, content)
+        if not author_uid or not author_name or (
+            not text and not image_urls and not rich_nodes
+        ):
             return None
 
         parent_id = _safe_int(reply.get("parent"))
@@ -1692,9 +1696,10 @@ class BilibiliGateway:
                 if isinstance(reply.get("replies"), list)
                 else 0,
             ),
+            rich_nodes=rich_nodes,
         )
 
-    def _extract_comment_image_urls(self, content: Dict[str, Any]) -> List[str]:
+    def _extract_comment_picture_urls(self, content: Dict[str, Any]) -> List[str]:
         if not isinstance(content, dict):
             return []
 
@@ -1716,15 +1721,76 @@ class BilibiliGateway:
                 for key in ("img_src", "img_url", "url", "src"):
                     append_candidate(picture.get(key))
 
+        return image_urls
+
+    def _extract_comment_rich_nodes(
+        self,
+        text: str,
+        content: Dict[str, Any],
+    ) -> List[BilibiliRichTextNode]:
+        plain_text = str(text or "")
+        if not plain_text:
+            return []
+
+        emote_urls: Dict[str, str] = {}
         emote = content.get("emote")
         if isinstance(emote, dict):
-            for raw_item in emote.values():
+            for raw_key, raw_item in emote.items():
                 if not isinstance(raw_item, dict):
                     continue
+                image_url = ""
                 for key in ("url", "icon_url", "emote_url"):
-                    append_candidate(raw_item.get(key))
+                    image_url = _normalize_url(str(raw_item.get(key, "") or "").strip())
+                    if image_url:
+                        break
+                if not image_url:
+                    continue
+                token_candidates = (
+                    raw_key,
+                    raw_item.get("text"),
+                    raw_item.get("name"),
+                    raw_item.get("emote"),
+                )
+                for raw_token in token_candidates:
+                    token = str(raw_token or "")
+                    if token and token in plain_text:
+                        emote_urls[token] = image_url
+                        break
 
-        return image_urls
+        if not emote_urls:
+            return [BilibiliRichTextNode(kind="text", text=plain_text)]
+
+        nodes: List[BilibiliRichTextNode] = []
+        cursor = 0
+        while cursor < len(plain_text):
+            matches = [
+                (plain_text.find(token, cursor), -len(token), token, image_url)
+                for token, image_url in emote_urls.items()
+                if plain_text.find(token, cursor) >= 0
+            ]
+            if not matches:
+                nodes.append(
+                    BilibiliRichTextNode(kind="text", text=plain_text[cursor:])
+                )
+                break
+            index, _, token, image_url = min(matches)
+            if index > cursor:
+                nodes.append(
+                    BilibiliRichTextNode(
+                        kind="text",
+                        text=plain_text[cursor:index],
+                    )
+                )
+            nodes.append(
+                BilibiliRichTextNode(
+                    kind="emoji",
+                    text=token,
+                    image_url=image_url,
+                )
+            )
+            cursor = index + len(token)
+
+        return nodes
 
     def _find_first_value(self, value: Any, candidate_keys: Sequence[str]) -> Optional[Any]:
         if isinstance(value, dict):

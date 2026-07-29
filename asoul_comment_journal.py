@@ -10,6 +10,7 @@ from typing import Sequence
 from asoul_bilibili import (
     BilibiliCommentPost,
     BilibiliCommentResource,
+    BilibiliRichTextNode,
     BilibiliRootReplyState,
 )
 
@@ -17,6 +18,7 @@ from asoul_bilibili import (
 COMMENT_HEAD_ROOT_SENTINEL = "__head__"
 # Fallback only when resource_published_at is missing on legacy rows.
 COMMENT_BASELINE_GRACE_SECONDS = 15 * 60
+COMMENT_NOTIFICATION_MAX_AGE_SECONDS = 24 * 60 * 60
 # Kept for status/compat imports; periodic safety activation is disabled.
 COMMENT_REPLY_SAFETY_MIN_SECONDS = 24 * 60 * 60
 COMMENT_REPLY_SAFETY_DAILY_BUDGET = 10_000
@@ -179,6 +181,7 @@ CREATE TABLE IF NOT EXISTS observed_comment (
     root_rpid TEXT NOT NULL,
     parent_rpid TEXT NOT NULL,
     image_urls_json TEXT NOT NULL,
+    rich_nodes_json TEXT NOT NULL DEFAULT '[]',
     baseline INTEGER NOT NULL,
     observed_at INTEGER NOT NULL,
     PRIMARY KEY(lifecycle_id, rpid)
@@ -304,6 +307,11 @@ class CommentJournal:
             if "reply_change_pending" not in scan_columns:
                 self._connection.execute(
                     "ALTER TABLE scan_task ADD COLUMN reply_change_pending INTEGER NOT NULL DEFAULT 0"
+                )
+            observed_columns = column_names("observed_comment")
+            if "rich_nodes_json" not in observed_columns:
+                self._connection.execute(
+                    "ALTER TABLE observed_comment ADD COLUMN rich_nodes_json TEXT NOT NULL DEFAULT '[]'"
                 )
             self._connection.execute(
                 """
@@ -753,8 +761,8 @@ class CommentJournal:
                     INSERT OR IGNORE INTO observed_comment(
                         lifecycle_id, rpid, author_uid, author_name, text,
                         created_at, is_reply, root_rpid, parent_rpid,
-                        image_urls_json, baseline, observed_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        image_urls_json, rich_nodes_json, baseline, observed_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(task.lifecycle_id),
@@ -767,6 +775,18 @@ class CommentJournal:
                         str(post.root_id or post.id),
                         str(post.parent_id or ""),
                         json.dumps(list(post.image_urls), ensure_ascii=False),
+                        json.dumps(
+                            [
+                                {
+                                    "kind": node.kind,
+                                    "text": node.text,
+                                    "image_url": node.image_url,
+                                    "url": node.url,
+                                }
+                                for node in post.rich_nodes
+                            ],
+                            ensure_ascii=False,
+                        ),
                         baseline,
                         int(now),
                     ),
@@ -774,6 +794,8 @@ class CommentJournal:
                 if (
                     inserted.rowcount == 1
                     and not baseline
+                    and int(post.created_at)
+                    >= int(now) - COMMENT_NOTIFICATION_MAX_AGE_SECONDS
                     and str(post.author_uid) in normalized_target_uids
                 ):
                     event_cursor = self._connection.execute(
@@ -1522,6 +1544,7 @@ class CommentJournal:
                 observed_comment.root_rpid,
                 observed_comment.parent_rpid,
                 observed_comment.image_urls_json,
+                observed_comment.rich_nodes_json,
                 resource_lifecycle.owner_uid,
                 resource_lifecycle.owner_name,
                 resource_lifecycle.resource_key,
@@ -1552,6 +1575,17 @@ class CommentJournal:
             if isinstance(raw_images, list)
             else []
         )
+        raw_nodes = json.loads(str(row["rich_nodes_json"] or "[]"))
+        rich_nodes = [
+            BilibiliRichTextNode(
+                kind=str(value.get("kind", "") or ""),
+                text=str(value.get("text", "") or ""),
+                image_url=str(value.get("image_url", "") or ""),
+                url=str(value.get("url", "") or ""),
+            )
+            for value in raw_nodes
+            if isinstance(value, dict) and str(value.get("kind", "") or "")
+        ] if isinstance(raw_nodes, list) else []
         return PendingCommentDelivery(
             delivery_id=int(row["delivery_id"]),
             event_id=int(row["event_id"]),
@@ -1567,6 +1601,7 @@ class CommentJournal:
                 root_id=str(row["root_rpid"]),
                 parent_id=str(row["parent_rpid"]),
                 image_urls=image_urls,
+                rich_nodes=rich_nodes,
             ),
             attempt_count=int(row["attempt_count"]),
         )
@@ -1581,6 +1616,17 @@ class CommentJournal:
                 WHERE delivery_id = ? AND state = 'pending'
                 """,
                 (int(acknowledged_at), int(delivery_id)),
+            )
+
+    def cancel_delivery(self, delivery_id: int) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE event_delivery
+                SET state = 'cancelled'
+                WHERE delivery_id = ? AND state = 'pending'
+                """,
+                (int(delivery_id),),
             )
 
     def fail_delivery(
