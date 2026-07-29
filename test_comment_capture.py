@@ -243,6 +243,60 @@ class CommentCaptureCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("9003", self.journal.observed_rpids(head.lifecycle_id))
 
+    async def test_known_top_reply_does_not_stop_head_pagination(self) -> None:
+        self.gateway.root_pages = {
+            "": BilibiliRootCommentPage(
+                posts=[comment_post("9000", 100), comment_post("9001", 101)],
+                root_states=[
+                    BilibiliRootReplyState("9000", 0, ()),
+                    BilibiliRootReplyState("9001", 0, ()),
+                ],
+                checkpoint_root_ids=("9001",),
+            )
+        }
+        head = self.journal.next_due_scan_task(
+            100, lane="head", owner_uid="100"
+        )
+        assert head is not None
+        await self.coordinator.run_scan_task(head, ["100"], ["origin-a"], 101)
+        self.gateway.root_pages = {
+            "": BilibiliRootCommentPage(
+                posts=[comment_post("9000", 100), comment_post("9003", 281)],
+                next_offset="page-2",
+                root_states=[
+                    BilibiliRootReplyState("9000", 0, ()),
+                    BilibiliRootReplyState("9003", 0, ()),
+                ],
+                checkpoint_root_ids=("9003",),
+            ),
+            "page-2": BilibiliRootCommentPage(
+                posts=[comment_post("9000", 100), comment_post("9001", 101)],
+                next_offset="page-3",
+                root_states=[
+                    BilibiliRootReplyState("9000", 0, ()),
+                    BilibiliRootReplyState("9001", 0, ()),
+                ],
+                checkpoint_root_ids=("9001",),
+            ),
+        }
+
+        first = self.journal.next_due_scan_task(
+            281, lane="head", owner_uid="100"
+        )
+        assert first is not None
+        await self.coordinator.run_scan_task(first, ["100"], ["origin-a"], 281)
+        second = self.journal.next_due_scan_task(
+            281, lane="head", owner_uid="100"
+        )
+
+        assert second is not None
+        self.assertEqual(second.cursor, "page-2")
+        await self.coordinator.run_scan_task(second, ["100"], ["origin-a"], 282)
+        self.assertIsNone(
+            self.journal.next_due_scan_task(282, lane="head", owner_uid="100")
+        )
+        self.assertIn("9003", self.journal.observed_rpids(head.lifecycle_id))
+
     async def test_reply_scan_continues_past_three_pages(self) -> None:
         self.gateway.root_pages = {
             "": BilibiliRootCommentPage(

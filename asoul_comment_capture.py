@@ -135,8 +135,13 @@ class CommentCaptureCoordinator:
                     timeout=self._request_timeout_seconds,
                 )
                 root_ids = [state.root_rpid for state in page.root_states]
+                checkpoint_root_ids = (
+                    list(page.checkpoint_root_ids)
+                    if page.checkpoint_root_ids is not None
+                    else root_ids
+                )
                 page_reaches_known_root = self.journal.has_observed_root(
-                    task.lifecycle_id, root_ids
+                    task.lifecycle_id, checkpoint_root_ids
                 )
                 if task.scan_lane == "head":
                     should_continue = (

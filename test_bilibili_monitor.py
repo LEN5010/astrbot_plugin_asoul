@@ -1394,6 +1394,47 @@ class BilibiliParsingTest(unittest.TestCase):
             ],
         )
 
+    def test_root_comment_page_includes_top_replies_without_using_them_as_checkpoints(
+        self,
+    ) -> None:
+        self.gateway.comment_module = FakeCommentModule(
+            {
+                "": {
+                    "top_replies": [
+                        {
+                            "rpid_str": "9000",
+                            "ctime": 100,
+                            "parent": 0,
+                            "member": {"mid": "100", "uname": "测试账号"},
+                            "content": {"message": "置顶评论"},
+                        }
+                    ],
+                    "replies": [
+                        {
+                            "rpid_str": "9001",
+                            "ctime": 101,
+                            "parent": 0,
+                            "member": {"mid": "200", "uname": "观众"},
+                            "content": {"message": "普通评论"},
+                        }
+                    ],
+                    "cursor": {"pagination_reply": {"next_offset": "page-2"}},
+                }
+            }
+        )
+
+        page = asyncio.run(
+            self.gateway.get_root_comment_page(self._comment_resource(), offset="")
+        )
+
+        self.assertEqual([post.id for post in page.posts], ["9000", "9001"])
+        self.assertEqual(
+            [state.root_rpid for state in page.root_states],
+            ["9000", "9001"],
+        )
+        self.assertEqual(page.checkpoint_root_ids, ("9001",))
+        self.assertEqual(page.next_offset, "page-2")
+
     def test_reply_comment_page_does_not_assume_newest_first(self) -> None:
         self.gateway.comment_module = FakeCommentModule({})
         self.gateway.comment_module.sub_comment_pages = {

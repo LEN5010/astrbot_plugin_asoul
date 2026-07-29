@@ -225,6 +225,7 @@ class BilibiliRootCommentPage:
     posts: List[BilibiliCommentPost] = field(default_factory=list)
     next_offset: str = ""
     root_states: List[BilibiliRootReplyState] = field(default_factory=list)
+    checkpoint_root_ids: Optional[tuple[str, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -830,6 +831,7 @@ class BilibiliGateway:
         posts: List[BilibiliCommentPost] = []
         root_states: List[BilibiliRootReplyState] = []
         seen_ids: set[str] = set()
+        seen_root_state_ids: set[str] = set()
 
         def append_reply(
             raw_reply: Dict[str, Any],
@@ -853,29 +855,47 @@ class BilibiliGateway:
                 if isinstance(raw_nested, dict):
                     append_reply(raw_nested, nested_root_id, embedded_ids)
 
-        replies = payload.get("replies")
-        if replies is not None and not isinstance(replies, list):
-            raise BilibiliCommentPayloadError("root replies must be a list or null")
-        for raw_reply in replies or []:
-            if not isinstance(raw_reply, dict):
-                raise BilibiliCommentPayloadError("root reply must be a dict")
+        def append_root(raw_reply: Dict[str, Any]) -> str:
             root_id = str(raw_reply.get("rpid_str") or raw_reply.get("rpid") or "")
             embedded_ids: List[str] = []
             append_reply(raw_reply, embedded_ids=embedded_ids)
-            root_states.append(
-                BilibiliRootReplyState(
-                    root_rpid=root_id,
-                    reply_count=max(
-                        _safe_int(raw_reply.get("rcount")),
-                        len(embedded_ids),
-                    ),
-                    embedded_reply_ids=tuple(embedded_ids),
+            if root_id not in seen_root_state_ids:
+                seen_root_state_ids.add(root_id)
+                root_states.append(
+                    BilibiliRootReplyState(
+                        root_rpid=root_id,
+                        reply_count=max(
+                            _safe_int(raw_reply.get("rcount")),
+                            len(embedded_ids),
+                        ),
+                        embedded_reply_ids=tuple(embedded_ids),
+                    )
                 )
+            return root_id
+
+        top_replies = payload.get("top_replies")
+        if top_replies is not None and not isinstance(top_replies, list):
+            raise BilibiliCommentPayloadError(
+                "top root replies must be a list or null"
             )
+        for raw_reply in top_replies or []:
+            if not isinstance(raw_reply, dict):
+                raise BilibiliCommentPayloadError("top root reply must be a dict")
+            append_root(raw_reply)
+
+        replies = payload.get("replies")
+        if replies is not None and not isinstance(replies, list):
+            raise BilibiliCommentPayloadError("root replies must be a list or null")
+        checkpoint_root_ids: List[str] = []
+        for raw_reply in replies or []:
+            if not isinstance(raw_reply, dict):
+                raise BilibiliCommentPayloadError("root reply must be a dict")
+            checkpoint_root_ids.append(append_root(raw_reply))
         return BilibiliRootCommentPage(
             posts=posts,
             next_offset=self._extract_comment_next_offset(payload),
             root_states=root_states,
+            checkpoint_root_ids=tuple(dict.fromkeys(checkpoint_root_ids)),
         )
 
     async def get_reply_comment_page(
