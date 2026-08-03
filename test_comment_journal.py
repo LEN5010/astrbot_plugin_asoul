@@ -160,16 +160,43 @@ class CommentJournalLifecycleTest(unittest.TestCase):
         first = self.journal.sync_resource_catalog(
             "100", "测试账号", [video_resource(2003)], 100
         ).activated[0]
-        retired = self.journal.sync_resource_catalog(
+        first_missing = self.journal.sync_resource_catalog(
             "100", "测试账号", [], 200
+        )
+        self.assertEqual(first_missing.retired, ())
+        retired = self.journal.sync_resource_catalog(
+            "100", "测试账号", [], 300
         ).retired[0]
         second = self.journal.sync_resource_catalog(
-            "100", "测试账号", [video_resource(2003)], 300
+            "100", "测试账号", [video_resource(2003)], 400
         ).activated[0]
 
         self.assertEqual(retired.lifecycle_id, first.lifecycle_id)
         self.assertNotEqual(second.lifecycle_id, first.lifecycle_id)
-        self.assertEqual(second.entered_at, 300)
+        self.assertEqual(second.entered_at, 400)
+
+    def test_catalog_presence_resets_single_missing_snapshot(self) -> None:
+        first = self.journal.sync_resource_catalog(
+            "100", "测试账号", [video_resource(2003)], 100
+        ).activated[0]
+
+        self.assertEqual(
+            self.journal.sync_resource_catalog("100", "测试账号", [], 200).retired,
+            (),
+        )
+        present = self.journal.sync_resource_catalog(
+            "100", "测试账号", [video_resource(2003)], 300
+        )
+        self.assertEqual(present.activated, ())
+        self.assertEqual(present.retired, ())
+        self.assertEqual(
+            self.journal.sync_resource_catalog("100", "测试账号", [], 400).retired,
+            (),
+        )
+        active = self.journal._connection.execute(
+            "SELECT lifecycle_id FROM resource_lifecycle WHERE retired_at = 0"
+        ).fetchone()
+        self.assertEqual(active["lifecycle_id"], first.lifecycle_id)
 
     def test_retirement_preserves_scan_and_observation_rows(self) -> None:
         lifecycle = self.journal.sync_resource_catalog(
@@ -204,6 +231,7 @@ class CommentJournalLifecycleTest(unittest.TestCase):
         ).fetchone()[0]
 
         self.journal.sync_resource_catalog("100", "测试账号", [], 200)
+        self.journal.sync_resource_catalog("100", "测试账号", [], 300)
 
         after_tasks = self.journal._connection.execute(
             "SELECT COUNT(*) FROM scan_task WHERE lifecycle_id = ?",
@@ -420,6 +448,71 @@ class CommentJournalPageCommitTest(CommentJournalLifecycleTest):
         )
         self.assertEqual(result.events_created, 1)
         self.assertEqual(result.deliveries_created, 1)
+
+    def test_reentered_resource_does_not_replay_observed_comment(self) -> None:
+        resource = video_resource(2003, published_at=90)
+        first_lifecycle = self.journal.sync_resource_catalog(
+            "100", "测试账号", [resource], now=100
+        ).activated[0]
+        first_task = self.journal.next_due_scan_task(100)
+        assert first_task is not None
+        post = BilibiliCommentPost(
+            id="pinned-9002",
+            author_uid="100",
+            author_name="测试账号",
+            text="置顶评论",
+            created_at=95,
+            is_reply=False,
+            root_id="pinned-9002",
+        )
+        first = self.journal.commit_scan_page(
+            task=first_task,
+            posts=[post],
+            target_uids=["100"],
+            target_origins=["origin-a"],
+            now=101,
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=281,
+        )
+        self.assertEqual(first.events_created, 1)
+
+        self.journal.sync_resource_catalog("100", "测试账号", [], now=200)
+        retired = self.journal.sync_resource_catalog(
+            "100", "测试账号", [], now=300
+        ).retired[0]
+        self.assertEqual(retired.lifecycle_id, first_lifecycle.lifecycle_id)
+        second_lifecycle = self.journal.sync_resource_catalog(
+            "100", "测试账号", [resource], now=400
+        ).activated[0]
+        second_task = self.journal.next_due_scan_task(
+            400, owner_uid="100"
+        )
+        assert second_task is not None
+        second = self.journal.commit_scan_page(
+            task=second_task,
+            posts=[post],
+            target_uids=["100"],
+            target_origins=["origin-a"],
+            now=401,
+            next_cursor="",
+            next_page_index=0,
+            next_sweep_at=581,
+        )
+
+        self.assertNotEqual(
+            second_lifecycle.lifecycle_id, first_lifecycle.lifecycle_id
+        )
+        self.assertEqual(second.events_created, 0)
+        self.assertEqual(second.deliveries_created, 0)
+        baseline = self.journal._connection.execute(
+            """
+            SELECT baseline FROM observed_comment
+            WHERE lifecycle_id = ? AND rpid = ?
+            """,
+            (second_lifecycle.lifecycle_id, post.id),
+        ).fetchone()
+        self.assertEqual(int(baseline["baseline"]), 1)
 
     def test_comments_older_than_one_day_are_observed_without_notification(
         self,

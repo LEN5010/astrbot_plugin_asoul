@@ -19,6 +19,10 @@ COMMENT_HEAD_ROOT_SENTINEL = "__head__"
 # Fallback only when resource_published_at is missing on legacy rows.
 COMMENT_BASELINE_GRACE_SECONDS = 15 * 60
 COMMENT_NOTIFICATION_MAX_AGE_SECONDS = 24 * 60 * 60
+# A single successful-but-incomplete catalog response must not retire a resource.
+# Requiring a consecutive confirmation also prevents lifecycle churn from replaying
+# already observed pinned comments.
+COMMENT_CATALOG_RETIRE_MISSING_COUNT = 2
 # Kept for status/compat imports; periodic safety activation is disabled.
 COMMENT_REPLY_SAFETY_MIN_SECONDS = 24 * 60 * 60
 COMMENT_REPLY_SAFETY_DAILY_BUDGET = 10_000
@@ -145,7 +149,8 @@ CREATE TABLE IF NOT EXISTS resource_lifecycle (
     incomplete_reason TEXT NOT NULL DEFAULT '',
     head_ready_at INTEGER NOT NULL DEFAULT 0,
     baseline_completed_at INTEGER NOT NULL DEFAULT 0,
-    resource_published_at INTEGER NOT NULL DEFAULT 0
+    resource_published_at INTEGER NOT NULL DEFAULT 0,
+    catalog_missing_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_resource
 ON resource_lifecycle(owner_uid, resource_key)
@@ -188,6 +193,8 @@ CREATE TABLE IF NOT EXISTS observed_comment (
 );
 CREATE INDEX IF NOT EXISTS ix_observed_root_reply
 ON observed_comment(lifecycle_id, root_rpid, is_reply);
+CREATE INDEX IF NOT EXISTS ix_observed_rpid_lifecycle
+ON observed_comment(rpid, lifecycle_id);
 CREATE TABLE IF NOT EXISTS comment_event (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     lifecycle_id TEXT NOT NULL,
@@ -290,6 +297,10 @@ class CommentJournal:
                 self._connection.execute(
                     "ALTER TABLE resource_lifecycle ADD COLUMN resource_published_at INTEGER NOT NULL DEFAULT 0"
                 )
+            if "catalog_missing_count" not in lifecycle_columns:
+                self._connection.execute(
+                    "ALTER TABLE resource_lifecycle ADD COLUMN catalog_missing_count INTEGER NOT NULL DEFAULT 0"
+                )
 
             scan_columns = column_names("scan_task")
             if "scan_lane" not in scan_columns:
@@ -323,6 +334,12 @@ class CommentJournal:
                 """
                 CREATE INDEX IF NOT EXISTS ix_scan_reply_gap
                 ON scan_task(task_state, kind, lifecycle_id, root_rpid)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_observed_rpid_lifecycle
+                ON observed_comment(rpid, lifecycle_id)
                 """
             )
 
@@ -491,6 +508,7 @@ class CommentJournal:
                         UPDATE resource_lifecycle SET
                             owner_name = ?, resource_kind = ?, oid = ?,
                             type_value = ?, title = ?, url = ?,
+                            catalog_missing_count = 0,
                             resource_published_at = CASE
                                 WHEN ? > 0 THEN ?
                                 ELSE resource_published_at
@@ -508,6 +526,17 @@ class CommentJournal:
                             published_at,
                             str(row["lifecycle_id"]),
                         ),
+                    )
+                    continue
+                missing_count = int(row["catalog_missing_count"] or 0) + 1
+                if missing_count < COMMENT_CATALOG_RETIRE_MISSING_COUNT:
+                    self._connection.execute(
+                        """
+                        UPDATE resource_lifecycle
+                        SET catalog_missing_count = ?
+                        WHERE lifecycle_id = ?
+                        """,
+                        (missing_count, str(row["lifecycle_id"])),
                     )
                     continue
                 retired.append(self._retire_lifecycle(row, int(now)))
@@ -755,7 +784,29 @@ class CommentJournal:
                 entered_at=entered_at,
             )
             for post in posts:
-                baseline = int(int(post.created_at) < baseline_cutoff)
+                previously_observed = self._connection.execute(
+                    """
+                    SELECT 1
+                    FROM observed_comment AS previous
+                    JOIN resource_lifecycle AS previous_lifecycle
+                      ON previous_lifecycle.lifecycle_id = previous.lifecycle_id
+                    WHERE previous.rpid = ?
+                      AND previous.lifecycle_id != ?
+                      AND previous_lifecycle.owner_uid = ?
+                      AND previous_lifecycle.resource_key = ?
+                    LIMIT 1
+                    """,
+                    (
+                        str(post.id),
+                        str(task.lifecycle_id),
+                        str(lifecycle["owner_uid"]),
+                        str(lifecycle["resource_key"]),
+                    ),
+                ).fetchone()
+                baseline = int(
+                    int(post.created_at) < baseline_cutoff
+                    or previously_observed is not None
+                )
                 inserted = self._connection.execute(
                     """
                     INSERT OR IGNORE INTO observed_comment(
