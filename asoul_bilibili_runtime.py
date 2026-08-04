@@ -1523,6 +1523,8 @@ class BilibiliRuntime:
 
     async def save_credential(self, credential_data: dict[str, str]) -> None:
         normalized = normalize_bilibili_credential_data(credential_data)
+        if not normalized.get("sessdata"):
+            raise ValueError("B 站登录结果缺少 SESSDATA，凭据未保存")
         self.credential_data = normalized
         self.gateway.set_credential_data(normalized)
         await self._owner.put_kv_data(KV_BILIBILI_CREDENTIAL, normalized)

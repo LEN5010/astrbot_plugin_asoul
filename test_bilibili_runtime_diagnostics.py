@@ -9,7 +9,10 @@ from test_asoul_push_targets import _install_astrbot_stubs, _load_main_module
 
 _install_astrbot_stubs()
 
-from asoul_bilibili import BilibiliGateway
+from asoul_bilibili import (
+    BilibiliGateway,
+    normalize_bilibili_credential_data,
+)
 from asoul_bilibili_runtime import (
     CONTENT_POLL_STATE_KEY,
     BilibiliRuntime,
@@ -53,6 +56,39 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
             "plugins/astrbot_plugin_asoul", str(runtime.comment_journal.path)
         )
         asyncio.run(plugin.terminate())
+
+    def test_qrcode_cookie_names_are_normalized_for_credential_storage(self) -> None:
+        normalized = normalize_bilibili_credential_data(
+            {
+                "SESSDATA": "session-value",
+                "bili_jct": "csrf-value",
+                "buvid3": "buvid3-value",
+                "buvid4": "buvid4-value",
+                "DedeUserID": "123456",
+                "ac_time_value": "refresh-value",
+            }
+        )
+
+        self.assertEqual(
+            normalized,
+            {
+                "sessdata": "session-value",
+                "bili_jct": "csrf-value",
+                "buvid3": "buvid3-value",
+                "buvid4": "buvid4-value",
+                "dedeuserid": "123456",
+                "ac_time_value": "refresh-value",
+            },
+        )
+
+    def test_saving_incomplete_login_result_fails_without_mutating_state(self) -> None:
+        _, runtime = self._new_runtime()
+
+        with self.assertRaisesRegex(ValueError, "缺少 SESSDATA"):
+            asyncio.run(runtime.save_credential({"bili_jct": "csrf-only"}))
+
+        self.assertEqual(runtime.credential_data, {})
+        self.assertFalse(runtime.gateway.has_credential())
 
     def test_comment_work_continues_without_active_groups_to_prevent_replay(
         self,

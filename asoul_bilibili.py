@@ -364,16 +364,21 @@ def normalize_bilibili_uid(raw_value: Any) -> str:
 
 
 def _normalize_credential_data(raw_value: Any) -> Dict[str, str]:
-    if isinstance(raw_value, dict) and any(key in raw_value for key in BILIBILI_CREDENTIAL_FIELDS):
-        source = raw_value
-    elif isinstance(raw_value, dict):
-        source = {}
-    else:
-        source = {}
+    source = raw_value if isinstance(raw_value, dict) else {}
 
     normalized: Dict[str, str] = {}
     for field_name in BILIBILI_CREDENTIAL_FIELDS:
         value = source.get(field_name, "")
+        if not str(value or "").strip():
+            value = next(
+                (
+                    candidate_value
+                    for candidate_name, candidate_value in source.items()
+                    if str(candidate_name).lower() == field_name.lower()
+                    and str(candidate_value or "").strip()
+                ),
+                "",
+            )
         text = str(value or "").strip()
         if text:
             normalized[field_name] = text
