@@ -90,6 +90,37 @@ class BilibiliRuntimeDiagnosticsTest(unittest.TestCase):
         self.assertEqual(runtime.credential_data, {})
         self.assertFalse(runtime.gateway.has_credential())
 
+    def test_qrcode_login_uses_structured_cookie_channel(self) -> None:
+        plugin, _ = self._new_runtime()
+        selected_channels = []
+
+        class FakeQrPicture:
+            def to_file(self, path: str) -> None:
+                return None
+
+        class FakeQrLogin:
+            def __init__(self, *, platform) -> None:
+                selected_channels.append(platform)
+
+            async def generate_qrcode(self) -> None:
+                return None
+
+            def get_qrcode_picture(self):
+                return FakeQrPicture()
+
+        with patch(
+            "asoul_bilibili_commands.login_v2.QrCodeLogin",
+            FakeQrLogin,
+        ):
+            asyncio.run(plugin._bilibili_commands.create_login_qrcode())
+
+        from bilibili_api import login_v2
+
+        self.assertEqual(
+            selected_channels,
+            [login_v2.QrCodeLoginChannel.TV],
+        )
+
     def test_comment_work_continues_without_active_groups_to_prevent_replay(
         self,
     ) -> None:

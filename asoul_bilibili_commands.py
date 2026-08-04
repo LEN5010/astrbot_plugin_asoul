@@ -264,7 +264,10 @@ class BilibiliCommandService:
     async def create_login_qrcode(self):
         await self._runtime.ensure_ready()
         QR_CODE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        qr_login = login_v2.QrCodeLogin(platform=login_v2.QrCodeLoginChannel.WEB)
+        # The WEB channel in bilibili-api-python 17.4.1 extracts cookies from a
+        # redirect URL that no longer includes SESSDATA.  The TV channel reads
+        # the structured cookie_info response instead.
+        qr_login = login_v2.QrCodeLogin(platform=login_v2.QrCodeLoginChannel.TV)
         await qr_login.generate_qrcode()
         qr_login.get_qrcode_picture().to_file(str(QR_CODE_PATH))
         return qr_login, QR_CODE_PATH

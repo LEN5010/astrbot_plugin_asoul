@@ -120,7 +120,7 @@ def _install_astrbot_stubs() -> None:
 
     login_v2_module = types.SimpleNamespace(
         QrCodeLogin=lambda platform=None: None,
-        QrCodeLoginChannel=types.SimpleNamespace(WEB="web"),
+        QrCodeLoginChannel=types.SimpleNamespace(WEB="web", TV="tv"),
         QrCodeLoginEvents=types.SimpleNamespace(DONE="done", TIMEOUT="timeout"),
     )
     bilibili_api_module = types.ModuleType("bilibili_api")
